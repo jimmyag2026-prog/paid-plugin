@@ -15,7 +15,7 @@ It runs locally, all logs stay on your machine, and it speaks through
 your existing IM accounts (Telegram / Lark / Feishu / WhatsApp / WeCom /
 Slack — whichever Hermes is wired up to).
 
-**Status: v0.5 alpha.** End-to-end loop is wired, 98 tests passing,
+**Status: v0.5 alpha.** End-to-end loop is wired, 102 tests passing,
 several v1 features intentionally cut for now (see
 [Limitations](#known-v05-limitations) below).
 
@@ -214,6 +214,39 @@ will land in a follow-up:
 - **Retrieval** — substring scorer over `sop.md` only. No FTS5, no web
   search.
 
+### Hermes upstream gaps PAID currently works around
+
+These are real upstream issues; PAID ships a workaround so v0.5 is usable
+today, but the cleanest fix is in `hermes-agent` itself:
+
+- **`pre_llm_call` hook does not pass `chat_id`.** Lark / Feishu's IM
+  API is chat-centric — outbound messages need a `chat_id`, but the hook
+  only carries `sender_id`. PAID works around this by inferring
+  `receive_id_type` from the ID prefix (`oc_` → chat_id, `ou_` → open_id,
+  bare hex → user_id) and bypassing the adapter's hard-coded chat_id
+  send path with a direct Lark API call (`paid/hermes_io.py`,
+  `_send_lark_direct`). When upstream propagates `chat_id` through the
+  hook, PAID will store it on counterparty profiles and use the standard
+  adapter path — the direct branch then degrades to a fallback.
+- **`post_llm_call` hook does not pass `platform` / `sender_id`.** This
+  meant owner replies were over-audited and Layer 4 cross-cp scoping was
+  blunt. PAID caches `(session_id → platform, sender_id, cp_id)` at
+  pre-hook and resolves at post-hook. In-memory only.
+- **Adapter `send()` hard-codes `receive_id_type=chat_id`.** Same root
+  cause as the first item; same workaround.
+
+### Quick start tips for new operators
+
+- After enabling the plugin, **DM the bot from your owner account and
+  type `/sethome`**. This stores your owner↔bot chat_id into
+  `FEISHU_HOME_CHANNEL` (or the equivalent env per platform). PAID prefers
+  that chat_id for owner approval-card delivery — slightly more reliable
+  than the user_id fallback, and it also suppresses hermes' first-message
+  "no home channel set" notice for everyone else.
+- Junior dispatch (`/paid-approve` → reply to junior) works without a
+  pre-captured chat_id thanks to the direct-API workaround above; no
+  per-junior `/sethome` is needed.
+
 ---
 
 ## Testing
@@ -223,7 +256,7 @@ cd /path/to/paid
 python3 -m pytest tests/ -q
 ```
 
-98 tests, ~0.2 s on a 2024 MBP. New contributions should keep it green.
+102 tests, ~0.2 s on a 2024 MBP. New contributions should keep it green.
 
 ---
 
