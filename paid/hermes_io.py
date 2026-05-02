@@ -293,5 +293,29 @@ def send_dm(
             return {"ok": False, "queued": str(qp), "error": f"adapter.send raised: {exc}"}
         raise SendDmError(f"adapter.send raised: {exc}") from exc
 
+    # Don't trust "no exception raised" as success — adapters return a
+    # SendResult-shaped object whose .success may be False even when the
+    # coroutine resolved cleanly. Check both. Falling for HTTP 200 = success
+    # is one of the five IM-bot traps (see project memory
+    # feedback_im_bot_api_traps.md): the Lark API returned [230001] invalid
+    # receive_id while SendResult wrapped it as success=False, but the old
+    # code happily reported ok=True with msg_id=None.
+    success = getattr(result, "success", None)
+    error = getattr(result, "error", None)
     msg_id = getattr(result, "message_id", None) or getattr(result, "msg_id", None)
+
+    if success is False or (success is None and not msg_id):
+        # Adapter signalled failure (or returned a shape we can't classify).
+        if fallback_to_queue:
+            qp = _enqueue_outbound_fallback(platform, user_id, message)
+            return {
+                "ok": False,
+                "queued": str(qp),
+                "error": str(error) if error else f"adapter.send returned no msg_id: {result!r}"[:300],
+                "platform": platform,
+            }
+        raise SendDmError(
+            f"adapter.send returned failure: success={success!r} error={error!r}"
+        )
+
     return {"ok": True, "msg_id": msg_id, "platform": platform, "raw": repr(result)[:200]}
