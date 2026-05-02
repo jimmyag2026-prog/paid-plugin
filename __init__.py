@@ -137,6 +137,25 @@ def _format_pending_card(req: approval.PendingApproval) -> str:
     )
 
 
+def _resolve_owner_send_target(platform: str, user_id: str) -> str:
+    """Return a Lark/feishu chat_id when one is configured via /sethome.
+
+    The hermes feishu adapter's send() hard-codes receive_id_type=chat_id,
+    so passing the bare tenant user_id from owner.json fails with
+    [230001] invalid receive_id from the Lark API. ``/sethome`` saves the
+    owner↔bot DM chat_id into FEISHU_HOME_CHANNEL — fall back to that for
+    owner approval-card delivery. Other platforms unchanged.
+
+    Note: this helper is owner-specific. Junior dispatch still has the
+    same chat_id problem; tracked as a known v0.5 issue (see README).
+    """
+    if platform in ("feishu", "lark"):
+        chat_id = (os.environ.get("FEISHU_HOME_CHANNEL") or "").strip()
+        if chat_id:
+            return chat_id
+    return user_id
+
+
 def _notify_owner_about_request(req: approval.PendingApproval) -> None:
     """Push the approval card to the owner. Failures fall back to local queue."""
     owner = identity.load_owner()
@@ -145,10 +164,13 @@ def _notify_owner_about_request(req: approval.PendingApproval) -> None:
         _safe_log(f"[approval] no owner identity — skipping DM for #{req.request_id}")
         return
     plat, uid = target
+    receive_target = _resolve_owner_send_target(plat, uid)
     body = _format_pending_card(req)
     try:
-        result = hermes_io.send_dm(plat, uid, body, fallback_to_queue=True)
-        _safe_log(f"[approval] notify owner #{req.request_id} via {plat}:{uid} → {result}")
+        result = hermes_io.send_dm(plat, receive_target, body, fallback_to_queue=True)
+        _safe_log(
+            f"[approval] notify owner #{req.request_id} via {plat}:{receive_target} → {result}"
+        )
     except Exception as exc:
         _safe_log(f"[approval] notify owner #{req.request_id} EXC {exc}")
 
