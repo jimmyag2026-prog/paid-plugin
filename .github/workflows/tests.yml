@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install pytest
-        run: pip install pytest
+      - name: Install package + test deps
+        run: pip install -e . pytest
       - name: Run tests
         run: python -m pytest tests/ -v
