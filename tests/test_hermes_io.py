@@ -412,3 +412,90 @@ def test_call_llm_retries_on_request_error(tmp_path, monkeypatch):
     with pytest.raises(hermes_io.LLMCallError):
         hermes_io.call_llm("hi")
     assert posts.call_count == 4  # 1 initial + 3 retries
+
+
+# ---------------------------------------------------------------------------
+# Standalone Lark client fallback (cron / out-of-process callers can deliver)
+# ---------------------------------------------------------------------------
+
+
+def test_load_lark_env_creds_reads_app_id_secret(tmp_path, monkeypatch):
+    fake_home = tmp_path / "home"
+    (fake_home / ".hermes").mkdir(parents=True)
+    (fake_home / ".hermes" / ".env").write_text(
+        "# header comment\n"
+        "FEISHU_APP_ID=cli_TESTAPP\n"
+        "FEISHU_APP_SECRET=  test_secret_quoted_  \n"
+        'FEISHU_DOMAIN="lark"\n'
+        "OTHER=ignored\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hermes_io.Path, "home", classmethod(lambda cls: fake_home))
+    creds = hermes_io._load_lark_env_creds()
+    assert creds == {
+        "FEISHU_APP_ID": "cli_TESTAPP",
+        "FEISHU_APP_SECRET": "test_secret_quoted_",
+        "FEISHU_DOMAIN": "lark",
+    }
+
+
+def test_load_lark_env_creds_returns_none_when_missing(tmp_path, monkeypatch):
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(hermes_io.Path, "home", classmethod(lambda cls: fake_home))
+    assert hermes_io._load_lark_env_creds() is None
+
+
+def test_build_standalone_lark_client_caches_singleton(tmp_path, monkeypatch):
+    """Repeat builds return the same client instance (token-cache continuity)."""
+    monkeypatch.setattr(
+        hermes_io, "_load_lark_env_creds",
+        lambda: {"FEISHU_APP_ID": "cli_x", "FEISHU_APP_SECRET": "s", "FEISHU_DOMAIN": "feishu"},
+    )
+    monkeypatch.setattr(hermes_io, "_STANDALONE_LARK_CLIENT", None)
+
+    fake_built = mock.Mock(name="fake_lark_client")
+    fake_lark = mock.Mock()
+    fake_builder = mock.Mock()
+    fake_builder.app_id = lambda v: fake_builder
+    fake_builder.app_secret = lambda v: fake_builder
+    fake_builder.domain = lambda v: fake_builder
+    fake_builder.build = lambda: fake_built
+    fake_lark.Client.builder = lambda: fake_builder
+
+    with mock.patch.dict(sys.modules, {"lark_oapi": fake_lark,
+                                       "lark_oapi.core.const": mock.Mock(FEISHU_DOMAIN="d1", LARK_DOMAIN="d2")}):
+        c1 = hermes_io._build_standalone_lark_client()
+        c2 = hermes_io._build_standalone_lark_client()
+    assert c1 is c2 is fake_built
+
+
+def test_build_standalone_lark_client_raises_without_creds(monkeypatch):
+    monkeypatch.setattr(hermes_io, "_load_lark_env_creds", lambda: None)
+    monkeypatch.setattr(hermes_io, "_STANDALONE_LARK_CLIENT", None)
+    with pytest.raises(hermes_io.SendDmError) as exc:
+        hermes_io._build_standalone_lark_client()
+    assert "FEISHU_APP_ID" in str(exc.value)
+
+
+def test_send_dm_falls_back_to_standalone_when_no_gateway(tmp_path, monkeypatch):
+    """When _get_gateway_adapter raises (no in-process runner), send_dm
+    must try the standalone client path BEFORE giving up to the queue."""
+    # No gateway in this process.
+    def _no_adapter(_):
+        raise hermes_io.SendDmError("no live GatewayRunner")
+    monkeypatch.setattr(hermes_io, "_get_gateway_adapter", _no_adapter)
+
+    # Standalone path returns ok.
+    monkeypatch.setattr(
+        hermes_io, "_send_lark_standalone",
+        lambda rid, msg: {"ok": True, "msg_id": "om_STANDALONE", "platform": "feishu",
+                          "receive_id_type": "user_id"},
+    )
+
+    # Point storage at tmp so we can detect "did NOT queue" by absence of file.
+    monkeypatch.setattr(hermes_io, "_enqueue_outbound_fallback",
+                        lambda *a, **kw: pytest.fail("should not have queued"))
+
+    out = hermes_io.send_dm("feishu", "4ed67983", "hi")
+    assert out["ok"] is True
+    assert out["msg_id"] == "om_STANDALONE"

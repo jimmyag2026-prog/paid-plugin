@@ -118,12 +118,43 @@ Verify:
 ```bash
 tail -20 ~/.hermes/paid/plugin_runtime.log
 # expect: "PAID v1 plugin registering"
-#         "hooks: pre_llm_call, post_llm_call"
-#         "commands: /paid-pending /paid-approve /paid-reject /paid-status"
+#         "registered: pre_gateway_dispatch"
+#         "registered: /card (Lark interactive card handler)"
+#         "hooks: pre_llm_call, post_llm_call, pre_gateway_dispatch"
+#         "commands: /paid-pending /paid-approve /paid-reject /paid-status /card"
 
 python3 -m paid status
 # expect: owner identity + counterparty count + pending=0 + queue=0
 ```
+
+---
+
+## 5a. Lark / Feishu — interactive card setup (only if your IM is Lark)
+
+Plain-text approval cards work out of the box. The richer interactive
+card with ✅ Approve / ❌ Reject buttons needs **three** Lark Open
+Platform settings; missing any one returns error 200340 on click.
+
+Walk this once, then publish a new app version:
+
+1. **App Features → Bot → toggle "Interactive Card" ON.** Required for
+   the next step's event to be selectable.
+2. **Events & Callbacks → Add Events → search "card" → tick
+   `card.action.trigger`.**
+3. **Verify Subscription mode is "Receive events through persistent
+   connection"** (not webhook). Hermes' Lark adapter listens on the
+   long connection — webhook mode bypasses it.
+
+After the publish completes, no hermes restart is needed; long-connection
+clients hot-load event subscription changes.
+
+Then, in your owner DM with the bot, send `/sethome` once. This stores
+the owner↔bot chat_id into `FEISHU_HOME_CHANNEL` in `~/.hermes/.env`,
+which PAID needs to reach you with approval cards.
+
+Full Lark runbook (including the open_id-vs-user_id "Identity
+bifurcation" gotcha and full error-code table) is in
+[`docs/LARK_SETUP.md`](docs/LARK_SETUP.md).
 
 ---
 

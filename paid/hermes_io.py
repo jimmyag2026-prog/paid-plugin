@@ -335,13 +335,86 @@ def _detect_lark_receive_id_type(receive_id: str) -> str:
     return "user_id"
 
 
-def _send_lark_direct(adapter: Any, receive_id: str, message: str) -> dict[str, Any]:
-    """Send a Lark text message directly via the adapter's authenticated client.
+def _load_lark_env_creds() -> dict[str, str] | None:
+    """Read FEISHU_APP_ID + FEISHU_APP_SECRET (+ optional FEISHU_DOMAIN) from
+    ``~/.hermes/.env`` for standalone Lark API calls when the gateway adapter
+    isn't reachable from this process.
 
-    Bypasses the adapter's ``send()`` which hard-codes ``receive_id_type``.
-    Used when the caller only has a ``user_id`` / ``open_id`` / etc.
+    Returns None when the file is missing or required keys aren't present.
+    Format: standard ``KEY=VALUE`` lines, ``#`` comments tolerated.
     """
-    import json as _json  # local import to keep module-level deps minimal
+    env_path = Path.home() / ".hermes" / ".env"
+    if not env_path.exists():
+        return None
+    creds: dict[str, str] = {}
+    try:
+        for ln in env_path.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=" not in ln:
+                continue
+            k, v = ln.split("=", 1)
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k in ("FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_DOMAIN"):
+                creds[k] = v
+    except Exception:
+        return None
+    if not creds.get("FEISHU_APP_ID") or not creds.get("FEISHU_APP_SECRET"):
+        return None
+    return creds
+
+
+# Cached standalone client — building one is cheap but token refresh state
+# is per-instance, so reuse across calls within the same process.
+_STANDALONE_LARK_CLIENT: Any = None
+
+
+def _build_standalone_lark_client() -> Any:
+    """Build a lark_oapi.Client from ``~/.hermes/.env`` creds.
+
+    Used by ``send_dm`` / ``send_lark_card`` when the in-process gateway
+    runner isn't available — e.g. ``bin/sweep_pending.py`` running as a
+    cron / systemd timer separately from the gateway service.
+
+    Returns the cached client on subsequent calls. Raises ``SendDmError`` if
+    creds aren't readable from .env or lark_oapi isn't importable.
+    """
+    global _STANDALONE_LARK_CLIENT
+    if _STANDALONE_LARK_CLIENT is not None:
+        return _STANDALONE_LARK_CLIENT
+
+    creds = _load_lark_env_creds()
+    if creds is None:
+        raise SendDmError(
+            "no FEISHU_APP_ID / FEISHU_APP_SECRET in ~/.hermes/.env "
+            "(needed for standalone Lark send when gateway is out of process)"
+        )
+
+    try:
+        import lark_oapi as lark  # type: ignore
+    except Exception as exc:
+        raise SendDmError(f"lark_oapi not importable: {exc}") from exc
+
+    builder = lark.Client.builder().app_id(creds["FEISHU_APP_ID"]).app_secret(
+        creds["FEISHU_APP_SECRET"]
+    )
+    # FEISHU_DOMAIN: "feishu" → CN endpoint, "lark" → international.
+    domain_label = (creds.get("FEISHU_DOMAIN") or "feishu").lower()
+    try:
+        from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN  # type: ignore
+        builder = builder.domain(LARK_DOMAIN if domain_label == "lark" else FEISHU_DOMAIN)
+    except Exception:
+        # Older lark_oapi versions take the domain string directly.
+        pass
+
+    _STANDALONE_LARK_CLIENT = builder.build()
+    return _STANDALONE_LARK_CLIENT
+
+
+def _send_with_lark_client(client: Any, receive_id: str, message: str) -> dict[str, Any]:
+    """Common Lark text-send path used by both adapter-based and standalone
+    branches. Returns the dict-shape send_dm callers expect."""
+    import json as _json
 
     try:
         from lark_oapi.api.im.v1 import (  # type: ignore
@@ -349,11 +422,7 @@ def _send_lark_direct(adapter: Any, receive_id: str, message: str) -> dict[str, 
             CreateMessageRequestBody,
         )
     except Exception as exc:
-        raise SendDmError(f"lark_oapi not importable for direct send: {exc}") from exc
-
-    client = getattr(adapter, "_client", None)
-    if client is None:
-        raise SendDmError("feishu adapter exposes no _client (hermes API drift?)")
+        raise SendDmError(f"lark_oapi not importable: {exc}") from exc
 
     rid_type = _detect_lark_receive_id_type(receive_id)
     body = (
@@ -372,8 +441,6 @@ def _send_lark_direct(adapter: Any, receive_id: str, message: str) -> dict[str, 
 
     resp = client.im.v1.message.create(req)
 
-    # lark_oapi response objects expose ``success()`` and ``code`` / ``msg``;
-    # be tolerant of either shape.
     success = (
         resp.success()  # type: ignore[attr-defined]
         if hasattr(resp, "success") and callable(resp.success)
@@ -403,6 +470,26 @@ def _send_lark_direct(adapter: Any, receive_id: str, message: str) -> dict[str, 
     }
 
 
+def _send_lark_direct(adapter: Any, receive_id: str, message: str) -> dict[str, Any]:
+    """Send via the adapter's authenticated client (gateway in-process)."""
+    client = getattr(adapter, "_client", None)
+    if client is None:
+        raise SendDmError("feishu adapter exposes no _client (hermes API drift?)")
+    return _send_with_lark_client(client, receive_id, message)
+
+
+def _send_lark_standalone(receive_id: str, message: str) -> dict[str, Any]:
+    """Send via a freshly-built lark_oapi.Client read from ~/.hermes/.env.
+
+    Used when ``_get_gateway_adapter`` raises (no live gateway runner in
+    this process) — e.g. ``bin/sweep_pending.py`` invoked from cron or
+    one-off CLI usage. This lets PAID actually deliver timeout / digest
+    messages even when the gateway is in a different process.
+    """
+    client = _build_standalone_lark_client()
+    return _send_with_lark_client(client, receive_id, message)
+
+
 def send_lark_card(
     platform: str,
     receive_id: str,
@@ -426,15 +513,27 @@ def send_lark_card(
         # a hard error so the caller picks the text fallback explicitly.
         raise SendDmError(f"send_lark_card unsupported on platform={platform!r}")
 
+    # Resolve a usable lark_oapi.Client. Prefer the in-process gateway adapter
+    # (cheaper, shares token cache); fall back to a standalone client built
+    # from ~/.hermes/.env when this code path is invoked outside the gateway
+    # process (e.g. cron-driven sweep).
+    client: Any = None
     try:
         adapter = _get_gateway_adapter(platform)
-    except SendDmError as exc:
-        if fallback_to_queue:
-            qp = _enqueue_outbound_fallback(
-                platform, receive_id, "[card] " + _json.dumps(card, ensure_ascii=False)
-            )
-            return {"ok": False, "queued": str(qp), "error": str(exc)}
-        raise
+        client = getattr(adapter, "_client", None)
+    except SendDmError:
+        client = None
+
+    if client is None:
+        try:
+            client = _build_standalone_lark_client()
+        except SendDmError as exc:
+            if fallback_to_queue:
+                qp = _enqueue_outbound_fallback(
+                    platform, receive_id, "[card] " + _json.dumps(card, ensure_ascii=False)
+                )
+                return {"ok": False, "queued": str(qp), "error": str(exc)}
+            raise
 
     try:
         from lark_oapi.api.im.v1 import (  # type: ignore
@@ -449,16 +548,6 @@ def send_lark_card(
             return {"ok": False, "queued": str(qp),
                     "error": f"lark_oapi import failed: {exc}"}
         raise SendDmError(f"lark_oapi import failed: {exc}") from exc
-
-    client = getattr(adapter, "_client", None)
-    if client is None:
-        if fallback_to_queue:
-            qp = _enqueue_outbound_fallback(
-                platform, receive_id, "[card] " + _json.dumps(card, ensure_ascii=False)
-            )
-            return {"ok": False, "queued": str(qp),
-                    "error": "feishu adapter has no _client"}
-        raise SendDmError("feishu adapter has no _client (hermes API drift?)")
 
     rid_type = _detect_lark_receive_id_type(receive_id)
     body = (
@@ -572,13 +661,25 @@ def send_dm(
     """
     import asyncio
 
+    # Resolution order for the lark / feishu non-chat_id branch:
+    #   1. Gateway adapter in this process (cheapest, shared token cache).
+    #   2. Standalone lark_oapi.Client built from ~/.hermes/.env (lets
+    #      out-of-process callers — bin/sweep_pending.py, ad-hoc CLI, cron —
+    #      actually deliver messages instead of always queuing).
+    #   3. Fallback to outbound_queue.jsonl as a last resort.
+    #
+    # For other platforms (telegram / wecom / etc), only step 1 applies; we
+    # don't have standalone clients for them yet.
+    adapter: Any = None
     try:
         adapter = _get_gateway_adapter(platform)
-    except SendDmError as exc:
-        if fallback_to_queue:
-            qp = _enqueue_outbound_fallback(platform, user_id, message)
-            return {"ok": False, "queued": str(qp), "error": str(exc)}
-        raise
+    except SendDmError as adapter_exc:
+        # Non-Lark platforms have no standalone fallback — go straight to queue.
+        if platform not in ("feishu", "lark"):
+            if fallback_to_queue:
+                qp = _enqueue_outbound_fallback(platform, user_id, message)
+                return {"ok": False, "queued": str(qp), "error": str(adapter_exc)}
+            raise
 
     # Lark / Feishu: when receive_id is NOT a chat_id (oc_…), the adapter's
     # hard-coded receive_id_type=chat_id rejects with [230001]. Bypass the
@@ -587,17 +688,44 @@ def send_dm(
         rid_type = _detect_lark_receive_id_type(user_id)
         if rid_type != "chat_id":
             try:
-                result = _send_lark_direct(adapter, user_id, message)
+                if adapter is not None:
+                    result = _send_lark_direct(adapter, user_id, message)
+                else:
+                    result = _send_lark_standalone(user_id, message)
             except Exception as exc:
-                if fallback_to_queue:
-                    qp = _enqueue_outbound_fallback(platform, user_id, message)
-                    return {"ok": False, "queued": str(qp),
-                            "error": f"lark direct send raised: {exc}"}
-                raise SendDmError(f"lark direct send raised: {exc}") from exc
+                # If gateway path raised AND we haven't tried standalone yet,
+                # one more attempt before giving up.
+                if adapter is not None:
+                    try:
+                        result = _send_lark_standalone(user_id, message)
+                    except Exception as exc2:
+                        if fallback_to_queue:
+                            qp = _enqueue_outbound_fallback(platform, user_id, message)
+                            return {"ok": False, "queued": str(qp),
+                                    "error": f"lark direct send raised: {exc}; "
+                                             f"standalone fallback raised: {exc2}"}
+                        raise SendDmError(
+                            f"lark direct send raised: {exc}; "
+                            f"standalone fallback raised: {exc2}"
+                        ) from exc2
+                else:
+                    if fallback_to_queue:
+                        qp = _enqueue_outbound_fallback(platform, user_id, message)
+                        return {"ok": False, "queued": str(qp),
+                                "error": f"lark standalone send raised: {exc}"}
+                    raise SendDmError(f"lark standalone send raised: {exc}") from exc
             if not result.get("ok") and fallback_to_queue:
                 qp = _enqueue_outbound_fallback(platform, user_id, message)
                 result["queued"] = str(qp)
             return result
+
+    # Non-Lark platforms below this point — adapter must exist.
+    if adapter is None:
+        # Should be unreachable because we returned/raised above.
+        if fallback_to_queue:
+            qp = _enqueue_outbound_fallback(platform, user_id, message)
+            return {"ok": False, "queued": str(qp), "error": "no adapter and platform has no standalone client"}
+        raise SendDmError(f"no adapter for platform={platform!r}")
 
     coro = adapter.send(user_id, message)
 

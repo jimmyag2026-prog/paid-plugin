@@ -232,8 +232,8 @@ These are intentionally cut for now. Each will land in a follow-up:
 
 ### Hermes upstream gaps PAID currently works around
 
-These are real upstream issues; PAID ships a workaround so v0.5 is usable
-today, but the cleanest fix is in `hermes-agent` itself:
+These are real upstream issues; PAID ships a workaround so v0.9 is
+usable today, but the cleanest fix is in `hermes-agent` itself:
 
 - **`pre_llm_call` hook does not pass `chat_id`.** Lark / Feishu's IM
   API is chat-centric — outbound messages need a `chat_id`, but the hook
@@ -250,6 +250,30 @@ today, but the cleanest fix is in `hermes-agent` itself:
   pre-hook and resolves at post-hook. In-memory only.
 - **Adapter `send()` hard-codes `receive_id_type=chat_id`.** Same root
   cause as the first item; same workaround.
+- **Identity bifurcation: `card.action.trigger` events arrive with
+  `open_id`, plain text events with `user_id`.** A pairing-approved
+  user can fail an auth check on a button click because hermes' approved
+  list keys on whichever form was first seen. PAID's
+  [`docs/LARK_SETUP.md`](docs/LARK_SETUP.md) walks through adding both
+  forms to `feishu-approved.json` AND `owner.json`.
+
+### Live-test learnings (real bugs we found by clicking buttons, not by reading docs)
+
+- **Lark Suite "Interactive Card" capability is a separate toggle from
+  the `card.action.trigger` event subscription.** Toggling the event on
+  without enabling the capability silently fails — the event won't even
+  appear in the Add-Events picker until the capability is on. Symptom:
+  error 200340 on every button click. Full walk-through in
+  [`docs/LARK_SETUP.md`](docs/LARK_SETUP.md).
+- **`SendResult.success` lies for HTTP 200 with API-level failure.**
+  Lark's adapter returns a SendResult with `.success=False` when the
+  API returned `[230001] invalid receive_id`, but the SDK call returned
+  HTTP 200. v0.8 onward inspects `.success` explicitly so a "queued"
+  outcome can't masquerade as a delivery.
+- **Sweep / cron callers are out-of-process.** v0.9.2 onward, `send_dm`
+  falls back to a standalone `lark_oapi.Client` built from
+  `~/.hermes/.env` when no in-process gateway adapter is available — so
+  `bin/sweep_pending.py` actually delivers, instead of always queuing.
 
 ### Quick start tips for new operators
 
@@ -262,6 +286,9 @@ today, but the cleanest fix is in `hermes-agent` itself:
 - Junior dispatch (`/paid-approve` → reply to junior) works without a
   pre-captured chat_id thanks to the direct-API workaround above; no
   per-junior `/sethome` is needed.
+- If you're on Lark Suite, complete the 3-step Interactive Card setup
+  in [`docs/LARK_SETUP.md`](docs/LARK_SETUP.md) before testing button
+  clicks — error 200340 is almost always a missing toggle there.
 
 ---
 
