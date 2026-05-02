@@ -48,6 +48,48 @@ from paid import (
 
 
 # ---------------------------------------------------------------------------
+# In-process session metadata cache.
+#
+# hermes' post_llm_call hook does NOT receive sender_id / platform in its
+# kwargs (verified against hermes-agent v0.12.0 — only pre_llm_call carries
+# them). Without a way to identify the sender at post-hook time, we can't
+# (a) early-return for owner messages so we don't audit-log their replies,
+# or (b) scope Layer 4 cross-cp checks to the right counterparty.
+#
+# Workaround: at pre_llm_call we cache (session_id → {platform, sender_id,
+# cp_id}); post_llm_call resolves by session_id. The cache is in-memory only;
+# losing it across restarts is acceptable — the worst outcome is one extra
+# audit row for an in-flight message.
+#
+# Bounded LRU keeps memory in check on long-running gateways.
+# ---------------------------------------------------------------------------
+
+from collections import OrderedDict
+
+_SESSION_META_CACHE: OrderedDict[str, dict[str, str]] = OrderedDict()
+_SESSION_META_CACHE_MAX = 256
+
+
+def _cache_session_meta(session_id: str, platform: str, sender_id: str, cp_id: str) -> None:
+    if not session_id:
+        return
+    _SESSION_META_CACHE[session_id] = {
+        "platform": platform or "",
+        "sender_id": sender_id or "",
+        "cp_id": cp_id or "",
+    }
+    _SESSION_META_CACHE.move_to_end(session_id)
+    while len(_SESSION_META_CACHE) > _SESSION_META_CACHE_MAX:
+        _SESSION_META_CACHE.popitem(last=False)
+
+
+def _lookup_session_meta(session_id: str) -> dict[str, str]:
+    if not session_id:
+        return {}
+    return _SESSION_META_CACHE.get(session_id, {})
+
+
+# ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
 
@@ -203,6 +245,10 @@ def on_pre_llm_call(**kwargs) -> dict | None:
         # Counterparty resolution -----------------------------------------------
         cp = identity.ensure_counterparty(platform, sender_id)
 
+        # Cache (session_id → metadata) so post_llm_call can resolve sender
+        # identity even though hermes drops platform/sender_id from its kwargs.
+        _cache_session_meta(session_id, platform, sender_id, cp.cp_id)
+
         if cp.role in ("ignored", "blocked"):
             _safe_log(f"[pre_llm] cp {cp.cp_id} role={cp.role} → silent")
             return {
@@ -356,6 +402,15 @@ def on_post_llm_call(**kwargs) -> None:
         platform = kwargs.get("platform") or ""
         sender_id = kwargs.get("sender_id") or ""
 
+        # hermes-agent v0.12.0's post_llm_call kwargs do NOT include
+        # platform/sender_id (only session_id is reliable). Fall back to the
+        # cache populated by pre_llm_call so we can still: (a) early-return
+        # on owner replies and (b) scope L4 to the right counterparty.
+        if not platform or not sender_id:
+            cached = _lookup_session_meta(session_id)
+            platform = platform or cached.get("platform", "")
+            sender_id = sender_id or cached.get("sender_id", "")
+
         if sender_id and platform and identity.is_owner(platform, sender_id):
             return
 
@@ -364,6 +419,8 @@ def on_post_llm_call(**kwargs) -> None:
         if sender_id and platform:
             cp = identity.load_counterparty(platform, sender_id)
             cp_id = cp.cp_id if cp else f"{platform}_{sender_id}"
+        elif session_id:
+            cp_id = _lookup_session_meta(session_id).get("cp_id", "")
 
         l4 = safety.check_output(response, cp_id)
         if not l4["ok"]:
