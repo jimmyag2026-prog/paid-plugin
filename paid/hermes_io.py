@@ -403,6 +403,125 @@ def _send_lark_direct(adapter: Any, receive_id: str, message: str) -> dict[str, 
     }
 
 
+def send_lark_card(
+    platform: str,
+    receive_id: str,
+    card: dict[str, Any],
+    *,
+    fallback_to_queue: bool = True,
+) -> dict[str, Any]:
+    """Send a Lark **interactive card** (``msg_type=interactive``).
+
+    Same plumbing as ``_send_lark_direct`` but lets the caller pass a card
+    JSON dict instead of plain text. The card schema is whatever Lark's
+    Open Platform expects — see ``__init__._format_lark_approval_card``
+    for PAID's approval card shape.
+
+    Returns the same shape as ``send_dm``.
+    """
+    import json as _json
+
+    if platform not in ("feishu", "lark"):
+        # Other platforms don't have an analogous "card" concept — treat as
+        # a hard error so the caller picks the text fallback explicitly.
+        raise SendDmError(f"send_lark_card unsupported on platform={platform!r}")
+
+    try:
+        adapter = _get_gateway_adapter(platform)
+    except SendDmError as exc:
+        if fallback_to_queue:
+            qp = _enqueue_outbound_fallback(
+                platform, receive_id, "[card] " + _json.dumps(card, ensure_ascii=False)
+            )
+            return {"ok": False, "queued": str(qp), "error": str(exc)}
+        raise
+
+    try:
+        from lark_oapi.api.im.v1 import (  # type: ignore
+            CreateMessageRequest,
+            CreateMessageRequestBody,
+        )
+    except Exception as exc:
+        if fallback_to_queue:
+            qp = _enqueue_outbound_fallback(
+                platform, receive_id, "[card] " + _json.dumps(card, ensure_ascii=False)
+            )
+            return {"ok": False, "queued": str(qp),
+                    "error": f"lark_oapi import failed: {exc}"}
+        raise SendDmError(f"lark_oapi import failed: {exc}") from exc
+
+    client = getattr(adapter, "_client", None)
+    if client is None:
+        if fallback_to_queue:
+            qp = _enqueue_outbound_fallback(
+                platform, receive_id, "[card] " + _json.dumps(card, ensure_ascii=False)
+            )
+            return {"ok": False, "queued": str(qp),
+                    "error": "feishu adapter has no _client"}
+        raise SendDmError("feishu adapter has no _client (hermes API drift?)")
+
+    rid_type = _detect_lark_receive_id_type(receive_id)
+    body = (
+        CreateMessageRequestBody.builder()
+        .receive_id(receive_id)
+        .msg_type("interactive")
+        .content(_json.dumps(card, ensure_ascii=False))
+        .build()
+    )
+    req = (
+        CreateMessageRequest.builder()
+        .receive_id_type(rid_type)
+        .request_body(body)
+        .build()
+    )
+
+    try:
+        resp = client.im.v1.message.create(req)
+    except Exception as exc:
+        if fallback_to_queue:
+            qp = _enqueue_outbound_fallback(
+                platform, receive_id, "[card] " + _json.dumps(card, ensure_ascii=False)
+            )
+            return {"ok": False, "queued": str(qp),
+                    "error": f"lark card send raised: {exc}"}
+        raise SendDmError(f"lark card send raised: {exc}") from exc
+
+    success = (
+        resp.success()  # type: ignore[attr-defined]
+        if hasattr(resp, "success") and callable(resp.success)
+        else (getattr(resp, "code", 1) == 0)
+    )
+    if not success:
+        result = {
+            "ok": False,
+            "error": f"lark api: code={getattr(resp, 'code', '?')} "
+                     f"msg={getattr(resp, 'msg', '') or getattr(resp, 'message', '')}",
+            "platform": "feishu",
+            "raw": repr(resp)[:300],
+        }
+        if fallback_to_queue:
+            qp = _enqueue_outbound_fallback(
+                platform, receive_id, "[card] " + _json.dumps(card, ensure_ascii=False)
+            )
+            result["queued"] = str(qp)
+        return result
+
+    data = getattr(resp, "data", None)
+    msg_id = (
+        getattr(data, "message_id", None)
+        or getattr(data, "msg_id", None)
+        or (data.get("message_id") if isinstance(data, dict) else None)
+    )
+    return {
+        "ok": True,
+        "msg_id": msg_id,
+        "platform": "feishu",
+        "receive_id_type": rid_type,
+        "msg_type": "interactive",
+        "raw": repr(resp)[:200],
+    }
+
+
 def _enqueue_outbound_fallback(platform: str, user_id: str, message: str) -> Path:
     """Append a queued outbound DM to disk so the owner can hand-deliver.
 

@@ -160,22 +160,144 @@ def _owner_primary_identity(owner: identity.Owner | None) -> tuple[str, str] | N
     return None
 
 
+def _confidence_badge(conf: float) -> str:
+    if conf >= 0.75:
+        return f"🟢 {conf:.2f}"
+    if conf >= 0.5:
+        return f"🟡 {conf:.2f}"
+    return f"🔴 {conf:.2f}"
+
+
+def _stakes_badge(stakes: str) -> str:
+    return {
+        "high": "🚨 HIGH",
+        "medium": "🟠 medium",
+        "low": "🟢 low",
+    }.get((stakes or "").lower(), stakes or "?")
+
+
+def _format_lark_approval_card(req: approval.PendingApproval) -> dict:
+    """Build the Lark interactive-card JSON for an approval request.
+
+    The two action buttons embed ``hermes_action="paid_approve" /
+    "paid_reject"`` inside ``value`` so we can detect "this is PAID's card,
+    not hermes's tool-approval card" downstream. Hermes's adapter keys off
+    the literal string ``hermes_action`` to mean "this is hermes's own
+    approval", so we use a different key (``paid_action``) to avoid that
+    branch and instead get routed to ``_handle_card_action_event`` →
+    synthetic ``/card button {json}`` slash command our handler reads.
+    """
+    confidence_pill = (
+        "🟢" if req.confidence >= 0.75
+        else "🟡" if req.confidence >= 0.5
+        else "🔴"
+    )
+    stakes_pill = {"high": "🚨 HIGH", "medium": "🟠 medium", "low": "🟢 low"}.get(
+        (req.stakes or "").lower(), req.stakes or "?"
+    )
+    q = (req.junior_question or "")[:600]
+    draft = (req.draft_answer or "(no draft — type /paid-approve <id> <your text>)")[:600]
+    sender = req.counterparty_display or req.counterparty_user_id
+
+    return {
+        "config": {"wide_screen_mode": True, "enable_forward": False},
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": f"📨 PAID approval #{req.request_id}",
+            },
+            "template": "blue",
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "fields": [
+                    {"is_short": True, "text": {"tag": "lark_md",
+                     "content": f"**From**\n{sender}\n_{req.counterparty_platform}_"}},
+                    {"is_short": True, "text": {"tag": "lark_md",
+                     "content": f"**Topic**\n{req.topic or '—'}"}},
+                    {"is_short": True, "text": {"tag": "lark_md",
+                     "content": f"**Stakes**\n{stakes_pill}"}},
+                    {"is_short": True, "text": {"tag": "lark_md",
+                     "content": f"**Confidence**\n{confidence_pill} {req.confidence:.2f}"}},
+                ],
+            },
+            {"tag": "hr"},
+            {"tag": "div", "text": {"tag": "lark_md",
+             "content": f"**Q (junior asked)**\n{q}"}},
+            {"tag": "div", "text": {"tag": "lark_md",
+             "content": f"**Draft (junior will see this on approve)**\n{draft}"}},
+            {"tag": "hr"},
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "✅ Approve & send"},
+                        "type": "primary",
+                        "value": {
+                            "paid_action": "approve",
+                            "request_id": req.request_id,
+                        },
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "❌ Reject"},
+                        "type": "danger",
+                        "value": {
+                            "paid_action": "reject",
+                            "request_id": req.request_id,
+                        },
+                    },
+                ],
+            },
+            {
+                "tag": "note",
+                "elements": [{
+                    "tag": "plain_text",
+                    "content": (
+                        "Tip: to override the draft instead of sending it as-is, "
+                        f"reply /paid-approve {req.request_id} <your text>"
+                    ),
+                }],
+            },
+        ],
+    }
+
+
 def _format_pending_card(req: approval.PendingApproval) -> str:
     """Plain-text approval card (Lark/Telegram-friendly).
 
-    No markdown / interactive buttons in v0.5 — owner replies via slash command.
+    Numbered shortcuts so the owner can reply without remembering the
+    full ``/paid-approve <id>`` syntax — just type ``1`` to approve, ``2``
+    to send a custom override, ``3`` to reject. (The numbered shorthand
+    is parsed by the slash-command surface; the verbose form still works.)
+    Confidence + stakes get visual badges so a skim is enough.
     """
+    draft = req.draft_answer or ""
+    draft_preview = (draft[:400] + " …") if len(draft) > 400 else (draft or "(no draft)")
+    q_preview = (
+        (req.junior_question[:400] + " …")
+        if len(req.junior_question) > 400 else req.junior_question
+    )
     return (
         f"📨 PAID approval #{req.request_id}\n"
         f"From: {req.counterparty_display or req.counterparty_user_id} "
         f"({req.counterparty_platform})\n"
-        f"Topic: {req.topic} · Stakes: {req.stakes} · Conf: {req.confidence:.2f}\n"
+        f"Topic: {req.topic}  ·  Stakes: {_stakes_badge(req.stakes)}  "
+        f"·  Conf: {_confidence_badge(req.confidence)}\n"
         f"\n"
-        f"Q: {req.junior_question[:400]}\n"
+        f"Q (junior asked):\n{q_preview}\n"
         f"\n"
-        f"Draft: {req.draft_answer[:400] if req.draft_answer else '(no draft)'}\n"
+        f"Draft (junior will see this if you approve):\n{draft_preview}\n"
         f"\n"
-        f"Reply with /paid-approve {req.request_id}  or  /paid-reject {req.request_id}"
+        f"Reply:\n"
+        f"  1️⃣ APPROVE — send draft as-is\n"
+        f"     /paid-approve {req.request_id}\n"
+        f"  2️⃣ EDIT    — replace with your text\n"
+        f"     /paid-approve {req.request_id} <your reply>\n"
+        f"  3️⃣ REJECT  — junior is told you'll reply directly\n"
+        f"     /paid-reject {req.request_id}"
     )
 
 
@@ -199,7 +321,11 @@ def _resolve_owner_send_target(platform: str, user_id: str) -> str:
 
 
 def _notify_owner_about_request(req: approval.PendingApproval) -> None:
-    """Push the approval card to the owner. Failures fall back to local queue."""
+    """Push the approval card to the owner. Failures fall back to local queue.
+
+    On feishu / lark: sends an interactive card (buttons → slash-command
+    callback). On other platforms: falls back to the plain-text card.
+    """
     owner = identity.load_owner()
     target = _owner_primary_identity(owner)
     if target is None:
@@ -207,11 +333,35 @@ def _notify_owner_about_request(req: approval.PendingApproval) -> None:
         return
     plat, uid = target
     receive_target = _resolve_owner_send_target(plat, uid)
+
+    if plat in ("feishu", "lark"):
+        try:
+            card = _format_lark_approval_card(req)
+            result = hermes_io.send_lark_card(
+                plat, receive_target, card, fallback_to_queue=True
+            )
+            _safe_log(
+                f"[approval] notify owner #{req.request_id} via {plat}:{receive_target} "
+                f"(interactive card) → {result}"
+            )
+            if result.get("ok"):
+                return
+            _safe_log(
+                f"[approval] interactive card failed, falling back to text for "
+                f"#{req.request_id}"
+            )
+        except Exception as exc:
+            _safe_log(
+                f"[approval] interactive card EXC #{req.request_id}: {exc} "
+                f"— falling back to text"
+            )
+
+    # Text fallback (other platforms or card failure).
     body = _format_pending_card(req)
     try:
         result = hermes_io.send_dm(plat, receive_target, body, fallback_to_queue=True)
         _safe_log(
-            f"[approval] notify owner #{req.request_id} via {plat}:{receive_target} → {result}"
+            f"[approval] notify owner #{req.request_id} via {plat}:{receive_target} (text) → {result}"
         )
     except Exception as exc:
         _safe_log(f"[approval] notify owner #{req.request_id} EXC {exc}")
@@ -242,11 +392,15 @@ def _format_discovery_card(
         f"  first message: {user_message[:300]!r}\n"
         f"{impersonation_note}\n"
         f"\n"
-        f"To trust them, run on the host:\n"
-        f"  python3 -m paid add-counterparty {cp.platform} {cp.user_id} "
+        f"Three ways to respond on the host:\n"
+        f"  1️⃣ TRUST  — let PAID auto-answer their topic\n"
+        f"     python3 -m paid add-counterparty {cp.platform} {cp.user_id} "
         f"--name '<display>' --role junior --topic-allow <topic>\n"
-        f"To ignore them, run:\n"
-        f"  python3 -m paid ignore-counterparty {cp.platform} {cp.user_id} "
+        f"  2️⃣ ASK    — bounce a clarifying question to them before deciding\n"
+        f"     python3 -m paid ask-counterparty {cp.platform} {cp.user_id} "
+        f"'<your question>'\n"
+        f"  3️⃣ IGNORE — silent reply, no escalations\n"
+        f"     python3 -m paid ignore-counterparty {cp.platform} {cp.user_id} "
         f"--reason '<why>'"
     )
 
@@ -771,6 +925,56 @@ def _cmd_reject(raw_args: str) -> str:
     return f"PAID: #{rid} rejected → {delivery}"
 
 
+def _cmd_card(raw_args: str) -> str:
+    """Handle Lark card-button clicks routed by hermes as ``/card <tag> <json>``.
+
+    The feishu adapter creates a synthetic command of the form::
+
+        /card button {"paid_action":"approve","request_id":"abc12345"}
+
+    when the operator clicks one of our approval card's buttons (no
+    ``hermes_action`` key, so it falls through to the generic dispatch).
+    We parse the JSON, find the matching action, and dispatch to the
+    existing ``_cmd_approve`` / ``_cmd_reject`` handlers — preserving a
+    single canonical code path.
+
+    Owner gating: hermes only routes the synthetic command when the
+    button-clicker is an authorised user; ``_is_caller_owner_via_env``
+    re-checks anyway so other plugins / future versions can't accidentally
+    let a non-owner trigger an approve.
+    """
+    if not _is_caller_owner_via_env():
+        return ""  # silent for non-owners
+    if not raw_args.strip():
+        return ""
+
+    parts = raw_args.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return ""  # not enough: missing JSON payload — ignore quietly
+    payload_str = parts[1]
+
+    try:
+        payload = json.loads(payload_str)
+    except Exception as exc:
+        _safe_log(f"[card] JSON parse fail: {exc} payload={payload_str[:200]!r}")
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+
+    action = str(payload.get("paid_action") or payload.get("action") or "").strip().lower()
+    rid = str(payload.get("request_id") or "").strip()
+    if not action or not rid:
+        return ""
+
+    if action == "approve":
+        return _cmd_approve(rid)
+    if action == "reject":
+        return _cmd_reject(rid)
+
+    _safe_log(f"[card] unknown paid_action={action!r} for #{rid}")
+    return ""
+
+
 def _cmd_status(raw_args: str) -> str:
     if not _is_caller_owner_via_env():
         return ""
@@ -832,6 +1036,17 @@ def register(ctx) -> None:
         description="Show full state of one PAID request.",
         args_hint="<id>",
     )
+    # `/card` intercepts hermes feishu adapter's synthetic command for
+    # interactive-card button clicks. Lark sends button click events as
+    # ``/card button {json}``; we parse and route to approve/reject.
+    try:
+        ctx.register_command(
+            "card", _cmd_card,
+            description="(internal) Lark card button click handler — used by PAID interactive cards.",
+        )
+        _safe_log("registered: /card (Lark interactive card handler)")
+    except Exception as exc:
+        _safe_log(f"/card registration skipped: {exc}")
 
-    _safe_log("hooks: pre_llm_call, post_llm_call")
-    _safe_log("commands: /paid-pending /paid-approve /paid-reject /paid-status")
+    _safe_log("hooks: pre_llm_call, post_llm_call, pre_gateway_dispatch")
+    _safe_log("commands: /paid-pending /paid-approve /paid-reject /paid-status /card")

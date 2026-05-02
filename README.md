@@ -15,10 +15,13 @@ It runs locally, all logs stay on your machine, and it speaks through
 your existing IM accounts (Telegram / Lark / Feishu / WhatsApp / WeCom /
 Slack — whichever Hermes is wired up to).
 
-**Status: v0.8 beta.** End-to-end loop is wired, 122 tests passing,
-verified live on Lark with the upstream `hermes-agent` v0.12.0. Several
+**Status: v0.9 beta.** End-to-end loop is wired, 128 tests passing,
+verified live on Lark with the upstream `hermes-agent` v0.12.0. Now
+ships an interactive Lark approval card (with button callbacks routed
+back to PAID), a local-only Flask web dashboard, daily snapshot reports,
+and a `paid status` upgrade with today's metrics + activity dots. Several
 v1 features intentionally cut for now (see
-[Limitations](#known-v08-limitations) below).
+[Limitations](#known-v09-limitations) below).
 
 ---
 
@@ -193,7 +196,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for module decomposition.
 
 ---
 
-## Known v0.8 limitations
+## Known v0.9 limitations
 
 These are intentionally cut for now. Each will land in a follow-up:
 
@@ -202,8 +205,10 @@ These are intentionally cut for now. Each will land in a follow-up:
 - **Layer 4c / 4d output checks** — LLM post-check and source attribution
   are not wired. Layer 4a/b is observer-only (logs but does not redact
   before send).
-- **Approval card buttons** — owner action is via slash command (works
-  on every IM); native interactive cards (Lark / Slack) come later.
+- **Approval card buttons** — Lark gets a real interactive card with
+  ✅ Approve / ❌ Reject buttons (button clicks come back through
+  hermes' synthetic-command path and dispatch to the existing handlers).
+  Other platforms still get the plain-text card with numbered shortcuts.
 - **Approval timeouts** — handled by ``bin/sweep_pending.py``; install it as
   a launchd / systemd timer (5 min cadence). Default timeout 30 min, see
   ``settings.json``.
@@ -212,7 +217,10 @@ These are intentionally cut for now. Each will land in a follow-up:
   `pending` role and PAID DMs you a discovery card on first contact; add
   them with `python3 -m paid add-counterparty …` or block them with
   `python3 -m paid ignore-counterparty <plat> <id> --reason "…"`.
-- **Dashboard** — none. `python3 -m paid status` is the read-only view.
+- **Dashboard** — `python3 -m paid status` (CLI) and `python3 -m paid
+  dashboard` (Flask web UI on 127.0.0.1:7777) both surface today's
+  metrics, recent activity, and counterparty health dots. Read-only;
+  install ``flask`` to use the web variant (`pip install --user flask`).
 - **Retrieval** — bigram-tokenised substring scorer over `sop.md`. Optional
   ``jieba`` (``pip install jieba``) gives proper Chinese segmentation; the
   fallback bigram path is good enough for SOP-sized corpora. No FTS5, no
@@ -264,7 +272,7 @@ cd /path/to/paid
 python3 -m pytest tests/ -q
 ```
 
-122 tests, ~0.3 s on a 2024 MBP. New contributions should keep it green.
+128 tests, ~0.3 s on a 2024 MBP. New contributions should keep it green.
 
 ---
 

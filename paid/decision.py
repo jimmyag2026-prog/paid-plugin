@@ -207,19 +207,45 @@ def _direct_context(
     )
 
 
+def _approval_timeout_minutes_for_copy() -> int:
+    """Resolve the timeout window we should advertise to the junior.
+
+    Pulls from ``settings.json`` so the placeholder line stays in sync with
+    the sweeper's actual cutoff. Falls back to 30 if settings unreadable
+    so unit-test fixtures don't have to mock storage.
+    """
+    try:
+        from . import settings as _settings  # lazy
+        secs = _settings.approval_timeout_seconds()
+        if secs > 0:
+            return max(1, int(round(secs / 60)))
+    except Exception:
+        pass
+    return 30
+
+
 def _request_line(owner_name: str, topic: str, lang: str) -> str:
-    """The exact placeholder line shown to the junior on `request` state."""
+    """The exact placeholder line shown to the junior on `request` state.
+
+    Includes an explicit auto-defer countdown so juniors know what happens
+    if the owner doesn't respond. The minute count tracks
+    ``settings.approval_timeout_minutes`` — change one, both move.
+    """
+    mins = _approval_timeout_minutes_for_copy()
     if lang == "zh":
         topic_clause = f"关于 {topic} 这个问题" if topic else "你这个问题"
         return (
-            f"嗨，我是 {owner_name} 的 AI 助理。{topic_clause}我先转给 {owner_name}，"
-            f"他通常 30 分钟内会回复。如果紧急可以直接 @ 他。— {owner_name}'s PAID"
+            f"嗨,我是 {owner_name} 的 AI 助理。{topic_clause}我先转给 {owner_name}; "
+            f"他通常 {mins} 分钟内会回复。如果 {mins} 分钟还没动静我会再给你一条交代消息。"
+            f"紧急可以直接 @ 他。— {owner_name}'s PAID"
         )
     topic_clause = f"On {topic}, " if topic else ""
     return (
         f"Hi — I'm {owner_name}'s AI assistant. {topic_clause}let me hand this "
-        f"to {owner_name}; he typically replies within 30 min. If urgent, "
-        f"feel free to @ him directly. — {owner_name}'s PAID"
+        f"to {owner_name}; he typically replies within {mins} min. If "
+        f"{mins} min passes without a reply I'll send a follow-up so you're "
+        f"not left hanging. If urgent, feel free to @ him directly. "
+        f"— {owner_name}'s PAID"
     )
 
 
