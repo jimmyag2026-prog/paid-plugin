@@ -19,7 +19,10 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Topic :: Communications :: Chat",
 ]
-dependencies = []
+dependencies = [
+    "httpx>=0.24",
+    "PyYAML>=6.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/jimmyag2026-prog/paid-plugin"
