@@ -214,6 +214,113 @@ def _get_gateway_adapter(platform: str):
     return adapter
 
 
+# ---------------------------------------------------------------------------
+# Lark / Feishu — receive_id_type inference + direct API send
+# ---------------------------------------------------------------------------
+
+# The hermes feishu adapter's ``send()`` (gateway/platforms/feishu.py:4088 in
+# v0.12.0) hard-codes ``receive_id_type="chat_id"``, so a bare tenant
+# ``user_id`` from ``owner.json`` / counterparty profiles fails with
+# ``[230001] invalid receive_id``. To keep PAID functional without forking
+# hermes, we detect the receive_id format and bypass the adapter's ``send``
+# when we don't have a chat_id, calling Lark's IM API directly via the
+# adapter's already-authenticated ``_client``.
+#
+# Once the upstream issue (chat_id in pre_llm_call kwargs) lands, we will be
+# able to capture chat_id at hook time and store it on counterparty profiles —
+# this branch then becomes redundant but harmless.
+
+_LARK_RECEIVE_ID_TYPES = {
+    "oc_": "chat_id",
+    "ou_": "open_id",
+    "on_": "union_id",
+}
+
+
+def _detect_lark_receive_id_type(receive_id: str) -> str:
+    """Infer ``receive_id_type`` for Lark's ``/im/v1/messages`` from the prefix.
+
+    Returns one of: ``chat_id`` / ``open_id`` / ``union_id`` / ``email`` /
+    ``user_id`` (default fallback for IDs without a known prefix).
+    """
+    if not receive_id:
+        return "user_id"
+    if "@" in receive_id and "." in receive_id.split("@", 1)[1]:
+        return "email"
+    for prefix, kind in _LARK_RECEIVE_ID_TYPES.items():
+        if receive_id.startswith(prefix):
+            return kind
+    return "user_id"
+
+
+def _send_lark_direct(adapter: Any, receive_id: str, message: str) -> dict[str, Any]:
+    """Send a Lark text message directly via the adapter's authenticated client.
+
+    Bypasses the adapter's ``send()`` which hard-codes ``receive_id_type``.
+    Used when the caller only has a ``user_id`` / ``open_id`` / etc.
+    """
+    import json as _json  # local import to keep module-level deps minimal
+
+    try:
+        from lark_oapi.api.im.v1 import (  # type: ignore
+            CreateMessageRequest,
+            CreateMessageRequestBody,
+        )
+    except Exception as exc:
+        raise SendDmError(f"lark_oapi not importable for direct send: {exc}") from exc
+
+    client = getattr(adapter, "_client", None)
+    if client is None:
+        raise SendDmError("feishu adapter exposes no _client (hermes API drift?)")
+
+    rid_type = _detect_lark_receive_id_type(receive_id)
+    body = (
+        CreateMessageRequestBody.builder()
+        .receive_id(receive_id)
+        .msg_type("text")
+        .content(_json.dumps({"text": message}, ensure_ascii=False))
+        .build()
+    )
+    req = (
+        CreateMessageRequest.builder()
+        .receive_id_type(rid_type)
+        .request_body(body)
+        .build()
+    )
+
+    resp = client.im.v1.message.create(req)
+
+    # lark_oapi response objects expose ``success()`` and ``code`` / ``msg``;
+    # be tolerant of either shape.
+    success = (
+        resp.success()  # type: ignore[attr-defined]
+        if hasattr(resp, "success") and callable(resp.success)
+        else (getattr(resp, "code", 1) == 0)
+    )
+    if not success:
+        return {
+            "ok": False,
+            "error": f"lark api: code={getattr(resp, 'code', '?')} "
+                     f"msg={getattr(resp, 'msg', '') or getattr(resp, 'message', '')}",
+            "platform": "feishu",
+            "raw": repr(resp)[:300],
+        }
+
+    data = getattr(resp, "data", None)
+    msg_id = (
+        getattr(data, "message_id", None)
+        or getattr(data, "msg_id", None)
+        or (data.get("message_id") if isinstance(data, dict) else None)
+    )
+    return {
+        "ok": True,
+        "msg_id": msg_id,
+        "platform": "feishu",
+        "receive_id_type": rid_type,
+        "raw": repr(resp)[:200],
+    }
+
+
 def _enqueue_outbound_fallback(platform: str, user_id: str, message: str) -> Path:
     """Append a queued outbound DM to disk so the owner can hand-deliver.
 
@@ -271,6 +378,25 @@ def send_dm(
             qp = _enqueue_outbound_fallback(platform, user_id, message)
             return {"ok": False, "queued": str(qp), "error": str(exc)}
         raise
+
+    # Lark / Feishu: when receive_id is NOT a chat_id (oc_…), the adapter's
+    # hard-coded receive_id_type=chat_id rejects with [230001]. Bypass the
+    # adapter and call Lark's IM API directly with the inferred type.
+    if platform in ("feishu", "lark"):
+        rid_type = _detect_lark_receive_id_type(user_id)
+        if rid_type != "chat_id":
+            try:
+                result = _send_lark_direct(adapter, user_id, message)
+            except Exception as exc:
+                if fallback_to_queue:
+                    qp = _enqueue_outbound_fallback(platform, user_id, message)
+                    return {"ok": False, "queued": str(qp),
+                            "error": f"lark direct send raised: {exc}"}
+                raise SendDmError(f"lark direct send raised: {exc}") from exc
+            if not result.get("ok") and fallback_to_queue:
+                qp = _enqueue_outbound_fallback(platform, user_id, message)
+                result["queued"] = str(qp)
+            return result
 
     coro = adapter.send(user_id, message)
 

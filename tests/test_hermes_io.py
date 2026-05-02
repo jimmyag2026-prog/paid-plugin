@@ -179,3 +179,157 @@ def test_malformed_response_shape_raises(tmp_path, monkeypatch):
         with pytest.raises(hermes_io.LLMCallError) as exc:
             hermes_io.call_llm("hi")
     assert "choices" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Lark / Feishu direct-send tests (Approach A — bypass adapter chat_id lock)
+# ---------------------------------------------------------------------------
+
+
+def test_detect_lark_receive_id_type_classification():
+    f = hermes_io._detect_lark_receive_id_type
+    assert f("oc_f4de22018c4a9f9480450ef9f8c13231") == "chat_id"
+    assert f("ou_abc123def456789012345678") == "open_id"
+    assert f("on_unionid001") == "union_id"
+    assert f("4ed67983") == "user_id"        # tenant short-hex
+    assert f("8ea86e3b") == "user_id"
+    assert f("alice@example.com") == "email"
+    assert f("") == "user_id"                 # empty falls back
+
+
+def test_send_lark_direct_uses_correct_receive_id_type():
+    """When given a user_id (no oc_/ou_ prefix), _send_lark_direct must
+    construct the request with receive_id_type='user_id' — proving we no
+    longer rely on the adapter's chat_id-only send()."""
+    fake_resp = mock.Mock()
+    fake_resp.success = lambda: True
+    fake_resp.data = mock.Mock(message_id="om_TESTMSGID")
+
+    fake_client = mock.Mock()
+    fake_client.im.v1.message.create.return_value = fake_resp
+
+    fake_adapter = mock.Mock()
+    fake_adapter._client = fake_client
+
+    # Fake out lark_oapi imports — capture the request that was built.
+    captured = {}
+
+    class _FakeBody:
+        @classmethod
+        def builder(cls):
+            b = mock.Mock()
+            b.receive_id = lambda v: (captured.setdefault("receive_id", v), b)[1]
+            b.msg_type = lambda v: (captured.setdefault("msg_type", v), b)[1]
+            b.content = lambda v: (captured.setdefault("content", v), b)[1]
+            b.build = lambda: "BODY"
+            return b
+
+    class _FakeReq:
+        @classmethod
+        def builder(cls):
+            r = mock.Mock()
+            r.receive_id_type = lambda v: (captured.setdefault("receive_id_type", v), r)[1]
+            r.request_body = lambda v: (captured.setdefault("request_body", v), r)[1]
+            r.build = lambda: "REQ"
+            return r
+
+    fake_module = mock.Mock()
+    fake_module.CreateMessageRequestBody = _FakeBody
+    fake_module.CreateMessageRequest = _FakeReq
+
+    with mock.patch.dict(sys.modules, {"lark_oapi.api.im.v1": fake_module}):
+        result = hermes_io._send_lark_direct(fake_adapter, "4ed67983", "hello")
+
+    assert captured["receive_id"] == "4ed67983"
+    assert captured["receive_id_type"] == "user_id"
+    assert captured["msg_type"] == "text"
+    assert json.loads(captured["content"]) == {"text": "hello"}
+    fake_client.im.v1.message.create.assert_called_once_with("REQ")
+    assert result["ok"] is True
+    assert result["msg_id"] == "om_TESTMSGID"
+    assert result["receive_id_type"] == "user_id"
+
+
+def test_send_lark_direct_chat_id_uses_chat_id_type():
+    """When given a chat_id (oc_…), receive_id_type should be chat_id."""
+    fake_resp = mock.Mock()
+    fake_resp.success = lambda: True
+    fake_resp.data = mock.Mock(message_id="om_X")
+
+    fake_client = mock.Mock()
+    fake_client.im.v1.message.create.return_value = fake_resp
+
+    fake_adapter = mock.Mock(_client=fake_client)
+
+    captured = {}
+
+    class _FakeBody:
+        @classmethod
+        def builder(cls):
+            b = mock.Mock()
+            b.receive_id = lambda v: b
+            b.msg_type = lambda v: b
+            b.content = lambda v: b
+            b.build = lambda: "B"
+            return b
+
+    class _FakeReq:
+        @classmethod
+        def builder(cls):
+            r = mock.Mock()
+            r.receive_id_type = lambda v: (captured.setdefault("receive_id_type", v), r)[1]
+            r.request_body = lambda v: r
+            r.build = lambda: "R"
+            return r
+
+    fake_module = mock.Mock()
+    fake_module.CreateMessageRequestBody = _FakeBody
+    fake_module.CreateMessageRequest = _FakeReq
+
+    with mock.patch.dict(sys.modules, {"lark_oapi.api.im.v1": fake_module}):
+        out = hermes_io._send_lark_direct(fake_adapter, "oc_chatid001", "hi")
+
+    assert captured["receive_id_type"] == "chat_id"
+    assert out["ok"] is True
+
+
+def test_send_lark_direct_propagates_failure():
+    """An unsuccessful Lark response must surface ok=False with the error."""
+    fake_resp = mock.Mock()
+    fake_resp.success = lambda: False
+    fake_resp.code = 230001
+    fake_resp.msg = "invalid receive_id"
+    fake_resp.data = None
+
+    fake_client = mock.Mock()
+    fake_client.im.v1.message.create.return_value = fake_resp
+    fake_adapter = mock.Mock(_client=fake_client)
+
+    class _FakeBody:
+        @classmethod
+        def builder(cls):
+            b = mock.Mock()
+            b.receive_id = lambda v: b
+            b.msg_type = lambda v: b
+            b.content = lambda v: b
+            b.build = lambda: "B"
+            return b
+
+    class _FakeReq:
+        @classmethod
+        def builder(cls):
+            r = mock.Mock()
+            r.receive_id_type = lambda v: r
+            r.request_body = lambda v: r
+            r.build = lambda: "R"
+            return r
+
+    fake_module = mock.Mock()
+    fake_module.CreateMessageRequestBody = _FakeBody
+    fake_module.CreateMessageRequest = _FakeReq
+
+    with mock.patch.dict(sys.modules, {"lark_oapi.api.im.v1": fake_module}):
+        out = hermes_io._send_lark_direct(fake_adapter, "4ed67983", "x")
+
+    assert out["ok"] is False
+    assert "230001" in out["error"]
