@@ -196,8 +196,41 @@ def _format_lark_approval_card(req: approval.PendingApproval) -> dict:
         (req.stakes or "").lower(), req.stakes or "?"
     )
     q = (req.junior_question or "")[:600]
-    draft = (req.draft_answer or "(no draft — type /paid-approve <id> <your text>)")[:600]
+    has_draft = bool((req.draft_answer or "").strip())
+    draft_for_display = (
+        req.draft_answer[:600] if has_draft
+        else "(no draft — sensitive topic. Approve via /paid-approve "
+             f"{req.request_id} &lt;your reply text&gt;)"
+    )
     sender = req.counterparty_display or req.counterparty_user_id
+
+    # Build action buttons: only show ✅ Approve when there's a draft to send.
+    # Hard-blacklist topics (salary / equity / etc) come through with empty
+    # drafts on purpose — clicking ✅ would just bounce ("no draft" error),
+    # so we show ❌ Reject only and route the operator to slash-override.
+    buttons: list[dict] = []
+    if has_draft:
+        buttons.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "✅ Approve & send draft"},
+            "type": "primary",
+            "value": {"paid_action": "approve", "request_id": req.request_id},
+        })
+    buttons.append({
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": "❌ Reject"},
+        "type": "danger",
+        "value": {"paid_action": "reject", "request_id": req.request_id},
+    })
+
+    note_content = (
+        "Tip: to override the draft instead of sending it as-is, reply "
+        f"/paid-approve {req.request_id} &lt;your text&gt;"
+        if has_draft else
+        f"This is a sensitive-topic request — no draft was generated. "
+        f"To answer: /paid-approve {req.request_id} &lt;your reply&gt;. "
+        f"To deflect: tap ❌ Reject."
+    )
 
     return {
         "config": {"wide_screen_mode": True, "enable_forward": False},
@@ -206,7 +239,9 @@ def _format_lark_approval_card(req: approval.PendingApproval) -> dict:
                 "tag": "plain_text",
                 "content": f"📨 PAID approval #{req.request_id}",
             },
-            "template": "blue",
+            # Sensitive (no-draft) requests get a red header so the operator's
+            # eye is drawn before they click anything.
+            "template": "blue" if has_draft else "red",
         },
         "elements": [
             {
@@ -226,40 +261,16 @@ def _format_lark_approval_card(req: approval.PendingApproval) -> dict:
             {"tag": "div", "text": {"tag": "lark_md",
              "content": f"**Q (junior asked)**\n{q}"}},
             {"tag": "div", "text": {"tag": "lark_md",
-             "content": f"**Draft (junior will see this on approve)**\n{draft}"}},
+             "content": (
+                 f"**Draft (junior will see this on approve)**\n{draft_for_display}"
+                 if has_draft else
+                 f"**Draft**\n{draft_for_display}"
+             )}},
             {"tag": "hr"},
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "✅ Approve & send"},
-                        "type": "primary",
-                        "value": {
-                            "paid_action": "approve",
-                            "request_id": req.request_id,
-                        },
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "❌ Reject"},
-                        "type": "danger",
-                        "value": {
-                            "paid_action": "reject",
-                            "request_id": req.request_id,
-                        },
-                    },
-                ],
-            },
+            {"tag": "action", "actions": buttons},
             {
                 "tag": "note",
-                "elements": [{
-                    "tag": "plain_text",
-                    "content": (
-                        "Tip: to override the draft instead of sending it as-is, "
-                        f"reply /paid-approve {req.request_id} <your text>"
-                    ),
-                }],
+                "elements": [{"tag": "plain_text", "content": note_content}],
             },
         ],
     }
@@ -967,6 +978,22 @@ def _cmd_card(raw_args: str) -> str:
         return ""
 
     if action == "approve":
+        # Empty-draft handling: hard-blacklist topics (salary / equity / etc.)
+        # come through with no classifier-generated draft, since we don't want
+        # the LLM speculating on sensitive content. Clicking ✅ in that case
+        # has nothing to send. Redirect the owner to the slash form with an
+        # explicit override message rather than letting them click into a
+        # silent failure.
+        req = approval.get(rid)
+        if req is not None and req.status == "pending" and not (req.draft_answer or "").strip():
+            _safe_log(f"[card] approve clicked on #{rid} but draft empty — asking owner for override")
+            return (
+                f"PAID #{rid}: this is a sensitive-topic request and PAID didn't draft "
+                f"an answer. To approve, reply with your answer:\n"
+                f"  /paid-approve {rid} <your reply text>\n"
+                f"Or reject with:\n"
+                f"  /paid-reject {rid}"
+            )
         return _cmd_approve(rid)
     if action == "reject":
         return _cmd_reject(rid)
