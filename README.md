@@ -1,5 +1,10 @@
 # PAID — Personal AI Delegate
 
+[![tests](https://github.com/jimmyag2026-prog/paid-plugin/actions/workflows/tests.yml/badge.svg)](https://github.com/jimmyag2026-prog/paid-plugin/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
+[![Hermes plugin](https://img.shields.io/badge/Hermes-plugin-orange)](https://github.com/NousResearch/hermes-agent)
+
 > Authorise an AI to handle a class of your IM messages on your behalf,
 > with an explicit approval gate. Three-state pipeline: auto-answer / ask
 > you first / decline back to you. Same category as a lawyer or
