@@ -15,8 +15,9 @@ echo "  target: $DEST"
 
 mkdir -p "$DEST"
 
-# Sync code, exclude dev artefacts.
-rsync -a --delete \
+# Sync code, exclude dev artefacts. --delete-excluded so stray pycache /
+# pytest_cache from a previous install get cleaned up too.
+rsync -a --delete --delete-excluded \
     --exclude '.git' \
     --exclude '.gitignore' \
     --exclude '.pytest_cache' \
