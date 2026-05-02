@@ -189,7 +189,10 @@ def _get_gateway_adapter(platform: str):
     """
     try:
         from gateway import run as _gw  # type: ignore
-        from gateway.session_context import Platform  # type: ignore
+        # Platform enum lives in gateway.config (verified against
+        # hermes-agent v0.12.0). Older drafts referenced session_context,
+        # which never exported Platform — that import always raised.
+        from gateway.config import Platform  # type: ignore
     except Exception as exc:
         raise SendDmError(f"hermes gateway modules not importable: {exc}") from exc
 
