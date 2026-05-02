@@ -170,6 +170,21 @@ def _cmd_add_counterparty(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_ignore_counterparty(args: argparse.Namespace) -> int:
+    cp = identity.load_counterparty(args.platform, args.user_id)
+    if cp is None:
+        # Auto-create as pending so we can record the ignore decision; this
+        # matches the discovery card flow where unknown senders may not yet
+        # have a profile.
+        cp = identity.ensure_counterparty(args.platform, args.user_id)
+    identity.mark_ignored(cp, reason=args.reason)
+    print(
+        f"ignored {cp.cp_id}: reason={cp.ignore_reason!r}  "
+        f"set_at={cp.ignore_set_at}"
+    )
+    return 0
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     owner = identity.load_owner()
     cp_root = storage.PAID_DIR / "counterparties"
@@ -289,6 +304,19 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--topic-escalate", action="append", default=[])
     a.add_argument("--notes", default="")
     a.set_defaults(func=_cmd_add_counterparty)
+
+    ig = sub.add_parser(
+        "ignore-counterparty",
+        help="Mark a counterparty as ignored (silent reply, no escalation).",
+    )
+    ig.add_argument("platform")
+    ig.add_argument("user_id")
+    ig.add_argument(
+        "--reason",
+        default="",
+        help="Why you ignored them — surfaced on the dashboard / discovery flow.",
+    )
+    ig.set_defaults(func=_cmd_ignore_counterparty)
 
     st = sub.add_parser("status", help="Show summary of PAID state.")
     st.set_defaults(func=_cmd_status)

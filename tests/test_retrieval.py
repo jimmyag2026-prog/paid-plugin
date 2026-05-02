@@ -143,3 +143,67 @@ def test_retrieve_chinese_query_no_match_falls_back(paid_tmp):
     out = retrieve_sop_context("象棋 蚯蚓 zzzzz")
     # Fallback returns the first paragraph (H1 "# PAID 操作手册" in this fixture)
     assert "操作手册" in out or "PAID" in out
+
+
+# ---------------------------------------------------------------------------
+# Bigram tokenizer regression — long-form Chinese SOP paragraphs that
+# would have scored 0 under the pre-v0.8 single-char tokenizer when they
+# happen to share many common chars across all paragraphs.
+# ---------------------------------------------------------------------------
+
+
+CN_SOP_LONG = """\
+# PAID 个人助理操作手册
+
+PAID 是 Jimmy 的代理 AI，按授权处理来访者的消息。整体设计是三态：直接答 / 请示
+Jimmy / 拒答。这一段是顶层概览，不应该被任何具体问题命中。
+
+## 工作时间与时区
+
+Jimmy 默认工作时间是周一到周五上午十点到下午六点半，时区是 Asia/Hong_Kong (UTC+8)。
+紧急情况除外，下班后不一定及时回。
+
+## 退款流程
+
+国内订单退款通常 7 个工作日内处理完毕。需要订单号和发票编号才能开启流程。
+
+## 会议安排
+
+默认会议长度 25 分钟，前后保留 5 分钟缓冲。约一对一去 calendly.com/jimmy 看空档，
+临时改期至少提前 4 小时。
+"""
+
+
+def test_bigram_finds_specific_chinese_paragraph(paid_tmp):
+    """Long-form Chinese: question about working hours must hit the
+    'working hours' paragraph at the top of the result."""
+    _write_sop(paid_tmp, CN_SOP_LONG)
+    out = retrieve_sop_context("Jimmy 工作时间是几点？")
+    assert "上午十点" in out and "下午六点" in out
+    # Ranking check: the working-hours content must appear BEFORE the
+    # overview content if both are included.
+    if "顶层概览" in out:
+        assert out.index("上午十点") < out.index("顶层概览")
+
+
+def test_bigram_disambiguates_meeting_vs_refund(paid_tmp):
+    _write_sop(paid_tmp, CN_SOP_LONG)
+    out = retrieve_sop_context("会议默认多久")
+    assert "25 分钟" in out
+    assert "退款" not in out  # must not bleed in via shared chars
+
+
+def test_bigram_refund_query_hits_refund_section(paid_tmp):
+    _write_sop(paid_tmp, CN_SOP_LONG)
+    out = retrieve_sop_context("怎么处理退款 需要什么材料")
+    assert "退款" in out
+    assert "订单号" in out
+
+
+def test_tokenize_bigram_pure_unit():
+    """Direct unit test on _tokenize: bigrams emerge for pure CJK input."""
+    from paid.retrieval import _tokenize
+    toks = _tokenize("工作时间")
+    # bigrams must be present
+    assert "工作" in toks
+    assert "时间" in toks

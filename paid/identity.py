@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import storage
@@ -42,6 +43,14 @@ class Counterparty:
     topics_always_escalate: list[str]
     web_search_allowed: bool
     notes: str
+    # When role transitions to "ignored"/"blocked", these record why and when.
+    # The dashboard / discovery flow surfaces them so the owner doesn't have
+    # to remember why they ignored someone three months ago.
+    ignore_reason: str = ""
+    ignore_set_at: str = ""    # ISO-8601 UTC; empty when not ignored
+    # Set on first inbound message; suppresses re-firing the discovery card
+    # if the same sender pings again before owner classifies them.
+    discovery_notified_at: str = ""
 
 
 def _owner_path() -> Path:
@@ -106,7 +115,71 @@ def load_counterparty(platform: str, sender_id: str) -> Counterparty | None:
         ),
         web_search_allowed=bool(data.get("web_search_allowed", True)),
         notes=data.get("notes", ""),
+        ignore_reason=data.get("ignore_reason", ""),
+        ignore_set_at=data.get("ignore_set_at", ""),
+        discovery_notified_at=data.get("discovery_notified_at", ""),
     )
+
+
+def save_counterparty(cp: Counterparty) -> None:
+    """Persist a Counterparty back to its profile.json."""
+    storage.write_json(_cp_profile_path(cp.cp_id), asdict(cp))
+
+
+def list_all_counterparties() -> list[Counterparty]:
+    """Walk ``counterparties/`` and load every profile (impersonation lookup,
+    dashboard, etc). Skips unreadable / non-dir entries silently."""
+    root = storage.PAID_DIR / "counterparties"
+    if not root.exists():
+        return []
+    out: list[Counterparty] = []
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        data = storage.read_json(child / "profile.json")
+        if not data:
+            continue
+        try:
+            cp = load_counterparty(
+                str(data.get("platform", "")),
+                str(data.get("user_id", "")),
+            )
+        except Exception:
+            continue
+        if cp is not None:
+            out.append(cp)
+    return out
+
+
+def detect_impersonation(cp: Counterparty) -> Counterparty | None:
+    """Return another known counterparty whose ``display_name`` matches *cp*'s
+    name (case-insensitive) on a DIFFERENT platform. Returns None if no clash.
+
+    This lets PAID flag "someone calling themselves Alice on Telegram when
+    we already have an Alice on Lark" so the owner doesn't auto-treat them
+    as the same trust level.
+    """
+    if not cp.display_name.strip():
+        return None
+    needle = cp.display_name.strip().lower()
+    for other in list_all_counterparties():
+        if other.cp_id == cp.cp_id:
+            continue
+        if other.platform == cp.platform:
+            continue
+        if other.display_name.strip().lower() == needle:
+            return other
+    return None
+
+
+def mark_ignored(cp: Counterparty, reason: str) -> Counterparty:
+    """Transition ``cp.role`` to ``ignored``, recording reason + UTC timestamp.
+    Returns the saved counterparty."""
+    cp.role = "ignored"
+    cp.ignore_reason = reason or "(no reason given)"
+    cp.ignore_set_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    save_counterparty(cp)
+    return cp
 
 
 def ensure_counterparty(

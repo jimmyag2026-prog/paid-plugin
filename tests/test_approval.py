@@ -93,3 +93,74 @@ def test_event_log_is_append_only_audit_trail(paid_tmp):
 def test_short_id_is_unique_across_creates(paid_tmp):
     ids = {_make().request_id for _ in range(20)}
     assert len(ids) == 20
+
+
+def test_list_overdue_returns_empty_when_nothing_old(paid_tmp):
+    """No pending → empty regardless of threshold."""
+    from paid import approval as ap
+    assert ap.list_overdue(60) == []
+
+
+def test_list_overdue_picks_only_pending_past_cutoff(paid_tmp, monkeypatch):
+    """Old pending = swept; recent pending = kept; resolved = ignored."""
+    from paid import approval as ap
+
+    # Use a controllable clock.
+    fake_now = [1_000_000.0]
+    monkeypatch.setattr(ap, "_now", lambda: fake_now[0])
+
+    old = ap.create(
+        counterparty_id="feishu_old", counterparty_platform="feishu",
+        counterparty_user_id="old1", counterparty_display="Old",
+        junior_session_id="s1", junior_question="?", draft_answer="",
+        topic="t", stakes="medium", confidence=0.5,
+    )
+
+    fake_now[0] += 100  # 100 seconds later
+    fresh = ap.create(
+        counterparty_id="feishu_fresh", counterparty_platform="feishu",
+        counterparty_user_id="fresh1", counterparty_display="Fresh",
+        junior_session_id="s2", junior_question="?", draft_answer="",
+        topic="t", stakes="medium", confidence=0.5,
+    )
+
+    fake_now[0] += 5  # ask "what's overdue past 50s ago?"
+    overdue = ap.list_overdue(50)
+
+    overdue_ids = [r.request_id for r in overdue]
+    assert old.request_id in overdue_ids
+    assert fresh.request_id not in overdue_ids
+
+
+def test_list_overdue_skips_resolved(paid_tmp, monkeypatch):
+    from paid import approval as ap
+
+    fake_now = [2_000_000.0]
+    monkeypatch.setattr(ap, "_now", lambda: fake_now[0])
+
+    req = ap.create(
+        counterparty_id="feishu_x", counterparty_platform="feishu",
+        counterparty_user_id="x1", counterparty_display="X",
+        junior_session_id="s1", junior_question="?", draft_answer="",
+        topic="t", stakes="medium", confidence=0.5,
+    )
+    fake_now[0] += 60
+    ap.set_status(req.request_id, "approved", final_text="ok")
+
+    fake_now[0] += 10
+    assert ap.list_overdue(30) == []  # request resolved, not counted
+
+
+def test_set_status_accepts_timed_out(paid_tmp):
+    """timed_out is a valid Status; set_status should round-trip it."""
+    from paid import approval as ap
+    req = ap.create(
+        counterparty_id="feishu_t", counterparty_platform="feishu",
+        counterparty_user_id="t1", counterparty_display="T",
+        junior_session_id="s", junior_question="q", draft_answer="",
+        topic="t", stakes="low", confidence=0.4,
+    )
+    res = ap.set_status(req.request_id, "timed_out", final_text="auto")
+    assert res is not None
+    assert res.status == "timed_out"
+    assert ap.get(req.request_id).status == "timed_out"

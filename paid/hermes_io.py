@@ -82,6 +82,88 @@ def _resolve_model_section(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Retry policy for transient LLM failures.
+#
+# DeepSeek / OpenRouter / Anthropic occasionally 5xx or close the connection
+# mid-stream. Without retry every PAID classifier call goes to the
+# conservative `[fallback]` branch on a single transient error, cascading
+# every counterparty's request to the "request" state — silent quality
+# regression that's hard to diagnose later.
+#
+# We retry up to 3 times with exponential backoff (~0.5s, 1.5s, 4s) on:
+#   * httpx.RequestError (DNS, TCP reset, read/write timeout)
+#   * 5xx response status
+# 4xx responses are deterministic (bad key, bad body) — no retry.
+# ---------------------------------------------------------------------------
+
+_RETRY_BACKOFFS_S: tuple[float, ...] = (0.5, 1.5, 4.0)
+_RETRY_STATUS_CODES: frozenset[int] = frozenset({500, 502, 503, 504, 408, 429})
+
+
+def _resolve_retry_backoffs() -> tuple[float, ...]:
+    """Resolve retry backoffs.
+
+    Priority:
+      1. ``_RETRY_BACKOFFS_S`` module constant if monkeypatched in a test
+         context (we detect this by comparing identity).
+      2. ``settings.json`` ``llm_retry_backoffs_seconds`` if the file exists
+         on disk.
+      3. Module default otherwise.
+
+    The "settings only when file exists on disk" rule keeps unit tests
+    deterministic — tests don't have to mock storage to override retry
+    behaviour, they just monkeypatch ``_RETRY_BACKOFFS_S``.
+    """
+    try:
+        from . import settings as _settings, storage as _storage  # lazy
+        # If the test has monkeypatched _RETRY_BACKOFFS_S, let that win.
+        if _RETRY_BACKOFFS_S != (0.5, 1.5, 4.0):
+            return _RETRY_BACKOFFS_S
+        if (_storage.PAID_DIR / "settings.json").exists():
+            cfg = _settings.llm_retry_backoffs()
+            if cfg:
+                return cfg
+    except Exception:
+        pass
+    return _RETRY_BACKOFFS_S
+
+
+def _post_with_retry(
+    url: str,
+    *,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    timeout: float,
+) -> "httpx.Response":
+    import time as _time
+
+    backoffs = _resolve_retry_backoffs()
+    last_exc: Exception | None = None
+    for attempt, backoff in enumerate((0.0,) + backoffs):
+        if backoff > 0:
+            _time.sleep(backoff)
+        try:
+            resp = httpx.post(url, headers=headers, json=body, timeout=timeout)
+        except httpx.RequestError as exc:
+            last_exc = exc
+            if attempt >= len(backoffs):
+                raise LLMCallError(
+                    f"HTTP request to {url} failed after "
+                    f"{len(backoffs) + 1} attempts: {exc}"
+                ) from exc
+            continue
+        if resp.status_code in _RETRY_STATUS_CODES and attempt < len(backoffs):
+            last_exc = LLMCallError(
+                f"transient {resp.status_code} on attempt {attempt + 1}"
+            )
+            continue
+        return resp
+
+    # Loop exit without a successful response — last_exc must be set.
+    raise LLMCallError(f"exhausted retries for {url}: {last_exc}")
+
+
 def _build_chat_url(base_url: str) -> str:
     """Return the chat-completions endpoint URL.
 
@@ -144,10 +226,10 @@ def call_llm(
     }
     url = _build_chat_url(model_cfg["base_url"])
 
-    try:
-        resp = httpx.post(url, headers=headers, json=body, timeout=timeout)
-    except httpx.HTTPError as e:
-        raise LLMCallError(f"HTTP request to {url} failed: {e}") from e
+    # Retry transient failures (5xx, connection errors, timeouts) with
+    # exponential backoff. Don't retry 4xx — those are deterministic
+    # (auth, malformed body, model-not-found, etc.).
+    resp = _post_with_retry(url, headers=headers, body=body, timeout=timeout)
 
     if resp.status_code >= 400:
         raise LLMCallError(

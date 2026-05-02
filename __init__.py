@@ -218,6 +218,79 @@ def _notify_owner_about_request(req: approval.PendingApproval) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Discovery card — first inbound message from unknown sender (J4 entry)
+# ---------------------------------------------------------------------------
+
+def _format_discovery_card(
+    cp: identity.Counterparty,
+    user_message: str,
+    impersonates: identity.Counterparty | None,
+) -> str:
+    impersonation_note = ""
+    if impersonates is not None:
+        impersonation_note = (
+            f"\n⚠️ Possible impersonation: a counterparty named "
+            f"'{impersonates.display_name}' already exists on "
+            f"{impersonates.platform} (cp_id={impersonates.cp_id}). "
+            f"Verify before granting trust."
+        )
+    return (
+        f"👋 PAID discovery — first contact from unknown sender\n"
+        f"  cp_id:   {cp.cp_id}\n"
+        f"  display: {cp.display_name or '(none)'}\n"
+        f"  platform: {cp.platform}  user_id: {cp.user_id}\n"
+        f"  first message: {user_message[:300]!r}\n"
+        f"{impersonation_note}\n"
+        f"\n"
+        f"To trust them, run on the host:\n"
+        f"  python3 -m paid add-counterparty {cp.platform} {cp.user_id} "
+        f"--name '<display>' --role junior --topic-allow <topic>\n"
+        f"To ignore them, run:\n"
+        f"  python3 -m paid ignore-counterparty {cp.platform} {cp.user_id} "
+        f"--reason '<why>'"
+    )
+
+
+def _notify_owner_about_unknown_sender(
+    cp: identity.Counterparty, user_message: str
+) -> None:
+    """Push a discovery DM to the owner when *cp* is a freshly-created pending
+    role and we haven't notified yet. Idempotent — sets discovery_notified_at
+    on success so repeated inbounds from the same unknown sender don't spam.
+    """
+    if cp.discovery_notified_at:
+        return  # already pinged owner about this one
+
+    owner = identity.load_owner()
+    target = _owner_primary_identity(owner)
+    if target is None:
+        _safe_log(f"[discovery] no owner identity — skipping for {cp.cp_id}")
+        return
+    plat, uid = target
+    receive_target = _resolve_owner_send_target(plat, uid)
+
+    impersonates = identity.detect_impersonation(cp)
+    body = _format_discovery_card(cp, user_message, impersonates)
+
+    try:
+        result = hermes_io.send_dm(plat, receive_target, body, fallback_to_queue=True)
+        _safe_log(
+            f"[discovery] notify owner about {cp.cp_id} via {plat}:{receive_target} → "
+            f"{result}"
+            + (f" [IMPERSONATION_FLAG cp={impersonates.cp_id}]" if impersonates else "")
+        )
+    except Exception as exc:
+        _safe_log(f"[discovery] notify EXC for {cp.cp_id}: {exc}")
+        return
+
+    # Mark as notified regardless of delivery success — failed sends already
+    # land in outbound_queue.jsonl, no need to retry on every subsequent
+    # message from the same unknown sender.
+    cp.discovery_notified_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    identity.save_counterparty(cp)
+
+
+# ---------------------------------------------------------------------------
 # Hook handlers
 # ---------------------------------------------------------------------------
 
@@ -248,6 +321,15 @@ def on_pre_llm_call(**kwargs) -> dict | None:
         # Cache (session_id → metadata) so post_llm_call can resolve sender
         # identity even though hermes drops platform/sender_id from its kwargs.
         _cache_session_meta(session_id, platform, sender_id, cp.cp_id)
+
+        # First inbound from an unknown sender → notify owner exactly once.
+        # role="pending" + no discovery_notified_at = fresh; once notified we
+        # set the timestamp on the cp profile to suppress re-firing.
+        if cp.role == "pending" and not cp.discovery_notified_at:
+            try:
+                _notify_owner_about_unknown_sender(cp, user_message)
+            except Exception as exc:
+                _safe_log(f"[discovery] EXC for {cp.cp_id}: {exc}")
 
         if cp.role in ("ignored", "blocked"):
             _safe_log(f"[pre_llm] cp {cp.cp_id} role={cp.role} → silent")
@@ -441,6 +523,25 @@ def on_post_llm_call(**kwargs) -> None:
                     ensure_ascii=False,
                 ),
             )
+            # Best-effort corrective DM: hermes 0.12.0 has no outbound mutation
+            # hook, so the leaked response has already been sent to the
+            # counterparty. We fire a follow-up message asking them to
+            # disregard so the operator at least has a paper-trail of "PAID
+            # noticed and tried to contain it" rather than a silent leak.
+            # Use any-CJK heuristic to pick the language.
+            if platform and sender_id:
+                try:
+                    is_cjk = any(c >= "一" and c <= "鿿" for c in response)
+                    correction = (
+                        "上一条回复可能包含了不该外发的信息，请忽略；让 Jimmy 直接回复你。"
+                        if is_cjk else
+                        "Heads-up: my previous reply may have contained sensitive "
+                        "information that shouldn't have been sent. Please disregard it "
+                        "— I'll let the owner respond directly."
+                    )
+                    hermes_io.send_dm(platform, sender_id, correction, fallback_to_queue=True)
+                except Exception as exc:
+                    _safe_log(f"[L4-LEAK] corrective send EXC: {exc}")
 
         audit.log_action(
             session_id=session_id,
@@ -458,6 +559,91 @@ def on_post_llm_call(**kwargs) -> None:
         )
     except Exception as exc:
         _safe_log(f"[post_llm] EXC {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Pre-gateway dispatch — gate input BEFORE it ever reaches the LLM.
+#
+# hermes-agent v0.12.0's `pre_gateway_dispatch` fires per inbound MessageEvent
+# AFTER the internal-event guard but BEFORE auth/pairing/agent dispatch.
+# Returning ``{"action": "skip"}`` drops the message (no reply). We use that
+# to short-circuit Layer 1 (prompt-injection) hits — the LLM never sees the
+# attempt, saving tokens AND making jailbreaks harder (no chance for the LLM
+# to be coaxed before our regex screen runs).
+#
+# We DON'T move owner short-circuit / counterparty resolution / classifier
+# here — keep those in pre_llm_call. This hook is single-purpose: a
+# pre-emptive injection guard.
+#
+# (Outbound interception — true Layer 4 redaction — would need a hook that
+# hermes 0.12.0 does NOT expose. See README "Hermes upstream gaps".)
+# ---------------------------------------------------------------------------
+
+def on_pre_gateway_dispatch(**kwargs) -> dict | None:
+    """Drop inbound messages that trip the L1 injection regex.
+
+    ``kwargs``: event (MessageEvent), gateway (GatewayRunner), session_store.
+    Returns ``{"action": "skip"}`` to drop; None to let dispatch proceed.
+    """
+    try:
+        event = kwargs.get("event")
+        if event is None:
+            return None
+        # Owner messages bypass — owner can paste anything they want.
+        source = getattr(event, "source", None)
+        platform = ""
+        sender_id = ""
+        if source is not None:
+            plat_val = getattr(source, "platform", None)
+            platform = getattr(plat_val, "value", str(plat_val)) if plat_val else ""
+            sender_id = str(getattr(source, "user_id", "") or "")
+        if platform and sender_id and identity.is_owner(platform, sender_id):
+            return None
+
+        text = str(getattr(event, "text", "") or "")
+        if not text:
+            return None
+
+        l1_hit, l1_labels = safety.detect_prompt_injection(text)
+        if not l1_hit:
+            return None
+
+        _safe_log(
+            f"[pre_gw L1-INJECTION-EARLY] platform={platform} sender={sender_id} "
+            f"labels={l1_labels} msg={text[:120]!r}"
+        )
+        try:
+            storage.append_jsonl(
+                storage.PAID_DIR / "fatal_alerts.jsonl",
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "reason": "layer_1_prompt_injection_early",
+                    "platform": platform,
+                    "sender_id": sender_id,
+                    "labels": l1_labels,
+                    "snippet": text[:300],
+                },
+            )
+        except Exception:
+            pass
+
+        # Best-effort canned decline back to the sender. send_dm tolerates
+        # gateway-not-ready by falling through to outbound_queue.jsonl.
+        owner = identity.load_owner()
+        owner_name = identity.display_name(owner)
+        decline = (
+            f"我没办法处理这个请求，请直接 @ {owner_name}." if any(c >= "一" for c in text)
+            else f"I can't process that request — please contact {owner_name} directly."
+        )
+        try:
+            hermes_io.send_dm(platform, sender_id, decline, fallback_to_queue=True)
+        except Exception as exc:
+            _safe_log(f"[pre_gw L1] decline send EXC: {exc}")
+
+        return {"action": "skip", "reason": "layer_1_prompt_injection"}
+    except Exception as exc:
+        _safe_log(f"[pre_gw] FATAL: {exc}\n{traceback.format_exc()}")
+        return None  # fail-open — let hermes proceed
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +799,16 @@ def register(ctx) -> None:
     storage.ensure_dirs()
     _safe_log("=" * 60)
     _safe_log(f"PAID v1 plugin registering (path: {ctx.manifest.path})")
+
+    # pre_gateway_dispatch (hermes 0.12.0+): early-exit on prompt-injection
+    # before the LLM is ever invoked. Older hermes versions ignore the
+    # registration if the hook isn't in their VALID_HOOKS set, so this is
+    # safe to call unconditionally.
+    try:
+        ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)
+        _safe_log("registered: pre_gateway_dispatch")
+    except Exception as exc:
+        _safe_log(f"pre_gateway_dispatch registration skipped: {exc}")
 
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("post_llm_call", on_post_llm_call)

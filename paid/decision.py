@@ -25,13 +25,23 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
-# Tunables. TODO: lift to settings.json once that config layer exists
-# (see design/01_review_decisions.md §2 — Week-2 settings system).
+# Tunables. Loaded from ``~/.hermes/paid/settings.json`` via ``paid.settings``;
+# the constant below is a fallback used when settings.json is absent at module
+# import time (e.g. unit tests that haven't set up PAID_DIR).
 # ---------------------------------------------------------------------------
 
-# Confidence floor a classifier output must clear (with stakes==low + in_scope)
-# to qualify for the "direct" answer state. Below this we route to "request".
-_CONFIDENCE_THRESHOLD_DIRECT: float = 0.75
+_CONFIDENCE_THRESHOLD_DIRECT_DEFAULT: float = 0.75
+
+
+def _confidence_threshold_direct() -> float:
+    """Resolve threshold via settings.json if available, else default.
+    Lazy-imported so plain ``import paid.decision`` doesn't pull settings/storage
+    in test environments that don't need them."""
+    try:
+        from . import settings as _settings  # noqa: WPS433 — intentionally lazy
+        return _settings.confidence_threshold_direct()
+    except Exception:
+        return _CONFIDENCE_THRESHOLD_DIRECT_DEFAULT
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +159,7 @@ def decide_action(
     if stakes == "high":
         return Action(state="request", reason="high-stakes topic; escalate to owner")
 
-    if confidence > _CONFIDENCE_THRESHOLD_DIRECT and stakes == "low" and in_scope:
+    if confidence > _confidence_threshold_direct() and stakes == "low" and in_scope:
         return Action(
             state="direct",
             reason=f"high-confidence ({confidence:.2f}) low-stakes in-scope answer",

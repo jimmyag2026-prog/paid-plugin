@@ -7,6 +7,13 @@ import os
 from pathlib import Path
 from typing import Any
 
+try:
+    import fcntl  # type: ignore
+    _HAS_FLOCK = True
+except ImportError:  # Windows
+    fcntl = None  # type: ignore[assignment]
+    _HAS_FLOCK = False
+
 PAID_DIR: Path = Path.home() / ".hermes" / "paid"
 
 # Bump when on-disk JSON shape changes incompatibly. Reads tolerate missing.
@@ -60,10 +67,30 @@ def read_text(path: Path) -> str | None:
 
 
 def append_jsonl(path: Path, entry: dict) -> None:
-    """Append one JSON line. fsync at end so crash leaves no half-line."""
+    """Append one JSON line, exclusively-locked for the duration of the write.
+
+    Why ``flock``: POSIX append on regular files is only atomic for writes
+    smaller than PIPE_BUF (typically 4 KiB). PAID's audit / approval / fatal
+    log lines can exceed that under load (long ``draft_answer`` payloads,
+    classification ``reasoning`` strings, full Lark response dumps), and
+    multiple processes / threads in the same gateway can land here
+    concurrently. ``fcntl.flock(LOCK_EX)`` serialises the writers, preventing
+    one half-line from interleaving inside another. ``fsync`` after
+    guarantees the line survives a crash.
+
+    Best-effort on platforms without ``fcntl`` (Windows): we still flush+fsync
+    but skip the lock — single-process is the only supported deployment
+    target there anyway.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(entry, ensure_ascii=False)
     with path.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+        if _HAS_FLOCK:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)  # type: ignore[union-attr]
+        try:
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            if _HAS_FLOCK:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)  # type: ignore[union-attr]

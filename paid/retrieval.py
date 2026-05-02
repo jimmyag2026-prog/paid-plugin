@@ -52,28 +52,76 @@ def _sop_path() -> Path:
     return storage.PAID_DIR / "sop.md"
 
 
-def _tokenize(query: str) -> list[str]:
-    """Split into per-char CJK tokens + whole-word ASCII tokens, drop stopwords.
+def _try_jieba_tokens(text: str) -> list[str] | None:
+    """Use jieba for CJK word segmentation if available, else None.
 
-    Examples:
-        "怎么退款"        -> ["退", "款"]              (怎,么 stopword'd)
-        "How do refunds"  -> ["refunds"]              (how,do stopword'd)
-        "退款 policy"     -> ["退", "款", "policy"]
+    jieba is ~5MB and slow on first import; we keep it optional and degrade
+    gracefully to char-bigrams when it's missing.
+    """
+    try:
+        import jieba  # type: ignore
+    except Exception:
+        return None
+    out: list[str] = []
+    for tok in jieba.cut(text, cut_all=False):
+        tok = tok.strip()
+        if not tok or tok in _STOPWORDS:
+            continue
+        if len(tok) == 1 and tok.isascii():
+            continue
+        out.append(tok)
+    return out
+
+
+def _cjk_bigrams(text: str) -> list[str]:
+    """Split CJK runs into bigrams + carry single-char fallback.
+
+    Bigrams capture pairs that act like word stems in Chinese ("退款", "时区",
+    "工作", "时间"), giving substring scoring real signal. Single chars also
+    kept (low weight) so a query like "退" still matches "退款条款".
+    """
+    out: list[str] = []
+    for run in re.findall(r"[一-鿿]+", text):
+        if len(run) >= 2:
+            for i in range(len(run) - 1):
+                bg = run[i : i + 2]
+                if bg in _STOPWORDS:
+                    continue
+                out.append(bg)
+        # always keep singletons too — short-query escape hatch
+        for ch in run:
+            if ch in _STOPWORDS:
+                continue
+            out.append(ch)
+    return out
+
+
+def _tokenize(query: str) -> list[str]:
+    """Tokenise a query for substring scoring against SOP paragraphs.
+
+    Path:
+      1. CJK runs → jieba words if available, else bigrams + singletons.
+      2. ASCII runs → \\w+, drop stopwords + 1-char noise.
+
+    Bigrams are the workhorse for Chinese; "工作时间" → ["工作", "作时", "时间", ...]
+    so a paragraph mentioning "默认工作时间是上午十点" is reliably hit.
     """
     if not query:
         return []
     lowered = query.lower()
+
+    # --- CJK ---
+    cjk_tokens = _try_jieba_tokens(lowered)
+    if cjk_tokens is None:
+        cjk_tokens = _cjk_bigrams(lowered)
+
     out: list[str] = []
-    # Per-character CJK
-    for ch in _CJK_RE.findall(lowered):
-        if ch in _STOPWORDS:
-            continue
-        out.append(ch)
-    # Whole-word ASCII
+    out.extend(cjk_tokens)
+
+    # --- ASCII ---
     for word in _ASCII_WORD_RE.findall(lowered):
         if word in _STOPWORDS:
             continue
-        # Drop 1-char ASCII noise (single letters/digits)
         if len(word) == 1:
             continue
         out.append(word)

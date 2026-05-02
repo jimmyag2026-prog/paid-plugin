@@ -27,7 +27,7 @@ from typing import Iterable, Literal
 
 from . import storage
 
-Status = Literal["pending", "approved", "rejected"]
+Status = Literal["pending", "approved", "rejected", "timed_out"]
 
 
 def _pending_log() -> Path:
@@ -219,3 +219,16 @@ def set_status(
     cur.final_text = final_text
     cur.ts_resolved = _now()
     return cur
+
+
+def list_overdue(timeout_seconds: float) -> list[PendingApproval]:
+    """Return pending approvals older than *timeout_seconds*, oldest first.
+
+    Used by the timeout sweeper (``bin/sweep_pending.py``) to find requests
+    that need to be auto-marked ``timed_out`` so the junior gets an
+    explanatory reply and the owner gets reminded.
+    """
+    if timeout_seconds <= 0:
+        return []
+    cutoff = _now() - timeout_seconds
+    return [r for r in list_pending() if r.ts_created < cutoff]

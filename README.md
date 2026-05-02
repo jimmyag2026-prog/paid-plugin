@@ -15,9 +15,10 @@ It runs locally, all logs stay on your machine, and it speaks through
 your existing IM accounts (Telegram / Lark / Feishu / WhatsApp / WeCom /
 Slack — whichever Hermes is wired up to).
 
-**Status: v0.5 alpha.** End-to-end loop is wired, 102 tests passing,
-several v1 features intentionally cut for now (see
-[Limitations](#known-v05-limitations) below).
+**Status: v0.8 beta.** End-to-end loop is wired, 122 tests passing,
+verified live on Lark with the upstream `hermes-agent` v0.12.0. Several
+v1 features intentionally cut for now (see
+[Limitations](#known-v08-limitations) below).
 
 ---
 
@@ -192,10 +193,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for module decomposition.
 
 ---
 
-## Known v0.5 limitations
+## Known v0.8 limitations
 
-These are intentionally cut for the first end-to-end testable cut. Each
-will land in a follow-up:
+These are intentionally cut for now. Each will land in a follow-up:
 
 - **Layer 3 strict source restriction** — context is shaped today, but
   there's no enforcement that responses cite only granted material.
@@ -204,15 +204,23 @@ will land in a follow-up:
   before send).
 - **Approval card buttons** — owner action is via slash command (works
   on every IM); native interactive cards (Lark / Slack) come later.
+- **Approval timeouts** — handled by ``bin/sweep_pending.py``; install it as
+  a launchd / systemd timer (5 min cadence). Default timeout 30 min, see
+  ``settings.json``.
 - **Modify button** — use `/paid-approve <id> <override text>` instead.
-- **Timeouts** — no 5-min reminder or 30-min auto-defer; pending requests
-  stay pending until you act on them.
 - **Auto counterparty discovery** — unknown senders default to the
-  `pending` role (silent reply); add them with
-  `python3 -m paid add-counterparty …`.
+  `pending` role and PAID DMs you a discovery card on first contact; add
+  them with `python3 -m paid add-counterparty …` or block them with
+  `python3 -m paid ignore-counterparty <plat> <id> --reason "…"`.
 - **Dashboard** — none. `python3 -m paid status` is the read-only view.
-- **Retrieval** — substring scorer over `sop.md` only. No FTS5, no web
-  search.
+- **Retrieval** — bigram-tokenised substring scorer over `sop.md`. Optional
+  ``jieba`` (``pip install jieba``) gives proper Chinese segmentation; the
+  fallback bigram path is good enough for SOP-sized corpora. No FTS5, no
+  web search.
+- **L4 outbound enforcement** — observer-only on the leaked reply, plus a
+  best-effort corrective DM ("disregard the previous reply") immediately
+  after. True redaction needs an outbound hook hermes 0.12.0 doesn't expose;
+  filed upstream.
 
 ### Hermes upstream gaps PAID currently works around
 
@@ -256,7 +264,7 @@ cd /path/to/paid
 python3 -m pytest tests/ -q
 ```
 
-102 tests, ~0.2 s on a 2024 MBP. New contributions should keep it green.
+122 tests, ~0.3 s on a 2024 MBP. New contributions should keep it green.
 
 ---
 

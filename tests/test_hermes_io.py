@@ -132,6 +132,8 @@ def test_base_url_with_v1_already_does_not_double_v1(tmp_path, monkeypatch):
 
 
 def test_http_error_status_raises_llmcallerror(tmp_path, monkeypatch):
+    """4xx status (deterministic — bad key / body) must raise on first try.
+    No retry, no waiting. (5xx retry is covered separately.)"""
     cfg_path = _write_config(
         tmp_path,
         {
@@ -143,11 +145,12 @@ def test_http_error_status_raises_llmcallerror(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(hermes_io, "HERMES_CONFIG_PATH", cfg_path)
 
-    fake = _fake_response(status=500, content="internal server error")
-    with mock.patch.object(hermes_io.httpx, "post", return_value=fake):
+    fake = _fake_response(status=401, content="unauthorized")
+    with mock.patch.object(hermes_io.httpx, "post", return_value=fake) as posts:
         with pytest.raises(hermes_io.LLMCallError) as exc:
             hermes_io.call_llm("hi")
-    assert "500" in str(exc.value)
+    assert "401" in str(exc.value)
+    assert posts.call_count == 1  # no retry on 4xx
 
 
 def test_missing_config_raises_hermesconfigerror(tmp_path, monkeypatch):
@@ -333,3 +336,79 @@ def test_send_lark_direct_propagates_failure():
 
     assert out["ok"] is False
     assert "230001" in out["error"]
+
+
+# ---------------------------------------------------------------------------
+# Retry policy tests
+# ---------------------------------------------------------------------------
+
+
+def test_call_llm_retries_on_503_then_succeeds(tmp_path, monkeypatch):
+    """A single 503 must trigger a retry that succeeds — not raise."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "model:\n"
+        "  default: m\n"
+        "  base_url: https://x\n"
+        "  api_key: k\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hermes_io, "HERMES_CONFIG_PATH", cfg)
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(hermes_io, "_RETRY_BACKOFFS_S", (0.0, 0.0, 0.0))
+
+    bad = mock.Mock()
+    bad.status_code = 503
+    bad.text = "service unavailable"
+
+    good = mock.Mock()
+    good.status_code = 200
+    good.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+
+    posts = mock.Mock(side_effect=[bad, good])
+    monkeypatch.setattr(hermes_io.httpx, "post", posts)
+
+    out = hermes_io.call_llm("hi")
+    assert out == "ok"
+    assert posts.call_count == 2  # one retry, then success
+
+
+def test_call_llm_does_not_retry_on_400(tmp_path, monkeypatch):
+    """4xx responses are deterministic (bad key / body) — must NOT retry."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "model:\n  default: m\n  base_url: https://x\n  api_key: k\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hermes_io, "HERMES_CONFIG_PATH", cfg)
+
+    bad = mock.Mock()
+    bad.status_code = 400
+    bad.text = "bad request"
+
+    posts = mock.Mock(return_value=bad)
+    monkeypatch.setattr(hermes_io.httpx, "post", posts)
+
+    with pytest.raises(hermes_io.LLMCallError):
+        hermes_io.call_llm("hi")
+    assert posts.call_count == 1  # no retry
+
+
+def test_call_llm_retries_on_request_error(tmp_path, monkeypatch):
+    """httpx.RequestError (network) is retried; final raise after exhaustion."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "model:\n  default: m\n  base_url: https://x\n  api_key: k\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hermes_io, "HERMES_CONFIG_PATH", cfg)
+    monkeypatch.setattr(hermes_io, "_RETRY_BACKOFFS_S", (0.0, 0.0, 0.0))
+
+    err = hermes_io.httpx.ConnectError("dns fail")
+    posts = mock.Mock(side_effect=[err, err, err, err])
+    monkeypatch.setattr(hermes_io.httpx, "post", posts)
+
+    with pytest.raises(hermes_io.LLMCallError):
+        hermes_io.call_llm("hi")
+    assert posts.call_count == 4  # 1 initial + 3 retries
