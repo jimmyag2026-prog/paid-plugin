@@ -1,0 +1,7 @@
+name: paid-v1
+version: 0.1.0
+description: PAID v1 — Personal AI Delegate (sprint scaffold)
+author: PAID project
+provides_hooks:
+  - pre_llm_call
+  - post_llm_call
