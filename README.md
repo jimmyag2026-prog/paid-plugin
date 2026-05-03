@@ -15,12 +15,25 @@ It runs locally, all logs stay on your machine, and it speaks through
 your existing IM accounts (Telegram / Lark / Feishu / WhatsApp / WeCom /
 Slack — whichever Hermes is wired up to).
 
-**Status: v0.9 beta.** End-to-end loop is wired, 128 tests passing,
-verified live on Lark with the upstream `hermes-agent` v0.12.0. Now
-ships an interactive Lark approval card (with button callbacks routed
-back to PAID), a local-only Flask web dashboard, daily snapshot reports,
-and a `paid status` upgrade with today's metrics + activity dots. Several
-v1 features intentionally cut for now (see
+**Status: v1.1 — design baseline.** End-to-end loop is wired, **179 tests
+passing + 48-check manual smoke**, verified live on Lark with the upstream
+`hermes-agent` v0.12.0. Ships an interactive Lark approval card (with
+button callbacks routed back to PAID), a local-only Flask web dashboard,
+daily snapshot reports, and a `paid status` upgrade with today's metrics
++ activity dots.
+
+**v1.0 → v1.1 (2026-05-03)** — Code unchanged from v1.0.0 (W2/W3 unblock
+batch). v1.1 promotes the design baseline for the next development arc:
+review-skill modular plan + hermes v0.11 plugin-hook upgrade evaluation.
+See `paid-may` companion repo:
+
+- [`design/02_review_skill_prd.md`](https://github.com/jimmyag2026-prog/paid-may/blob/main/design/02_review_skill_prd.md) — review skill PRD
+- [`design/03_review_skill_integration.md`](https://github.com/jimmyag2026-prog/paid-may/blob/main/design/03_review_skill_integration.md) — plugin↔skill integration
+- [`design/04_review_skill_architecture.md`](https://github.com/jimmyag2026-prog/paid-may/blob/main/design/04_review_skill_architecture.md) — module/state-machine architecture
+- [`design/05_backlog.md`](https://github.com/jimmyag2026-prog/paid-may/blob/main/design/05_backlog.md) — modular development backlog (M1–M9)
+- [`design/06_hermes_v011_evaluation.md`](https://github.com/jimmyag2026-prog/paid-may/blob/main/design/06_hermes_v011_evaluation.md) — hermes v0.11 hook adoption plan
+
+Several v1 features intentionally cut for now (see
 [Limitations](#known-v09-limitations) below).
 
 ---

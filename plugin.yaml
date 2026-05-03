@@ -1,5 +1,5 @@
 name: paid-v1
-version: 1.0.0
+version: 1.1.0
 description: PAID — Personal AI Delegate (three-state approval pipeline)
 author: PAID project
 provides_hooks:
