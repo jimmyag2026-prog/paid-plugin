@@ -104,26 +104,95 @@ def _safe_log(msg: str) -> None:
         pass
 
 
+# Per-process alert debounce — keyed on (channel, reason) so a fatal that
+# repeats every inbound (e.g. busted hermes config) doesn't spam the owner's
+# IM. fatal_alerts.jsonl is NOT debounced — every entry lands for forensics.
+_ALERT_IM_DEBOUNCE_SECONDS = 600   # 10 min between IM alerts for same reason
+_ALERT_MAIL_DEBOUNCE_SECONDS = 1800  # 30 min between mails for same reason
+_ALERT_LAST_SENT: dict[tuple[str, str], float] = {}
+
+
+def _alert_recently_sent(channel: str, reason: str) -> bool:
+    import time as _time
+    key = (channel, reason)
+    last = _ALERT_LAST_SENT.get(key, 0.0)
+    window = (
+        _ALERT_IM_DEBOUNCE_SECONDS if channel == "im"
+        else _ALERT_MAIL_DEBOUNCE_SECONDS
+    )
+    return (_time.time() - last) < window
+
+
+def _mark_alert_sent(channel: str, reason: str) -> None:
+    import time as _time
+    _ALERT_LAST_SENT[(channel, reason)] = _time.time()
+
+
 def _alert_owner(reason: str, detail: str) -> None:
     """Surface a fatal-class event to the owner.
 
-    Layered best-effort, ordered by reliability:
-      1. plugin_runtime.log (always — handled by _safe_log already at call site)
-      2. fatal_alerts.jsonl — durable record a tail-watcher can pick up
-      3. ~/bin/send_mail — only if installed; short timeout, never blocks the hook
+    Layered best-effort, ordered by reliability + reach:
+      1. plugin_runtime.log   (always — handled by _safe_log already at call site)
+      2. fatal_alerts.jsonl   (durable record a tail-watcher can pick up)
+      3. IM DM via send_dm    (fastest channel — owner sees it on phone within seconds;
+                               falls back to outbound_queue.jsonl on adapter failure)
+      4. ~/bin/send_mail      (slower but survives hermes/IM outages — only if installed)
+
+    Every layer wrapped in try/except: alert path MUST NOT raise into the hook
+    that called us, otherwise a transient exception while reporting an exception
+    creates an unrecoverable loop. The mail / IM steps each have short timeouts.
+
+    To avoid an alert storm if the same fatal repeats every inbound (e.g. a
+    busted hermes config), we de-bounce IM-channel alerts to one per
+    ``_ALERT_IM_DEBOUNCE_SECONDS`` window keyed on (reason); fatal_alerts.jsonl
+    still gets every entry for forensics. send_mail also de-bounces — same key,
+    same window.
     """
     ts = datetime.now(timezone.utc).isoformat()
     entry = {"ts": ts, "reason": reason, "detail": detail[:2000]}
 
+    # Layer 2 — durable JSONL.
     try:
         storage.append_jsonl(storage.PAID_DIR / "fatal_alerts.jsonl", entry)
     except Exception:
         pass
 
+    # Layer 3 — IM DM. Best-effort; debounced to avoid spamming the owner if
+    # the same fatal repeats. send_dm itself falls back to outbound_queue on
+    # adapter failure so even when the gateway is down, a record reaches disk.
+    try:
+        if not _alert_recently_sent("im", reason):
+            owner = identity.load_owner()
+            target = _owner_primary_identity(owner)
+            if target is not None:
+                plat, uid = target
+                # If owner is on Lark/Feishu and FEISHU_HOME_CHANNEL is set,
+                # prefer the chat_id (matches sweep_pending.py heuristic so
+                # alerts land in the same surface).
+                if plat in ("feishu", "lark"):
+                    home = (os.environ.get("FEISHU_HOME_CHANNEL") or "").strip()
+                    if home:
+                        uid = home
+                short_detail = (detail or "").strip().splitlines()[0][:300]
+                body = (
+                    f"⚠️ PAID fatal alert\n"
+                    f"reason: {reason}\n"
+                    f"ts: {ts}\n"
+                    f"detail: {short_detail}\n"
+                    f"(see ~/.hermes/paid/fatal_alerts.jsonl for full trace)"
+                )
+                hermes_io.send_dm(plat, uid, body, fallback_to_queue=True)
+                _mark_alert_sent("im", reason)
+    except Exception:
+        pass
+
+    # Layer 4 — send_mail (slower but survives hermes outage).
     send_mail = shutil.which("send_mail")
     if not send_mail:
         return
     try:
+        if _alert_recently_sent("mail", reason):
+            return
         owner_email = os.environ.get("PAID_OWNER_EMAIL", "").strip()
         if not owner_email:
             return
@@ -134,6 +203,7 @@ def _alert_owner(reason: str, detail: str) -> None:
             check=False,
             capture_output=True,
         )
+        _mark_alert_sent("mail", reason)
     except Exception:
         pass
 
