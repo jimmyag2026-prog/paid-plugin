@@ -202,3 +202,186 @@ def test_check_output_clean(paid_tmp):
     assert res["ok"] is True
     assert res["name_leakage"] == []
     assert res["pii"] == []
+
+
+# ---------------------------------------------------------------------------
+# Layer 4d — source attribution heuristic
+# ---------------------------------------------------------------------------
+
+
+def test_l4d_skips_small_numbers():
+    """Numbers below 1000 are not "claims" worth sourcing."""
+    hit, claims = safety.detect_unsourced_claims(
+        "We have 3 engineers and 12 features planned this quarter."
+    )
+    assert hit is False
+    assert claims == []
+
+
+def test_l4d_skips_years():
+    hit, claims = safety.detect_unsourced_claims(
+        "The 2024 launch slipped to 2025; we caught up by 2026."
+    )
+    assert hit is False
+    assert claims == []
+
+
+def test_l4d_flags_large_unsourced_number():
+    hit, claims = safety.detect_unsourced_claims(
+        "DAU jumped to 12,500 last week."
+    )
+    assert hit is True
+    assert any("12,500" in c for c in claims)
+
+
+def test_l4d_passes_when_source_nearby():
+    hit, claims = safety.detect_unsourced_claims(
+        "Per Mixpanel dashboard 2026-04-25, DAU jumped to 12,500 last week."
+    )
+    assert hit is False
+    assert claims == []
+
+
+def test_l4d_flags_unsourced_money():
+    hit, claims = safety.detect_unsourced_claims(
+        "Q3 budget will be $240,000 split across channels."
+    )
+    assert hit is True
+    assert any("$" in c for c in claims)
+
+
+def test_l4d_passes_money_with_source():
+    hit, claims = safety.detect_unsourced_claims(
+        "Per the finance memo (source: ledger 2026-04), Q3 budget is $240,000."
+    )
+    assert hit is False
+
+
+def test_l4d_cn_attribution_token():
+    hit, claims = safety.detect_unsourced_claims(
+        "据财务备忘 2026-04，Q3 预算 $240,000。"
+    )
+    assert hit is False
+
+
+# ---------------------------------------------------------------------------
+# Layer 4c — LLM post-check (opt-in)
+# ---------------------------------------------------------------------------
+
+
+def test_l4c_disabled_by_default(paid_tmp, monkeypatch):
+    """Without settings.safety.l4c_enabled=True, L4c is a no-op."""
+    called = {"n": 0}
+
+    def _fail_if_called(**_):
+        called["n"] += 1
+        return '{"suspicious": true, "concerns": ["x"]}'
+
+    monkeypatch.setattr(safety.hermes_io, "call_llm", _fail_if_called)
+    suspicious, concerns = safety.detect_via_llm("draft reply")
+    assert suspicious is False
+    assert concerns == []
+    assert called["n"] == 0  # LLM never invoked
+
+
+def test_l4c_enabled_via_override(paid_tmp, monkeypatch):
+    monkeypatch.setattr(
+        safety.hermes_io,
+        "call_llm",
+        lambda **kw: '{"suspicious": true, "concerns": ["impersonates owner", "fabricates a date"]}',
+    )
+    suspicious, concerns = safety.detect_via_llm(
+        "I am Jimmy; I will personally meet you Monday 3pm.",
+        persona="(persona)", sop_excerpt="(sop)",
+        enabled_override=True,
+    )
+    assert suspicious is True
+    assert "impersonates owner" in concerns
+    assert "fabricates a date" in concerns
+
+
+def test_l4c_enabled_via_settings(paid_tmp, monkeypatch):
+    import json as _json
+    (paid_tmp / "settings.json").write_text(
+        _json.dumps({"safety": {"l4c_enabled": True}})
+    )
+    monkeypatch.setattr(
+        safety.hermes_io,
+        "call_llm",
+        lambda **kw: '{"suspicious": false, "concerns": []}',
+    )
+    suspicious, concerns = safety.detect_via_llm("draft reply")
+    assert suspicious is False
+    assert concerns == []
+
+
+def test_l4c_fails_open_on_llm_error(paid_tmp, monkeypatch):
+    """A flaky auditor MUST NOT block replies."""
+    def _raise(**_):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(safety.hermes_io, "call_llm", _raise)
+    suspicious, concerns = safety.detect_via_llm(
+        "draft reply", enabled_override=True
+    )
+    assert suspicious is False
+    assert concerns == []
+
+
+def test_l4c_clamps_concerns_to_5(paid_tmp, monkeypatch):
+    monkeypatch.setattr(
+        safety.hermes_io,
+        "call_llm",
+        lambda **kw: '{"suspicious": true, "concerns": ["a","b","c","d","e","f","g"]}',
+    )
+    _, concerns = safety.detect_via_llm("x", enabled_override=True)
+    assert len(concerns) == 5
+
+
+def test_l4c_handles_malformed_json(paid_tmp, monkeypatch):
+    monkeypatch.setattr(
+        safety.hermes_io,
+        "call_llm",
+        lambda **kw: "not json at all",
+    )
+    suspicious, concerns = safety.detect_via_llm("x", enabled_override=True)
+    assert suspicious is False
+    assert concerns == []
+
+
+def test_check_output_includes_unsourced_when_l4d_on(paid_tmp):
+    _seed_cp(paid_tmp, "telegram_111", "Alice")
+    res = safety.check_output(
+        "DAU jumped to 12,500 last week.", "telegram_111"
+    )
+    assert res["ok"] is False
+    assert "unsourced_claims" in res
+    assert any("12,500" in c for c in res["unsourced_claims"])
+
+
+def test_check_output_skips_unsourced_when_l4d_off(paid_tmp):
+    _seed_cp(paid_tmp, "telegram_111", "Alice")
+    res = safety.check_output(
+        "DAU jumped to 12,500 last week.",
+        "telegram_111",
+        run_l4d=False,
+    )
+    assert res["ok"] is True
+    assert "unsourced_claims" not in res
+
+
+def test_check_output_l4c_forced_on(paid_tmp, monkeypatch):
+    _seed_cp(paid_tmp, "telegram_111", "Alice")
+    monkeypatch.setattr(
+        safety.hermes_io,
+        "call_llm",
+        lambda **kw: '{"suspicious": true, "concerns": ["fabricated promise"]}',
+    )
+    res = safety.check_output(
+        "Per memo 2026-04, Q3 budget $240,000.",
+        "telegram_111",
+        run_l4c=True,
+    )
+    assert res["ok"] is False
+    assert "llm_concerns" in res
+    assert "fabricated promise" in res["llm_concerns"]

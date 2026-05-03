@@ -631,11 +631,54 @@ def _enqueue_outbound_fallback(platform: str, user_id: str, message: str) -> Pat
     return path
 
 
+def render_options_block(options: list[dict] | None) -> str:
+    """Render an options-block list as plain-text bullets appended to a message.
+
+    Each option is a ``{"key": "<short>", "label": "<text>"}`` dict. Output:
+
+        (a) accept — 接受会改
+        (pass) skip
+        (custom) free text
+
+    The rendered string is empty when *options* is None or empty. Centralised
+    here so the paid-review skill, approval cards, and any future caller all
+    produce identical option syntax — and the junior-side reply parser can
+    rely on a single ``(key)`` shape across platforms.
+    """
+    if not options:
+        return ""
+    lines: list[str] = []
+    for opt in options:
+        if not isinstance(opt, dict):
+            continue
+        key = str(opt.get("key", "")).strip()
+        if not key:
+            continue
+        label = str(opt.get("label", "")).strip()
+        if label:
+            lines.append(f"({key}) {label}")
+        else:
+            lines.append(f"({key})")
+    if not lines:
+        return ""
+    return "\n".join(lines)
+
+
+def _maybe_append_options(message: str, options: list[dict] | None) -> str:
+    """Return *message* with the rendered options block appended, if any."""
+    block = render_options_block(options)
+    if not block:
+        return message
+    sep = "\n\n" if message and not message.endswith("\n") else ""
+    return f"{message}{sep}{block}"
+
+
 def send_dm(
     platform: str,
     user_id: str,
     message: str,
     *,
+    options_block: list[dict] | None = None,
     fallback_to_queue: bool = True,
 ) -> dict[str, Any]:
     """Send a DM via the live Hermes gateway adapter.
@@ -648,6 +691,12 @@ def send_dm(
             match the Platform enum value used by the gateway.
         user_id: Platform-native chat / user id (becomes ``chat_id`` for adapter).
         message: Plain-text body.
+        options_block: Optional list of ``{"key", "label"}`` dicts the recipient
+            can reply with. Rendered as plain-text bullets appended to the body
+            on every platform (universal lowest-common-denominator). Lark and
+            Telegram have richer affordances (interactive cards / inline
+            keyboards) — wiring those in is a follow-up; the plain-text form is
+            still parseable so the recipient can reply ``a`` / ``pass`` / etc.
         fallback_to_queue: When True (default) and the live send fails, write
             to outbound_queue.jsonl and return a queued result instead of
             raising.
@@ -660,6 +709,11 @@ def send_dm(
         SendDmError: only if ``fallback_to_queue=False`` and the send fails.
     """
     import asyncio
+
+    # Render options block into the message body BEFORE platform dispatch so
+    # the queued-fallback path also captures it (otherwise an owner doing a
+    # manual deliver from outbound_queue.jsonl wouldn't see the options).
+    message = _maybe_append_options(message, options_block)
 
     # Resolution order for the lark / feishu non-chat_id branch:
     #   1. Gateway adapter in this process (cheapest, shared token cache).

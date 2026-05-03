@@ -110,8 +110,22 @@ def detect_lang(text: str) -> str:
 class Action:
     """Output of decide_action()."""
 
-    state: str  # "direct" | "request" | "decline"
+    state: str  # "direct" | "request" | "decline" | "review"
     reason: str  # human-readable rationale (for audit log)
+
+
+# States the plugin glue must know how to dispatch on. The "review" state
+# is a hand-off marker — when set, the plugin should route to the
+# paid-review skill instead of using shape_context() output directly.
+ACTION_STATES = ("direct", "request", "decline", "review")
+
+
+def is_review_state(action: "Action") -> bool:
+    """True if `action` should hand off to the paid-review skill.
+
+    Centralised so callers don't pattern-match the string literal.
+    """
+    return action.state == "review"
 
 
 # ---------------------------------------------------------------------------
@@ -119,20 +133,53 @@ class Action:
 # ---------------------------------------------------------------------------
 
 
+def _review_min_stakes() -> str:
+    """Minimum classifier stakes that allows auto-review trigger.
+
+    Reads ``settings.review.auto_trigger_min_stakes`` (one of ``"low"``,
+    ``"medium"``, ``"high"``, ``"off"``); defaults to ``"medium"`` so a
+    junior simply venting low-stakes feelings doesn't open a review session.
+    Returning ``"off"`` disables auto-review entirely (skill is then only
+    triggered by explicit ``/review`` commands).
+    """
+    try:
+        from . import settings as _settings  # lazy
+        cfg = _settings.load().get("review", {}) if hasattr(_settings, "load") else {}
+        val = str(cfg.get("auto_trigger_min_stakes", "medium")).lower()
+        if val in {"low", "medium", "high", "off"}:
+            return val
+    except Exception:
+        pass
+    return "medium"
+
+
+def _stakes_meets(stakes: str, threshold: str) -> bool:
+    """True when *stakes* >= *threshold* in the low<medium<high ordering."""
+    order = {"low": 0, "medium": 1, "high": 2}
+    return order.get(stakes, 1) >= order.get(threshold, 1)
+
+
 def decide_action(
     classification: Any,
     counterparty: Any,
     user_message: str = "",
 ) -> Action:
-    """Apply the 3-state rules to classifier output.
+    """Apply the 4-state rules to classifier output.
 
     Order:
-      0. Hard global blacklist on user_message  -> request (escalate)
-      1. is_blacklisted=True                    -> decline
-      2. in_scope=False                         -> request
-      3. stakes=="high"                         -> request
-      4. confidence > 0.75 AND stakes=="low" AND in_scope=True -> direct
-      5. otherwise                              -> request (conservative default)
+      0. Hard global blacklist on user_message     -> request (escalate)
+      1. is_blacklisted=True                       -> decline
+      1.5 needs_review=True AND stakes >= min      -> review (hand off)
+      2. in_scope=False                            -> request
+      3. stakes=="high"                            -> request
+      4. confidence > threshold AND stakes=="low" AND in_scope=True -> direct
+      5. otherwise                                 -> request (conservative)
+
+    The "review" branch (1.5) is intentionally placed BEFORE the in_scope
+    check: a draft / proposal that needs structured review is worth opening
+    a session for even if the topic isn't on the counterparty's allow-list,
+    since the review session itself involves the owner. is_blacklisted still
+    wins so a "review my equity grant" ask still declines on rule 1.
 
     `classification` and `counterparty` are duck-typed; we only read attrs.
     """
@@ -149,9 +196,22 @@ def decide_action(
     in_scope = bool(getattr(classification, "in_scope", False))
     stakes = str(getattr(classification, "stakes", "medium")).lower()
     confidence = float(getattr(classification, "confidence", 0.0))
+    needs_review = bool(getattr(classification, "needs_review", False))
 
     if is_blacklisted:
         return Action(state="decline", reason="counterparty blacklisted topic")
+
+    # 1.5 review hand-off (only if review subsystem is enabled).
+    if needs_review:
+        threshold = _review_min_stakes()
+        if threshold != "off" and _stakes_meets(stakes, threshold):
+            return Action(
+                state="review",
+                reason=(
+                    f"needs_review=True, stakes={stakes} >= "
+                    f"min={threshold}; hand off to paid-review skill"
+                ),
+            )
 
     if not in_scope:
         return Action(state="request", reason="topic out of scope for this counterparty")

@@ -51,6 +51,15 @@ class Classification:
     suggested_queries: list[str] = field(default_factory=list)
     draft_answer: str = ""
     reasoning: str = ""
+    # review-skill integration (added in W2 batch 1).
+    # `needs_review` flips on when the inbound looks like a structured ask
+    # (draft / proposal / agenda) that the owner should sign off on rather
+    # than a one-shot question. The decision module routes such messages to
+    # the "review" state which hands off to the paid-review skill.
+    # `review_subject_hints` carries 2-4 candidate decision-subject phrases
+    # the skill uses for its subject-confirmation step.
+    needs_review: bool = False
+    review_subject_hints: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -81,7 +90,9 @@ You MUST return a JSON object with exactly these keys and types:
   "needs_retrieval":       boolean,        // true if more SOP/web context would help
   "suggested_queries":     [string, ...],  // up to 3 short search strings, [] if none
   "draft_answer":          string,         // proposed answer grounded in SOP excerpt; "" if cannot draft
-  "reasoning":             string          // <=300 chars rationale, manager-only
+  "reasoning":             string,         // <=300 chars rationale, manager-only
+  "needs_review":          boolean,        // see Review-trigger rules below
+  "review_subject_hints":  [string, ...]   // 2-4 candidate "decision subject" phrases when needs_review=true; [] otherwise
 }
 
 Rules:
@@ -89,6 +100,17 @@ Rules:
 - If the question matches topics_always_escalate, set is_blacklisted=true and stakes="high".
 - If you would need facts not present in the SOP excerpt, leave draft_answer="" and set needs_retrieval=true.
 - Output the JSON object only — no surrounding text, no markdown fences.
+
+Review-trigger rules (set `needs_review=true` if AND only if ALL three hold):
+  (a) The junior submitted a STRUCTURED ASK — draft / proposal / plan / budget /
+      agenda / investment memo / OKR / roadmap / spec — not a one-shot question.
+  (b) They expect the owner to APPROVE / REJECT / CHOOSE between options /
+      give DIRECTIONAL feedback — not just answer a fact.
+  (c) A single-sentence reply would NOT meaningfully advance the work.
+  Even when stakes=="low" you may still set true; the decision module checks
+  stakes separately. When `needs_review=true`, populate `review_subject_hints`
+  with 2-4 short phrases (each <= 12 words) capturing distinct candidate
+  "single decision the owner is being asked to make". When false, return [].
 """
 
 
@@ -223,6 +245,8 @@ def _parse_classification(raw: str) -> Classification:
         suggested_queries=_coerce_str_list(data.get("suggested_queries")),
         draft_answer=str(data.get("draft_answer", "")),
         reasoning=str(data.get("reasoning", "")),
+        needs_review=bool(data.get("needs_review", False)),
+        review_subject_hints=_coerce_str_list(data.get("review_subject_hints"))[:4],
     )
     return _validate(parsed)
 
