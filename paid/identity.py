@@ -1,4 +1,12 @@
-"""Module I — owner detection + counterparty profile load/create."""
+"""Module I — owner detection + counterparty profile load/create.
+
+Schema notes
+~~~~~~~~~~~~
+Counterparty profile.json is **schema_version=2** as of W2 batch 1
+(2026-05-02): added ``active_review_session`` and ``review_history`` for
+paid-review skill integration. The reader (``load_counterparty``) tolerates
+older v1 records — missing fields default to empty.
+"""
 
 from __future__ import annotations
 
@@ -51,6 +59,15 @@ class Counterparty:
     # Set on first inbound message; suppresses re-firing the discovery card
     # if the same sender pings again before owner classifies them.
     discovery_notified_at: str = ""
+    # paid-review skill integration. Holds the session id of the currently
+    # open review session for this counterparty (at most one concurrent
+    # session per cp in v0.1). When set, the plugin routes inbound messages
+    # to the skill's QA loop instead of running classification afresh.
+    active_review_session: str = ""
+    # Closed-session breadcrumbs. Append-only; bounded length so a chatty
+    # counterparty doesn't blow up the profile json. The dashboard pulls
+    # full session bodies from sessions/_closed/ on demand.
+    review_history: list[dict] = field(default_factory=list)
 
 
 def _owner_path() -> Path:
@@ -100,6 +117,9 @@ def load_counterparty(platform: str, sender_id: str) -> Counterparty | None:
     data = storage.read_json(_cp_profile_path(cp_id))
     if data is None:
         return None
+    raw_history = data.get("review_history", [])
+    if not isinstance(raw_history, list):
+        raw_history = []
     return Counterparty(
         cp_id=data.get("cp_id", cp_id),
         platform=data.get("platform", platform),
@@ -118,6 +138,8 @@ def load_counterparty(platform: str, sender_id: str) -> Counterparty | None:
         ignore_reason=data.get("ignore_reason", ""),
         ignore_set_at=data.get("ignore_set_at", ""),
         discovery_notified_at=data.get("discovery_notified_at", ""),
+        active_review_session=data.get("active_review_session", "") or "",
+        review_history=[h for h in raw_history if isinstance(h, dict)],
     )
 
 
@@ -170,6 +192,65 @@ def detect_impersonation(cp: Counterparty) -> Counterparty | None:
         if other.display_name.strip().lower() == needle:
             return other
     return None
+
+
+# --------------------------------------------------------------------------
+# paid-review skill helpers
+# --------------------------------------------------------------------------
+
+# How many closed-session entries to keep on the counterparty profile. Older
+# ones get rotated out — full bodies live in sessions/_closed/<month>/<sid>/.
+_REVIEW_HISTORY_MAX = 20
+
+
+class ReviewSessionConflict(Exception):
+    """Raised when set_active_review_session is called on a cp that already
+    has an active session id, unless ``replace=True`` is passed."""
+
+
+def set_active_review_session(
+    cp: Counterparty, sid: str, *, replace: bool = False
+) -> Counterparty:
+    """Mark *cp* as having an open review session ``sid``. Persists profile.
+
+    By default refuses to overwrite an existing active session — passes
+    ``replace=True`` to force (e.g. when owner ``/review close`` already ran
+    but cleanup got interrupted).
+    """
+    if not sid:
+        raise ValueError("sid must be non-empty")
+    if cp.active_review_session and cp.active_review_session != sid and not replace:
+        raise ReviewSessionConflict(
+            f"counterparty {cp.cp_id} already has active review session "
+            f"{cp.active_review_session!r}; pass replace=True to overwrite"
+        )
+    cp.active_review_session = sid
+    save_counterparty(cp)
+    return cp
+
+
+def clear_active_review_session(
+    cp: Counterparty, *, archive: dict | None = None
+) -> Counterparty:
+    """Clear the active session pointer; optionally append a history record.
+
+    ``archive`` is a free-form dict the caller (skill ``deliver``) supplies —
+    typical fields: ``sid``, ``subject``, ``verdict``, ``rounds``,
+    ``closed_at``. We stamp ``closed_at`` here if the caller forgot.
+    Old entries beyond ``_REVIEW_HISTORY_MAX`` are rotated out.
+    """
+    cp.active_review_session = ""
+    if archive:
+        record = dict(archive)
+        record.setdefault(
+            "closed_at",
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        )
+        cp.review_history.append(record)
+        if len(cp.review_history) > _REVIEW_HISTORY_MAX:
+            cp.review_history = cp.review_history[-_REVIEW_HISTORY_MAX:]
+    save_counterparty(cp)
+    return cp
 
 
 def mark_ignored(cp: Counterparty, reason: str) -> Counterparty:
