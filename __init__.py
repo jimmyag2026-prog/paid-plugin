@@ -162,29 +162,39 @@ def _alert_owner(reason: str, detail: str) -> None:
     # Layer 3 — IM DM. Best-effort; debounced to avoid spamming the owner if
     # the same fatal repeats. send_dm itself falls back to outbound_queue on
     # adapter failure so even when the gateway is down, a record reaches disk.
+    #
+    # Identity selection: use owner.preferred_identity() (Owner v2) so the
+    # alert lands on the platform the owner actually watches. Falls back to
+    # legacy _owner_primary_identity for owners whose v2 profile somehow has
+    # no enabled identities (defensive — shouldn't happen in practice).
     try:
         if not _alert_recently_sent("im", reason):
             owner = identity.load_owner()
-            target = _owner_primary_identity(owner)
-            if target is not None:
+            pref = owner.preferred_identity() if owner else None
+            if pref is not None:
+                plat, uid = pref.platform, pref.home_chat_id
+            else:
+                target = _owner_primary_identity(owner)
+                if target is None:
+                    raise RuntimeError("no owner identity")
                 plat, uid = target
-                # If owner is on Lark/Feishu and FEISHU_HOME_CHANNEL is set,
-                # prefer the chat_id (matches sweep_pending.py heuristic so
-                # alerts land in the same surface).
-                if plat in ("feishu", "lark"):
-                    home = (os.environ.get("FEISHU_HOME_CHANNEL") or "").strip()
-                    if home:
-                        uid = home
-                short_detail = (detail or "").strip().splitlines()[0][:300]
-                body = (
-                    f"⚠️ PAID fatal alert\n"
-                    f"reason: {reason}\n"
-                    f"ts: {ts}\n"
-                    f"detail: {short_detail}\n"
-                    f"(see ~/.hermes/paid/fatal_alerts.jsonl for full trace)"
-                )
-                hermes_io.send_dm(plat, uid, body, fallback_to_queue=True)
-                _mark_alert_sent("im", reason)
+            # If owner is on Lark/Feishu and FEISHU_HOME_CHANNEL is set,
+            # prefer the chat_id (matches sweep_pending.py heuristic so
+            # alerts land in the same surface).
+            if plat in ("feishu", "lark"):
+                home = (os.environ.get("FEISHU_HOME_CHANNEL") or "").strip()
+                if home:
+                    uid = home
+            short_detail = (detail or "").strip().splitlines()[0][:300]
+            body = (
+                f"⚠️ PAID fatal alert\n"
+                f"reason: {reason}\n"
+                f"ts: {ts}\n"
+                f"detail: {short_detail}\n"
+                f"(see ~/.hermes/paid/fatal_alerts.jsonl for full trace)"
+            )
+            hermes_io.send_dm(plat, uid, body, fallback_to_queue=True)
+            _mark_alert_sent("im", reason)
     except Exception:
         pass
 

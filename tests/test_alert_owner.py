@@ -129,6 +129,54 @@ def test_alert_owner_swallows_send_dm_exception(paid_tmp, monkeypatch):
     assert (paid_tmp / "fatal_alerts.jsonl").exists()
 
 
+def test_alert_owner_uses_owner_v2_preferred_platform(paid_tmp, monkeypatch):
+    """v1.2.1 fix: _alert_owner must honour owner.preferred_identity (Owner v2)
+    so multi-platform owners get IM alerts on the platform they actually watch.
+    Pre-fix it always used identities[0] regardless of preferred_platform."""
+    (paid_tmp / "owner.json").write_text(
+        json.dumps({
+            "schema_version": 2,
+            "owner_id": "owner_jimmy",
+            "name": "Jimmy",
+            "preferred_platform": "telegram",
+            "identities": [
+                # NOT first — but preferred_platform overrides ordering.
+                {"platform": "feishu", "user_id": "8ea86", "home_chat_id": "8ea86", "enabled": True},
+                {"platform": "telegram", "user_id": "6914282833",
+                 "home_chat_id": "6914282833", "enabled": True},
+            ],
+        })
+    )
+    sent = _patch_send_dm_capture(monkeypatch)
+    _plug._alert_owner("v2_pref_check", "should land on telegram not feishu")
+    assert len(sent) == 1
+    assert sent[0]["platform"] == "telegram"
+    assert sent[0]["user_id"] == "6914282833"
+
+
+def test_alert_owner_falls_back_to_legacy_when_all_disabled(paid_tmp, monkeypatch):
+    """If all v2 identities are enabled=False (no preferred_identity), fall
+    back to _owner_primary_identity which doesn't filter by enabled."""
+    (paid_tmp / "owner.json").write_text(
+        json.dumps({
+            "schema_version": 2,
+            "owner_id": "x",
+            "preferred_platform": "telegram",
+            "identities": [
+                {"platform": "telegram", "user_id": "12345",
+                 "home_chat_id": "12345", "enabled": False},
+            ],
+        })
+    )
+    sent = _patch_send_dm_capture(monkeypatch)
+    _plug._alert_owner("legacy_fb", "x")
+    # legacy primary picks identities[0] regardless of enabled — telegram still
+    # gets the alert (this is the safer default; user disabled but might want
+    # to know about a fatal anyway).
+    assert len(sent) == 1
+    assert sent[0]["platform"] == "telegram"
+
+
 def test_alert_recently_sent_window():
     """Mechanism check: time-based debounce window."""
     import time as _t
