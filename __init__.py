@@ -1041,10 +1041,60 @@ def _cmd_status(raw_args: str) -> str:
 # Plugin registration
 # ---------------------------------------------------------------------------
 
+_MINIMUM_HERMES_VERSION = "0.11.0"
+
+
+def _check_hermes_capability(ctx) -> dict:
+    """Verify the running hermes exposes the plugin surface PAID needs.
+
+    PAID's owner-facing CLI (5 slash commands) was wired in v0.5+ on top of
+    hermes v0.11's ``register_command`` plugin API (#10626). Before v0.11,
+    that method did not exist — PAID would silently NOT register its
+    /paid-pending /paid-approve /paid-reject /paid-status /card commands,
+    leaving the owner with a J3 dead-end and no obvious failure signal.
+
+    Returns a dict with the diagnostic. Caller decides whether to alert.
+    """
+    has_register_command = hasattr(ctx, "register_command")
+    has_register_hook = hasattr(ctx, "register_hook")
+    return {
+        "has_register_command": has_register_command,
+        "has_register_hook": has_register_hook,
+        "hermes_version_ok": has_register_command and has_register_hook,
+        "minimum_required": _MINIMUM_HERMES_VERSION,
+    }
+
+
 def register(ctx) -> None:
     storage.ensure_dirs()
     _safe_log("=" * 60)
     _safe_log(f"PAID v1 plugin registering (path: {ctx.manifest.path})")
+
+    # Capability check — refuse to half-load on too-old hermes.
+    cap = _check_hermes_capability(ctx)
+    if not cap["hermes_version_ok"]:
+        msg = (
+            f"hermes is missing required plugin surface for PAID: "
+            f"register_command={cap['has_register_command']} "
+            f"register_hook={cap['has_register_hook']}; "
+            f"need hermes >= {_MINIMUM_HERMES_VERSION}. "
+            f"PAID will skip slash-command registration; owner CLI "
+            f"(/paid-pending /paid-approve /paid-reject /paid-status /card) "
+            f"will be unavailable. Upgrade hermes-agent to v0.11+ to enable "
+            f"the full PAID surface."
+        )
+        _safe_log(f"⚠️  {msg}")
+        try:
+            _alert_owner(reason="paid_minimum_hermes_version", detail=msg)
+        except Exception:
+            # _alert_owner depends on hermes-side bits; if even that fails on
+            # the very-old hermes, the file log + jsonl entry are the
+            # forensic record.
+            pass
+        if not cap["has_register_hook"]:
+            # Without register_hook we can't even wire J2 — bail out.
+            return
+        # else: fall through and register hooks; just skip slash commands.
 
     # pre_gateway_dispatch (hermes 0.12.0+): early-exit on prompt-injection
     # before the LLM is ever invoked. Older hermes versions ignore the
@@ -1059,36 +1109,39 @@ def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("post_llm_call", on_post_llm_call)
 
-    ctx.register_command(
-        "paid-pending", _cmd_pending,
-        description="List pending PAID approvals.",
-    )
-    ctx.register_command(
-        "paid-approve", _cmd_approve,
-        description="Approve a pending PAID request (sends draft to junior; trailing text overrides).",
-        args_hint="<id> [override text]",
-    )
-    ctx.register_command(
-        "paid-reject", _cmd_reject,
-        description="Reject a pending PAID request (notifies junior to contact owner directly).",
-        args_hint="<id>",
-    )
-    ctx.register_command(
-        "paid-status", _cmd_status,
-        description="Show full state of one PAID request.",
-        args_hint="<id>",
-    )
-    # `/card` intercepts hermes feishu adapter's synthetic command for
-    # interactive-card button clicks. Lark sends button click events as
-    # ``/card button {json}``; we parse and route to approve/reject.
-    try:
+    if cap["has_register_command"]:
         ctx.register_command(
-            "card", _cmd_card,
-            description="(internal) Lark card button click handler — used by PAID interactive cards.",
+            "paid-pending", _cmd_pending,
+            description="List pending PAID approvals.",
         )
-        _safe_log("registered: /card (Lark interactive card handler)")
-    except Exception as exc:
-        _safe_log(f"/card registration skipped: {exc}")
+        ctx.register_command(
+            "paid-approve", _cmd_approve,
+            description="Approve a pending PAID request (sends draft to junior; trailing text overrides).",
+            args_hint="<id> [override text]",
+        )
+        ctx.register_command(
+            "paid-reject", _cmd_reject,
+            description="Reject a pending PAID request (notifies junior to contact owner directly).",
+            args_hint="<id>",
+        )
+        ctx.register_command(
+            "paid-status", _cmd_status,
+            description="Show full state of one PAID request.",
+            args_hint="<id>",
+        )
+        # `/card` intercepts hermes feishu adapter's synthetic command for
+        # interactive-card button clicks. Lark sends button click events as
+        # ``/card button {json}``; we parse and route to approve/reject.
+        try:
+            ctx.register_command(
+                "card", _cmd_card,
+                description="(internal) Lark card button click handler — used by PAID interactive cards.",
+            )
+            _safe_log("registered: /card (Lark interactive card handler)")
+        except Exception as exc:
+            _safe_log(f"/card registration skipped: {exc}")
 
-    _safe_log("hooks: pre_llm_call, post_llm_call, pre_gateway_dispatch")
-    _safe_log("commands: /paid-pending /paid-approve /paid-reject /paid-status /card")
+        _safe_log("hooks: pre_llm_call, post_llm_call, pre_gateway_dispatch")
+        _safe_log("commands: /paid-pending /paid-approve /paid-reject /paid-status /card")
+    else:
+        _safe_log("hooks: pre_llm_call, post_llm_call (commands skipped — hermes < 0.11)")
