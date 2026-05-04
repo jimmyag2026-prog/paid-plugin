@@ -611,6 +611,227 @@ def send_lark_card(
     }
 
 
+# ---------------------------------------------------------------------------
+# Telegram — send a message with optional inline keyboard
+# ---------------------------------------------------------------------------
+
+# Same workaround pattern as Lark: hermes adapter.send doesn't accept
+# reply_markup, so we drop down to ``adapter._bot.send_message`` (the
+# python-telegram-bot ``Bot`` instance) directly. Bot is async; we use the
+# same loop-detection trampoline as ``send_dm`` so this works both inside
+# the gateway thread and in standalone callers.
+
+
+def send_telegram_card(
+    chat_id: str,
+    text: str,
+    *,
+    keyboard: list[list[dict]] | None = None,
+    parse_mode: str = "Markdown",
+    fallback_to_queue: bool = True,
+) -> dict[str, Any]:
+    """Send a Telegram message with optional inline keyboard.
+
+    Args:
+        chat_id: TG chat id (string of integer for private; can also be
+            ``"@channel"``).
+        text: Message body. TG hard-limits to 4096 chars; we don't auto-split.
+        keyboard: List of rows; each row is list of button dicts shaped
+            ``{"text": "✅ Approve", "callback_data": "paid_approve:<id>"}``
+            or ``{"text": "🔍 View", "url": "https://..."}``.
+            **Note v0.1**: callback_data buttons render but their click is
+            NOT routed back to PAID (see design/08 §1).
+        parse_mode: ``"Markdown"`` / ``"MarkdownV2"`` / ``"HTML"`` / ``None``.
+        fallback_to_queue: When live send fails, enqueue + return
+            ``{"ok": False, "queued": ...}`` instead of raising.
+    """
+    import asyncio
+    import json as _json
+
+    try:
+        adapter = _get_gateway_adapter("telegram")
+    except SendDmError as exc:
+        if fallback_to_queue:
+            qp = _enqueue_outbound_fallback(
+                "telegram", chat_id,
+                "[card] " + _json.dumps(
+                    {"text": text, "keyboard": keyboard}, ensure_ascii=False
+                ),
+            )
+            return {"ok": False, "queued": str(qp), "error": str(exc)}
+        raise
+
+    bot = getattr(adapter, "_bot", None)
+    if bot is None:
+        if fallback_to_queue:
+            qp = _enqueue_outbound_fallback("telegram", chat_id, text)
+            return {"ok": False, "queued": str(qp),
+                    "error": "TG adapter has no _bot (not connected)"}
+        raise SendDmError("TG adapter has no _bot (not connected)")
+
+    # Construct python-telegram-bot's InlineKeyboardMarkup from our spec.
+    reply_markup = None
+    if keyboard:
+        try:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup  # type: ignore
+        except Exception as exc:
+            # python-telegram-bot not importable here — fall through to a
+            # text-only send rather than fail the whole notification.
+            reply_markup = None
+        else:
+            rows = []
+            for row in keyboard:
+                btn_objs = []
+                for btn in row:
+                    btn_objs.append(InlineKeyboardButton(
+                        text=str(btn.get("text", "")),
+                        callback_data=btn.get("callback_data"),
+                        url=btn.get("url"),
+                    ))
+                rows.append(btn_objs)
+            reply_markup = InlineKeyboardMarkup(rows)
+
+    coro = bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=reply_markup,
+        parse_mode=parse_mode,
+    )
+
+    try:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None and loop.is_running():
+            fut = asyncio.run_coroutine_threadsafe(coro, loop)
+            result = fut.result(timeout=30)
+        else:
+            result = asyncio.run(coro)
+    except Exception as exc:
+        if fallback_to_queue:
+            qp = _enqueue_outbound_fallback("telegram", chat_id, text)
+            return {"ok": False, "queued": str(qp),
+                    "error": f"TG send_message raised: {exc}"}
+        raise SendDmError(f"TG send_message raised: {exc}") from exc
+
+    msg_id = getattr(result, "message_id", None)
+    return {
+        "ok": True,
+        "msg_id": str(msg_id) if msg_id is not None else None,
+        "platform": "telegram",
+        "raw": repr(result)[:200],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Slack — send a message with Block Kit blocks
+# ---------------------------------------------------------------------------
+
+
+def send_slack_block(
+    channel: str,
+    blocks: list[dict],
+    *,
+    fallback_text: str = "",
+    fallback_to_queue: bool = True,
+) -> dict[str, Any]:
+    """Send a Slack message with Block Kit blocks.
+
+    Args:
+        channel: Slack channel id (``D...`` for DM, ``C...`` for public,
+            ``G...`` for private). Slack will also accept user id
+            (``U...``) and open a DM automatically.
+        blocks: Block Kit list. Slack hard-limits to 50 blocks per message.
+        fallback_text: REQUIRED by Slack — shown in mobile notifications,
+            accessibility readers, and old clients that can't render blocks.
+        fallback_to_queue: When live send fails, enqueue + return queue path.
+    """
+    import asyncio
+    import json as _json
+
+    try:
+        adapter = _get_gateway_adapter("slack")
+    except SendDmError as exc:
+        if fallback_to_queue:
+            qp = _enqueue_outbound_fallback(
+                "slack", channel,
+                "[card] " + _json.dumps(
+                    {"blocks": blocks, "text": fallback_text}, ensure_ascii=False
+                ),
+            )
+            return {"ok": False, "queued": str(qp), "error": str(exc)}
+        raise
+
+    app = getattr(adapter, "_app", None)
+    client = getattr(app, "client", None) if app is not None else None
+    if client is None:
+        if fallback_to_queue:
+            qp = _enqueue_outbound_fallback(
+                "slack", channel, fallback_text or "(slack blocks card)"
+            )
+            return {"ok": False, "queued": str(qp),
+                    "error": "Slack adapter has no app.client"}
+        raise SendDmError("Slack adapter has no app.client")
+
+    coro = client.chat_postMessage(
+        channel=channel,
+        blocks=blocks,
+        text=fallback_text or "PAID notification",
+    )
+
+    try:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None and loop.is_running():
+            fut = asyncio.run_coroutine_threadsafe(coro, loop)
+            result = fut.result(timeout=30)
+        else:
+            result = asyncio.run(coro)
+    except Exception as exc:
+        if fallback_to_queue:
+            qp = _enqueue_outbound_fallback(
+                "slack", channel, fallback_text or "(slack blocks card)"
+            )
+            return {"ok": False, "queued": str(qp),
+                    "error": f"Slack chat_postMessage raised: {exc}"}
+        raise SendDmError(f"Slack chat_postMessage raised: {exc}") from exc
+
+    # Slack SDK returns a SlackResponse — supports both attr and dict access.
+    def _g(obj: Any, key: str, default: Any = None) -> Any:
+        if hasattr(obj, "get"):
+            try:
+                return obj.get(key, default)
+            except Exception:
+                pass
+        return getattr(obj, key, default)
+
+    ok = bool(_g(result, "ok", False))
+    msg_id = _g(result, "ts", None)
+    if not ok:
+        if fallback_to_queue:
+            qp = _enqueue_outbound_fallback(
+                "slack", channel, fallback_text or "(slack blocks card)"
+            )
+            return {
+                "ok": False, "queued": str(qp),
+                "error": f"slack api not-ok: {repr(result)[:300]}",
+                "platform": "slack",
+            }
+        raise SendDmError(f"slack chat_postMessage returned not-ok: {result!r}")
+
+    return {
+        "ok": True,
+        "msg_id": str(msg_id) if msg_id is not None else None,
+        "platform": "slack",
+        "raw": repr(result)[:200],
+    }
+
+
 def _enqueue_outbound_fallback(platform: str, user_id: str, message: str) -> Path:
     """Append a queued outbound DM to disk so the owner can hand-deliver.
 
