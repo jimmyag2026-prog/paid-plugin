@@ -852,6 +852,74 @@ def _enqueue_outbound_fallback(platform: str, user_id: str, message: str) -> Pat
     return path
 
 
+# ---------------------------------------------------------------------------
+# Options-block adapters — convert PAID's universal options spec into each
+# platform's native button payload. Used by send_dm dispatch + by the
+# higher-level review-skill / approval-card paths that want richer UI than
+# plain-text bullets.
+# ---------------------------------------------------------------------------
+
+
+def _options_block_to_telegram_keyboard(options: list[dict]) -> list[list[dict]]:
+    """Render PAID options ([{key, label}]) as a Telegram inline keyboard
+    spec (list-of-rows of {text, callback_data}).
+
+    callback_data format: ``paid_opt:<key>``. v0.1 doesn't route TG button
+    clicks back to PAID — buttons are visual only — but we set
+    callback_data so v1.x can wire dispatch without changing the formatter.
+
+    Layout: each option becomes its own row (full-width), so labels stay
+    readable on mobile even with long Chinese text.
+    """
+    rows: list[list[dict]] = []
+    for opt in options or []:
+        if not isinstance(opt, dict):
+            continue
+        key = str(opt.get("key", "")).strip()
+        if not key:
+            continue
+        label = str(opt.get("label", "")).strip() or f"({key})"
+        rows.append([{
+            "text": f"({key}) {label}" if not label.startswith("(") else label,
+            "callback_data": f"paid_opt:{key}",
+        }])
+    return rows
+
+
+def _options_block_to_slack_blocks(message: str, options: list[dict]) -> list[dict]:
+    """Render PAID options as a minimal Slack Block Kit message:
+
+      [section(message)] + [actions(buttons)]
+
+    Each button's action_id = ``paid_opt_<key>`` (slack action_id can't
+    contain colons in some clients), value = key. v0.1 doesn't route
+    Slack action callbacks back to PAID — buttons visual only.
+    """
+    blocks: list[dict] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": message or "(empty)"},
+        }
+    ]
+    elements: list[dict] = []
+    for opt in options or []:
+        if not isinstance(opt, dict):
+            continue
+        key = str(opt.get("key", "")).strip()
+        if not key:
+            continue
+        label = str(opt.get("label", "")).strip() or key
+        elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": f"({key}) {label}", "emoji": True},
+            "value": key,
+            "action_id": f"paid_opt_{key}",
+        })
+    if elements:
+        blocks.append({"type": "actions", "elements": elements})
+    return blocks
+
+
 def render_options_block(options: list[dict] | None) -> str:
     """Render an options-block list as plain-text bullets appended to a message.
 
@@ -928,8 +996,46 @@ def send_dm(
 
     Raises:
         SendDmError: only if ``fallback_to_queue=False`` and the send fails.
+
+    Platform-specific options_block dispatch (v1.2.0):
+      - platform="telegram" + options_block → send_telegram_card with
+        InlineKeyboardMarkup. On any failure falls through to plain-text path.
+      - platform="slack" + options_block → send_slack_block with Block Kit
+        actions. On any failure falls through.
+      - other platforms (lark / wecom / etc.) + options_block → plain-text
+        path with bullets appended (unchanged from v1.0.0).
     """
     import asyncio
+
+    # Platform-specific options_block dispatch BEFORE plain-text path.
+    # Failure here is non-fatal — we fall through to the plain-text path so
+    # the recipient still sees the message + ASCII bullets.
+    if options_block:
+        if platform == "telegram":
+            try:
+                keyboard = _options_block_to_telegram_keyboard(options_block)
+                if keyboard:
+                    res = send_telegram_card(
+                        user_id, message, keyboard=keyboard,
+                        parse_mode="Markdown",
+                        fallback_to_queue=False,
+                    )
+                    if res.get("ok"):
+                        return res
+            except SendDmError:
+                pass  # → plain-text path below
+        elif platform == "slack":
+            try:
+                blocks = _options_block_to_slack_blocks(message, options_block)
+                res = send_slack_block(
+                    user_id, blocks,
+                    fallback_text=message,
+                    fallback_to_queue=False,
+                )
+                if res.get("ok"):
+                    return res
+            except SendDmError:
+                pass
 
     # Render options block into the message body BEFORE platform dispatch so
     # the queued-fallback path also captures it (otherwise an owner doing a
