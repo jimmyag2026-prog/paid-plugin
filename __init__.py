@@ -260,15 +260,32 @@ def _resolve_owner_send_target(platform: str, user_id: str) -> str:
 def _notify_owner_about_request(req: approval.PendingApproval) -> None:
     """Push the approval card to the owner. Failures fall back to local queue.
 
-    On feishu / lark: sends an interactive card (buttons → slash-command
-    callback). On other platforms: falls back to the plain-text card.
+    Dispatches by the owner's preferred platform identity (Owner v2):
+      - feishu / lark → send_lark_card with interactive card JSON
+      - telegram      → send_telegram_card with InlineKeyboardMarkup
+      - slack         → send_slack_block with Block Kit blocks
+      - any other     → plain-text card via send_dm
+
+    Card path failure (e.g. no live gateway, adapter not connected) falls
+    through to the plain-text path so the recipient still sees the body
+    even when the rich UI fails.
     """
     owner = identity.load_owner()
-    target = _owner_primary_identity(owner)
-    if target is None:
-        _safe_log(f"[approval] no owner identity — skipping DM for #{req.request_id}")
-        return
-    plat, uid = target
+    pref = owner.preferred_identity() if owner else None
+    if pref is None:
+        # Backward compat: try legacy primary-identity helper for v1
+        # owner.json files where preferred_identity returns None due to
+        # all-disabled (shouldn't happen in practice but defensive).
+        target = _owner_primary_identity(owner)
+        if target is None:
+            _safe_log(f"[approval] no owner identity — skipping DM for #{req.request_id}")
+            return
+        plat, uid = target
+    else:
+        plat = pref.platform
+        uid = pref.home_chat_id
+    # FEISHU_HOME_CHANNEL env still wins for Lark (operator-set runtime
+    # override that pre-dates the schema-v2 home_chat_id field).
     receive_target = _resolve_owner_send_target(plat, uid)
 
     # Build platform-agnostic spec; each platform formatter consumes the same.
@@ -281,6 +298,8 @@ def _notify_owner_about_request(req: approval.PendingApproval) -> None:
         req, timeout_min=timeout_min,
     )
 
+    # Platform-specific rich card path. On any failure, fall through to the
+    # plain-text path below so the owner still gets the card body.
     if plat in ("feishu", "lark"):
         try:
             card = card_formatters.format_lark(spec)
@@ -302,8 +321,58 @@ def _notify_owner_about_request(req: approval.PendingApproval) -> None:
                 f"[approval] interactive card EXC #{req.request_id}: {exc} "
                 f"— falling back to text"
             )
+    elif plat == "telegram":
+        try:
+            payload = card_formatters.format_telegram(spec)
+            keyboard = (payload.get("reply_markup") or {}).get("inline_keyboard")
+            result = hermes_io.send_telegram_card(
+                receive_target,
+                payload["text"],
+                keyboard=keyboard,
+                parse_mode=payload.get("parse_mode", "Markdown"),
+                fallback_to_queue=True,
+            )
+            _safe_log(
+                f"[approval] notify owner #{req.request_id} via tg:{receive_target} "
+                f"(inline kbd) → {result}"
+            )
+            if result.get("ok"):
+                return
+            _safe_log(
+                f"[approval] TG inline-kbd card failed, falling back to text for "
+                f"#{req.request_id}"
+            )
+        except Exception as exc:
+            _safe_log(
+                f"[approval] TG card EXC #{req.request_id}: {exc} "
+                f"— falling back to text"
+            )
+    elif plat == "slack":
+        try:
+            payload = card_formatters.format_slack(spec)
+            result = hermes_io.send_slack_block(
+                receive_target,
+                payload["blocks"],
+                fallback_text=payload.get("text", ""),
+                fallback_to_queue=True,
+            )
+            _safe_log(
+                f"[approval] notify owner #{req.request_id} via slack:{receive_target} "
+                f"(block kit) → {result}"
+            )
+            if result.get("ok"):
+                return
+            _safe_log(
+                f"[approval] Slack block-kit failed, falling back to text for "
+                f"#{req.request_id}"
+            )
+        except Exception as exc:
+            _safe_log(
+                f"[approval] Slack card EXC #{req.request_id}: {exc} "
+                f"— falling back to text"
+            )
 
-    # Text fallback (other platforms or card failure).
+    # Text fallback (other platforms or rich-card failure).
     body = card_formatters.format_plain(spec)
     try:
         result = hermes_io.send_dm(plat, receive_target, body, fallback_to_queue=True)
