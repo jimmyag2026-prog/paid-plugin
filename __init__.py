@@ -37,6 +37,7 @@ if str(_HERE) not in sys.path:
 from paid import (
     approval,
     audit,
+    card_formatters,
     card_spec,
     classifier,
     decision,
@@ -231,149 +232,10 @@ def _owner_primary_identity(owner: identity.Owner | None) -> tuple[str, str] | N
     return None
 
 
-def _confidence_badge(conf: float) -> str:
-    if conf >= 0.75:
-        return f"🟢 {conf:.2f}"
-    if conf >= 0.5:
-        return f"🟡 {conf:.2f}"
-    return f"🔴 {conf:.2f}"
-
-
-def _stakes_badge(stakes: str) -> str:
-    return {
-        "high": "🚨 HIGH",
-        "medium": "🟠 medium",
-        "low": "🟢 low",
-    }.get((stakes or "").lower(), stakes or "?")
-
-
-def _format_lark_approval_card(spec: card_spec.ApprovalCardSpec) -> dict:
-    """Build the Lark interactive-card JSON for an approval request.
-
-    The two action buttons embed ``paid_action="approve" / "reject"`` inside
-    ``value`` so we can detect "this is PAID's card, not hermes's
-    tool-approval card" downstream. Hermes's adapter keys off the literal
-    string ``hermes_action`` to mean "this is hermes's own approval", so we
-    use a different key (``paid_action``) to avoid that branch and instead
-    get routed to ``_handle_card_action_event`` → synthetic
-    ``/card button {json}`` slash command our handler reads.
-
-    Takes an ``ApprovalCardSpec`` (not the raw PendingApproval) so the same
-    spec can be passed to TG / Slack formatters that follow the same
-    confidence-badge / stakes-badge / draft-truncation conventions.
-    """
-    draft_for_display = (
-        spec.draft if spec.has_draft
-        else "(no draft — sensitive topic. Approve via /paid-approve "
-             f"{spec.request_id} &lt;your reply text&gt;)"
-    )
-
-    # Build action buttons: only show ✅ Approve when there's a draft to send.
-    # Hard-blacklist topics (salary / equity / etc) come through with empty
-    # drafts on purpose — clicking ✅ would just bounce ("no draft" error),
-    # so we show ❌ Reject only and route the operator to slash-override.
-    buttons: list[dict] = []
-    if spec.has_draft:
-        buttons.append({
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "✅ Approve & send draft"},
-            "type": "primary",
-            "value": {"paid_action": "approve", "request_id": spec.request_id},
-        })
-    buttons.append({
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": "❌ Reject"},
-        "type": "danger",
-        "value": {"paid_action": "reject", "request_id": spec.request_id},
-    })
-
-    note_content = (
-        "Tip: to override the draft instead of sending it as-is, reply "
-        f"/paid-approve {spec.request_id} &lt;your text&gt;"
-        if spec.has_draft else
-        f"This is a sensitive-topic request — no draft was generated. "
-        f"To answer: /paid-approve {spec.request_id} &lt;your reply&gt;. "
-        f"To deflect: tap ❌ Reject."
-    )
-
-    return {
-        "config": {"wide_screen_mode": True, "enable_forward": False},
-        "header": {
-            "title": {
-                "tag": "plain_text",
-                "content": spec.header_title(),
-            },
-            # Sensitive (no-draft) requests get a red header so the operator's
-            # eye is drawn before they click anything.
-            "template": "blue" if spec.has_draft else "red",
-        },
-        "elements": [
-            {
-                "tag": "div",
-                "fields": [
-                    {"is_short": True, "text": {"tag": "lark_md",
-                     "content": f"**From**\n{spec.junior_name}\n_{spec.junior_platform}_"}},
-                    {"is_short": True, "text": {"tag": "lark_md",
-                     "content": f"**Topic**\n{spec.topic}"}},
-                    {"is_short": True, "text": {"tag": "lark_md",
-                     "content": f"**Stakes**\n{spec.stakes_pill()}"}},
-                    {"is_short": True, "text": {"tag": "lark_md",
-                     "content": f"**Confidence**\n{spec.confidence_label()}"}},
-                ],
-            },
-            {"tag": "hr"},
-            {"tag": "div", "text": {"tag": "lark_md",
-             "content": f"**Q (junior asked)**\n{spec.junior_msg}"}},
-            {"tag": "div", "text": {"tag": "lark_md",
-             "content": (
-                 f"**Draft (junior will see this on approve)**\n{draft_for_display}"
-                 if spec.has_draft else
-                 f"**Draft**\n{draft_for_display}"
-             )}},
-            {"tag": "hr"},
-            {"tag": "action", "actions": buttons},
-            {
-                "tag": "note",
-                "elements": [{"tag": "plain_text", "content": note_content}],
-            },
-        ],
-    }
-
-
-def _format_pending_card(req: approval.PendingApproval) -> str:
-    """Plain-text approval card (Lark/Telegram-friendly).
-
-    Numbered shortcuts so the owner can reply without remembering the
-    full ``/paid-approve <id>`` syntax — just type ``1`` to approve, ``2``
-    to send a custom override, ``3`` to reject. (The numbered shorthand
-    is parsed by the slash-command surface; the verbose form still works.)
-    Confidence + stakes get visual badges so a skim is enough.
-    """
-    draft = req.draft_answer or ""
-    draft_preview = (draft[:400] + " …") if len(draft) > 400 else (draft or "(no draft)")
-    q_preview = (
-        (req.junior_question[:400] + " …")
-        if len(req.junior_question) > 400 else req.junior_question
-    )
-    return (
-        f"📨 PAID approval #{req.request_id}\n"
-        f"From: {req.counterparty_display or req.counterparty_user_id} "
-        f"({req.counterparty_platform})\n"
-        f"Topic: {req.topic}  ·  Stakes: {_stakes_badge(req.stakes)}  "
-        f"·  Conf: {_confidence_badge(req.confidence)}\n"
-        f"\n"
-        f"Q (junior asked):\n{q_preview}\n"
-        f"\n"
-        f"Draft (junior will see this if you approve):\n{draft_preview}\n"
-        f"\n"
-        f"Reply:\n"
-        f"  1️⃣ APPROVE — send draft as-is\n"
-        f"     /paid-approve {req.request_id}\n"
-        f"  2️⃣ EDIT    — replace with your text\n"
-        f"     /paid-approve {req.request_id} <your reply>\n"
-        f"  3️⃣ REJECT  — junior is told you'll reply directly\n"
-        f"     /paid-reject {req.request_id}"
-    )
+# NOTE: _confidence_badge / _stakes_badge moved to paid/card_spec.py
+# (single source of truth for visual hints across formatters).
+# _format_lark_approval_card moved to paid/card_formatters.format_lark.
+# _format_pending_card moved to paid/card_formatters.format_plain.
 
 
 def _resolve_owner_send_target(platform: str, user_id: str) -> str:
@@ -421,7 +283,7 @@ def _notify_owner_about_request(req: approval.PendingApproval) -> None:
 
     if plat in ("feishu", "lark"):
         try:
-            card = _format_lark_approval_card(spec)
+            card = card_formatters.format_lark(spec)
             result = hermes_io.send_lark_card(
                 plat, receive_target, card, fallback_to_queue=True
             )
@@ -442,7 +304,7 @@ def _notify_owner_about_request(req: approval.PendingApproval) -> None:
             )
 
     # Text fallback (other platforms or card failure).
-    body = _format_pending_card(req)
+    body = card_formatters.format_plain(spec)
     try:
         result = hermes_io.send_dm(plat, receive_target, body, fallback_to_queue=True)
         _safe_log(
