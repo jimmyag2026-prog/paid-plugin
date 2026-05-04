@@ -4,8 +4,18 @@ Schema notes
 ~~~~~~~~~~~~
 Counterparty profile.json is **schema_version=2** as of W2 batch 1
 (2026-05-02): added ``active_review_session`` and ``review_history`` for
-paid-review skill integration. The reader (``load_counterparty``) tolerates
-older v1 records — missing fields default to empty.
+paid-review skill integration.
+
+Owner.json is **schema_version=2** as of multiplatform v0.1 (2026-05-03):
+each identity gains optional ``home_chat_id`` (where to send PAID DMs;
+distinct from ``user_id`` on Lark / Slack) and ``enabled`` (let owner
+temporarily mute a platform without removing the identity entry). Owner
+also gains ``preferred_platform`` (which identity to prefer when fanning
+out approval cards / fatal alerts).
+
+Both readers tolerate v1 records — missing fields default in (``home_chat_id
+=user_id``, ``enabled=True``, ``preferred_platform=identities[0].platform``).
+A migration helper ``bin/migrate_owner_v1_to_v2.py`` upgrades on disk.
 """
 
 from __future__ import annotations
@@ -17,11 +27,90 @@ from pathlib import Path
 from . import storage
 
 
+_OWNER_SCHEMA_VERSION = 2
+
+
+@dataclass
+class OwnerIdentity:
+    """One (platform, user_id) record on the owner profile, with v2 fields.
+
+    ``home_chat_id`` is where PAID actually DMs the owner (e.g. on Lark
+    that's the bot↔owner chat, not the bare user_id which the adapter's
+    send() rejects with [230001]). Default: same as user_id (correct for
+    Telegram private chats; legacy v1 behaviour for everywhere else).
+
+    ``enabled`` lets the owner mute a platform temporarily — disabled
+    identities still appear in owner.json (so re-enabling is one bool flip)
+    but are skipped by ``preferred_identity()`` and ``enabled_identities()``.
+    """
+
+    platform: str
+    user_id: str
+    home_chat_id: str = ""
+    enabled: bool = True
+    name: str = ""
+
+    def __post_init__(self):
+        if not self.home_chat_id:
+            self.home_chat_id = self.user_id
+
+
 @dataclass
 class Owner:
     owner_id: str
-    identities: list[dict]  # [{"platform": "telegram", "user_id": "..."}]
+    identities: list[dict]  # [{"platform", "user_id", "home_chat_id"?, "enabled"?, "name"?}]
     name: str = ""  # display name shown to counterparties; falls back to owner_id
+    # v2 fields (default-safe so v1 owner.json loads without migration)
+    schema_version: int = _OWNER_SCHEMA_VERSION
+    preferred_platform: str = ""  # "" → falls back to first enabled identity
+
+    # ------------------------------------------------------------------
+    # v2 helpers — work on raw identities dicts so we don't need to keep
+    # OwnerIdentity instances in sync with the persisted JSON.
+    # ------------------------------------------------------------------
+
+    def iter_identities(self) -> list[OwnerIdentity]:
+        """Return identities as ``OwnerIdentity`` instances with defaults
+        applied. Skips entries that are not dict-shaped."""
+        out: list[OwnerIdentity] = []
+        for ident in self.identities or []:
+            if not isinstance(ident, dict):
+                continue
+            try:
+                out.append(OwnerIdentity(
+                    platform=str(ident.get("platform", "")),
+                    user_id=str(ident.get("user_id", "")),
+                    home_chat_id=str(ident.get("home_chat_id", "") or ""),
+                    enabled=bool(ident.get("enabled", True)),
+                    name=str(ident.get("name", "") or ""),
+                ))
+            except Exception:
+                continue
+        return out
+
+    def enabled_identities(self) -> list[OwnerIdentity]:
+        """All identities with ``enabled=True`` and non-empty platform/user_id."""
+        return [
+            i for i in self.iter_identities()
+            if i.enabled and i.platform and i.user_id
+        ]
+
+    def preferred_identity(self) -> OwnerIdentity | None:
+        """Pick the best identity for outbound owner DM.
+
+        Order:
+          1. enabled identity matching ``preferred_platform``
+          2. first enabled identity (insertion order)
+        Returns None if no enabled identity is configured.
+        """
+        enabled = self.enabled_identities()
+        if not enabled:
+            return None
+        if self.preferred_platform:
+            for i in enabled:
+                if i.platform == self.preferred_platform:
+                    return i
+        return enabled[0]
 
 
 def display_name(owner: Owner | None) -> str:
@@ -83,7 +172,12 @@ def _cp_profile_path(cp_id: str) -> Path:
 
 
 def load_owner() -> Owner | None:
-    """Read owner.json. Return None if missing or malformed."""
+    """Read owner.json. Return None if missing or malformed.
+
+    Backward-compatible reader: v1 records (no ``schema_version``) load
+    cleanly with ``preferred_platform`` empty (which makes
+    ``preferred_identity()`` fall back to the first enabled identity —
+    matches v1 ``_owner_primary_identity`` semantics)."""
     data = storage.read_json(_owner_path())
     if data is None:
         return None
@@ -92,7 +186,27 @@ def load_owner() -> Owner | None:
     if not isinstance(identities, list):
         identities = []
     name = data.get("name", "") or ""
-    return Owner(owner_id=owner_id, identities=identities, name=name)
+    schema_version = int(data.get("schema_version", 1) or 1)
+    preferred_platform = str(data.get("preferred_platform", "") or "")
+    return Owner(
+        owner_id=owner_id,
+        identities=identities,
+        name=name,
+        schema_version=schema_version,
+        preferred_platform=preferred_platform,
+    )
+
+
+def save_owner(owner: Owner) -> None:
+    """Persist an Owner back to owner.json — always writes v2 schema."""
+    payload = {
+        "schema_version": _OWNER_SCHEMA_VERSION,
+        "owner_id": owner.owner_id,
+        "name": owner.name,
+        "preferred_platform": owner.preferred_platform,
+        "identities": owner.identities,
+    }
+    storage.write_json(_owner_path(), payload)
 
 
 def is_owner(platform: str, sender_id: str) -> bool:
