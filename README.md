@@ -15,12 +15,20 @@ It runs locally, all logs stay on your machine, and it speaks through
 your existing IM accounts (Telegram / Lark / Feishu / WhatsApp / WeCom /
 Slack — whichever Hermes is wired up to).
 
-**Status: v1.1 — design baseline.** End-to-end loop is wired, **179 tests
-passing + 48-check manual smoke**, verified live on Lark with the upstream
-`hermes-agent` v0.12.0. Ships an interactive Lark approval card (with
-button callbacks routed back to PAID), a local-only Flask web dashboard,
-daily snapshot reports, and a `paid status` upgrade with today's metrics
-+ activity dots.
+**Status: v1.2 — multi-platform v0.1.** End-to-end loop is wired, **289 tests
+passing + 63-check manual smoke**, verified live on Lark + offline mock
+on Telegram + Slack with the upstream `hermes-agent` v0.12.0. Ships an
+interactive Lark approval card (with button callbacks routed back to
+PAID), Telegram InlineKeyboard cards, Slack Block Kit cards, a local-only
+Flask web dashboard, daily snapshot reports, and a `paid status` upgrade
+with today's metrics + activity dots.
+
+**v1.1 → v1.2 (2026-05-03)** — Multi-platform v0.1: TG + Slack approval
+cards. Owner picks `preferred_platform` in `owner.json` (v2 schema with
+`home_chat_id` + `enabled` per identity). Button clicks on TG/Slack are
+visual-only (slash commands stay the operation path) — see
+[`docs/USER_TEST_MULTIPLATFORM.md`](docs/USER_TEST_MULTIPLATFORM.md) for
+the owner-side walkthrough.
 
 **v1.0 → v1.1 (2026-05-03)** — Code unchanged from v1.0.0 (W2/W3 unblock
 batch). v1.1 promotes the design baseline for the next development arc:

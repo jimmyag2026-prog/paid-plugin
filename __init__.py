@@ -37,6 +37,8 @@ if str(_HERE) not in sys.path:
 from paid import (
     approval,
     audit,
+    card_formatters,
+    card_spec,
     classifier,
     decision,
     hermes_io,
@@ -230,156 +232,10 @@ def _owner_primary_identity(owner: identity.Owner | None) -> tuple[str, str] | N
     return None
 
 
-def _confidence_badge(conf: float) -> str:
-    if conf >= 0.75:
-        return f"🟢 {conf:.2f}"
-    if conf >= 0.5:
-        return f"🟡 {conf:.2f}"
-    return f"🔴 {conf:.2f}"
-
-
-def _stakes_badge(stakes: str) -> str:
-    return {
-        "high": "🚨 HIGH",
-        "medium": "🟠 medium",
-        "low": "🟢 low",
-    }.get((stakes or "").lower(), stakes or "?")
-
-
-def _format_lark_approval_card(req: approval.PendingApproval) -> dict:
-    """Build the Lark interactive-card JSON for an approval request.
-
-    The two action buttons embed ``hermes_action="paid_approve" /
-    "paid_reject"`` inside ``value`` so we can detect "this is PAID's card,
-    not hermes's tool-approval card" downstream. Hermes's adapter keys off
-    the literal string ``hermes_action`` to mean "this is hermes's own
-    approval", so we use a different key (``paid_action``) to avoid that
-    branch and instead get routed to ``_handle_card_action_event`` →
-    synthetic ``/card button {json}`` slash command our handler reads.
-    """
-    confidence_pill = (
-        "🟢" if req.confidence >= 0.75
-        else "🟡" if req.confidence >= 0.5
-        else "🔴"
-    )
-    stakes_pill = {"high": "🚨 HIGH", "medium": "🟠 medium", "low": "🟢 low"}.get(
-        (req.stakes or "").lower(), req.stakes or "?"
-    )
-    q = (req.junior_question or "")[:600]
-    has_draft = bool((req.draft_answer or "").strip())
-    draft_for_display = (
-        req.draft_answer[:600] if has_draft
-        else "(no draft — sensitive topic. Approve via /paid-approve "
-             f"{req.request_id} &lt;your reply text&gt;)"
-    )
-    sender = req.counterparty_display or req.counterparty_user_id
-
-    # Build action buttons: only show ✅ Approve when there's a draft to send.
-    # Hard-blacklist topics (salary / equity / etc) come through with empty
-    # drafts on purpose — clicking ✅ would just bounce ("no draft" error),
-    # so we show ❌ Reject only and route the operator to slash-override.
-    buttons: list[dict] = []
-    if has_draft:
-        buttons.append({
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "✅ Approve & send draft"},
-            "type": "primary",
-            "value": {"paid_action": "approve", "request_id": req.request_id},
-        })
-    buttons.append({
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": "❌ Reject"},
-        "type": "danger",
-        "value": {"paid_action": "reject", "request_id": req.request_id},
-    })
-
-    note_content = (
-        "Tip: to override the draft instead of sending it as-is, reply "
-        f"/paid-approve {req.request_id} &lt;your text&gt;"
-        if has_draft else
-        f"This is a sensitive-topic request — no draft was generated. "
-        f"To answer: /paid-approve {req.request_id} &lt;your reply&gt;. "
-        f"To deflect: tap ❌ Reject."
-    )
-
-    return {
-        "config": {"wide_screen_mode": True, "enable_forward": False},
-        "header": {
-            "title": {
-                "tag": "plain_text",
-                "content": f"📨 PAID approval #{req.request_id}",
-            },
-            # Sensitive (no-draft) requests get a red header so the operator's
-            # eye is drawn before they click anything.
-            "template": "blue" if has_draft else "red",
-        },
-        "elements": [
-            {
-                "tag": "div",
-                "fields": [
-                    {"is_short": True, "text": {"tag": "lark_md",
-                     "content": f"**From**\n{sender}\n_{req.counterparty_platform}_"}},
-                    {"is_short": True, "text": {"tag": "lark_md",
-                     "content": f"**Topic**\n{req.topic or '—'}"}},
-                    {"is_short": True, "text": {"tag": "lark_md",
-                     "content": f"**Stakes**\n{stakes_pill}"}},
-                    {"is_short": True, "text": {"tag": "lark_md",
-                     "content": f"**Confidence**\n{confidence_pill} {req.confidence:.2f}"}},
-                ],
-            },
-            {"tag": "hr"},
-            {"tag": "div", "text": {"tag": "lark_md",
-             "content": f"**Q (junior asked)**\n{q}"}},
-            {"tag": "div", "text": {"tag": "lark_md",
-             "content": (
-                 f"**Draft (junior will see this on approve)**\n{draft_for_display}"
-                 if has_draft else
-                 f"**Draft**\n{draft_for_display}"
-             )}},
-            {"tag": "hr"},
-            {"tag": "action", "actions": buttons},
-            {
-                "tag": "note",
-                "elements": [{"tag": "plain_text", "content": note_content}],
-            },
-        ],
-    }
-
-
-def _format_pending_card(req: approval.PendingApproval) -> str:
-    """Plain-text approval card (Lark/Telegram-friendly).
-
-    Numbered shortcuts so the owner can reply without remembering the
-    full ``/paid-approve <id>`` syntax — just type ``1`` to approve, ``2``
-    to send a custom override, ``3`` to reject. (The numbered shorthand
-    is parsed by the slash-command surface; the verbose form still works.)
-    Confidence + stakes get visual badges so a skim is enough.
-    """
-    draft = req.draft_answer or ""
-    draft_preview = (draft[:400] + " …") if len(draft) > 400 else (draft or "(no draft)")
-    q_preview = (
-        (req.junior_question[:400] + " …")
-        if len(req.junior_question) > 400 else req.junior_question
-    )
-    return (
-        f"📨 PAID approval #{req.request_id}\n"
-        f"From: {req.counterparty_display or req.counterparty_user_id} "
-        f"({req.counterparty_platform})\n"
-        f"Topic: {req.topic}  ·  Stakes: {_stakes_badge(req.stakes)}  "
-        f"·  Conf: {_confidence_badge(req.confidence)}\n"
-        f"\n"
-        f"Q (junior asked):\n{q_preview}\n"
-        f"\n"
-        f"Draft (junior will see this if you approve):\n{draft_preview}\n"
-        f"\n"
-        f"Reply:\n"
-        f"  1️⃣ APPROVE — send draft as-is\n"
-        f"     /paid-approve {req.request_id}\n"
-        f"  2️⃣ EDIT    — replace with your text\n"
-        f"     /paid-approve {req.request_id} <your reply>\n"
-        f"  3️⃣ REJECT  — junior is told you'll reply directly\n"
-        f"     /paid-reject {req.request_id}"
-    )
+# NOTE: _confidence_badge / _stakes_badge moved to paid/card_spec.py
+# (single source of truth for visual hints across formatters).
+# _format_lark_approval_card moved to paid/card_formatters.format_lark.
+# _format_pending_card moved to paid/card_formatters.format_plain.
 
 
 def _resolve_owner_send_target(platform: str, user_id: str) -> str:
@@ -404,20 +260,49 @@ def _resolve_owner_send_target(platform: str, user_id: str) -> str:
 def _notify_owner_about_request(req: approval.PendingApproval) -> None:
     """Push the approval card to the owner. Failures fall back to local queue.
 
-    On feishu / lark: sends an interactive card (buttons → slash-command
-    callback). On other platforms: falls back to the plain-text card.
+    Dispatches by the owner's preferred platform identity (Owner v2):
+      - feishu / lark → send_lark_card with interactive card JSON
+      - telegram      → send_telegram_card with InlineKeyboardMarkup
+      - slack         → send_slack_block with Block Kit blocks
+      - any other     → plain-text card via send_dm
+
+    Card path failure (e.g. no live gateway, adapter not connected) falls
+    through to the plain-text path so the recipient still sees the body
+    even when the rich UI fails.
     """
     owner = identity.load_owner()
-    target = _owner_primary_identity(owner)
-    if target is None:
-        _safe_log(f"[approval] no owner identity — skipping DM for #{req.request_id}")
-        return
-    plat, uid = target
+    pref = owner.preferred_identity() if owner else None
+    if pref is None:
+        # Backward compat: try legacy primary-identity helper for v1
+        # owner.json files where preferred_identity returns None due to
+        # all-disabled (shouldn't happen in practice but defensive).
+        target = _owner_primary_identity(owner)
+        if target is None:
+            _safe_log(f"[approval] no owner identity — skipping DM for #{req.request_id}")
+            return
+        plat, uid = target
+    else:
+        plat = pref.platform
+        uid = pref.home_chat_id
+    # FEISHU_HOME_CHANNEL env still wins for Lark (operator-set runtime
+    # override that pre-dates the schema-v2 home_chat_id field).
     receive_target = _resolve_owner_send_target(plat, uid)
 
+    # Build platform-agnostic spec; each platform formatter consumes the same.
+    try:
+        from paid import settings as _settings
+        timeout_min = max(1, int(_settings.approval_timeout_seconds() / 60))
+    except Exception:
+        timeout_min = 30
+    spec = card_spec.ApprovalCardSpec.from_pending_approval(
+        req, timeout_min=timeout_min,
+    )
+
+    # Platform-specific rich card path. On any failure, fall through to the
+    # plain-text path below so the owner still gets the card body.
     if plat in ("feishu", "lark"):
         try:
-            card = _format_lark_approval_card(req)
+            card = card_formatters.format_lark(spec)
             result = hermes_io.send_lark_card(
                 plat, receive_target, card, fallback_to_queue=True
             )
@@ -436,9 +321,59 @@ def _notify_owner_about_request(req: approval.PendingApproval) -> None:
                 f"[approval] interactive card EXC #{req.request_id}: {exc} "
                 f"— falling back to text"
             )
+    elif plat == "telegram":
+        try:
+            payload = card_formatters.format_telegram(spec)
+            keyboard = (payload.get("reply_markup") or {}).get("inline_keyboard")
+            result = hermes_io.send_telegram_card(
+                receive_target,
+                payload["text"],
+                keyboard=keyboard,
+                parse_mode=payload.get("parse_mode", "Markdown"),
+                fallback_to_queue=True,
+            )
+            _safe_log(
+                f"[approval] notify owner #{req.request_id} via tg:{receive_target} "
+                f"(inline kbd) → {result}"
+            )
+            if result.get("ok"):
+                return
+            _safe_log(
+                f"[approval] TG inline-kbd card failed, falling back to text for "
+                f"#{req.request_id}"
+            )
+        except Exception as exc:
+            _safe_log(
+                f"[approval] TG card EXC #{req.request_id}: {exc} "
+                f"— falling back to text"
+            )
+    elif plat == "slack":
+        try:
+            payload = card_formatters.format_slack(spec)
+            result = hermes_io.send_slack_block(
+                receive_target,
+                payload["blocks"],
+                fallback_text=payload.get("text", ""),
+                fallback_to_queue=True,
+            )
+            _safe_log(
+                f"[approval] notify owner #{req.request_id} via slack:{receive_target} "
+                f"(block kit) → {result}"
+            )
+            if result.get("ok"):
+                return
+            _safe_log(
+                f"[approval] Slack block-kit failed, falling back to text for "
+                f"#{req.request_id}"
+            )
+        except Exception as exc:
+            _safe_log(
+                f"[approval] Slack card EXC #{req.request_id}: {exc} "
+                f"— falling back to text"
+            )
 
-    # Text fallback (other platforms or card failure).
-    body = _format_pending_card(req)
+    # Text fallback (other platforms or rich-card failure).
+    body = card_formatters.format_plain(spec)
     try:
         result = hermes_io.send_dm(plat, receive_target, body, fallback_to_queue=True)
         _safe_log(

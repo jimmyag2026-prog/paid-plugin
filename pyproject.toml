@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paid"
-version = "1.1.0"
+version = "1.2.0"
 description = "Personal AI Delegate — Hermes plugin that authorises an AI to handle a class of your IM messages with an approval gate."
 readme = "README.md"
 license = {file = "LICENSE"}
