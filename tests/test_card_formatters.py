@@ -57,12 +57,21 @@ def test_lark_card_with_draft_shows_approve_button():
     assert any("Reject" in t for t in button_texts)
 
 
-def test_lark_card_no_draft_hides_approve_button():
+def test_lark_card_no_draft_renders_all_three_buttons_v1_2_2():
+    """v1.2.2 UX change: even no-draft cards render Approve/Edit/Reject so
+    the visual model is consistent across cards. The note block tells the
+    operator that ✅ won't fire and to use slash command instead."""
     card = card_formatters.format_lark(_make_spec(has_draft=False, draft=""))
     actions = [el for el in card["elements"] if el.get("tag") == "action"]
     button_texts = [b["text"]["content"] for b in actions[0]["actions"]]
-    assert not any("Approve" in t for t in button_texts)
+    assert any("Approve" in t for t in button_texts)
+    assert any("Edit" in t for t in button_texts)
     assert any("Reject" in t for t in button_texts)
+    # Note explains why ✅ won't actually do anything.
+    note = next(el for el in card["elements"] if el.get("tag") == "note")
+    note_text = note["elements"][0]["content"]
+    assert "won't send" in note_text or "won't" in note_text or "no draft" in note_text.lower()
+    assert "/paid-approve" in note_text
 
 
 def test_lark_card_no_draft_uses_red_header():
@@ -130,14 +139,19 @@ def test_telegram_keyboard_with_draft_has_three_buttons():
     assert any("Reject" in t for t in texts)
 
 
-def test_telegram_keyboard_no_draft_only_reject():
+def test_telegram_keyboard_no_draft_still_renders_all_three_buttons_v1_2_2():
+    """v1.2.2 UX change: keep all 3 buttons even without a draft for visual
+    consistency. Card text explicitly tells operator ✅ won't fire."""
     payload = card_formatters.format_telegram(_make_spec(has_draft=False, draft=""))
     rows = payload["reply_markup"]["inline_keyboard"]
     flat = [btn for row in rows for btn in row]
     texts = [b["text"] for b in flat]
-    assert not any("Approve" in t for t in texts)
-    assert not any("Edit" in t for t in texts)
+    assert any("Approve" in t for t in texts)
+    assert any("Edit" in t for t in texts)
     assert any("Reject" in t for t in texts)
+    # Body text warns that ✅ won't send.
+    assert "won't send" in payload["text"] or "won't" in payload["text"]
+    assert "/paid-approve abc123" in payload["text"]
 
 
 def test_telegram_callback_data_uses_paid_prefix():
@@ -203,12 +217,22 @@ def test_slack_blocks_have_actions_with_three_buttons_when_draft():
     assert "paid_reject" in action_ids
 
 
-def test_slack_blocks_no_draft_only_reject_button():
+def test_slack_blocks_no_draft_still_renders_all_three_buttons_v1_2_2():
+    """v1.2.2 UX change: 3 buttons even without a draft for consistency.
+    The 'no draft' section block explicitly warns about ✅ being a no-op."""
     payload = card_formatters.format_slack(_make_spec(has_draft=False, draft=""))
     actions = [b for b in payload["blocks"] if b["type"] == "actions"]
     elements = actions[0]["elements"]
-    assert len(elements) == 1
-    assert elements[0]["action_id"] == "paid_reject"
+    assert len(elements) == 3
+    action_ids = [e["action_id"] for e in elements]
+    assert "paid_approve" in action_ids
+    assert "paid_edit" in action_ids
+    assert "paid_reject" in action_ids
+    # The no-draft section warns about ✅ being inert.
+    sections = [b for b in payload["blocks"] if b["type"] == "section"]
+    no_draft_text = " ".join(s["text"]["text"] for s in sections if s.get("text"))
+    assert "/paid-approve" in no_draft_text
+    assert "won't" in no_draft_text or "no_draft" in no_draft_text.lower() or "none" in no_draft_text.lower()
 
 
 def test_slack_action_value_is_request_id():

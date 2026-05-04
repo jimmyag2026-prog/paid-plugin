@@ -30,45 +30,58 @@ from .card_spec import ApprovalCardSpec
 def format_lark(spec: ApprovalCardSpec) -> dict:
     """Build Lark interactive-card JSON.
 
-    Buttons embed ``paid_action="approve" / "reject"`` inside ``value`` so
-    we can detect "this is PAID's card, not hermes's tool-approval card"
+    Buttons embed ``paid_action="approve"/"edit"/"reject"`` inside ``value``
+    so we can detect "this is PAID's card, not hermes's tool-approval card"
     downstream. Hermes's adapter keys off the literal string
     ``hermes_action`` to mean "this is hermes's own approval", so we use a
     different key (``paid_action``) to avoid that branch and instead get
     routed to ``_handle_card_action_event`` → synthetic
     ``/card button {json}`` slash command our handler reads.
+
+    All three buttons (Approve/Edit/Reject) render unconditionally as of
+    v1.2.2 — even when has_draft=False. The note block below the actions
+    explains what each button means in the no-draft case so the operator
+    has a consistent visual model across cards (rather than buttons
+    disappearing on sensitive topics).
     """
     draft_for_display = (
         spec.draft if spec.has_draft
-        else "(no draft — sensitive topic. Approve via /paid-approve "
-             f"{spec.request_id} &lt;your reply text&gt;)"
+        else "_(none — PAID couldn't ground a draft from your SOP. "
+             f"Type your own reply: `/paid-approve {spec.request_id} &lt;your text&gt;`)_"
     )
 
-    # Only show ✅ Approve when there's a draft to send. Hard-blacklist
-    # topics (salary / equity / etc) come through with empty drafts on
-    # purpose — clicking ✅ would just bounce ("no draft" error).
-    buttons: list[dict] = []
-    if spec.has_draft:
-        buttons.append({
+    # All three buttons render every time. v0.1 doesn't route Lark button
+    # clicks back to this branch when there's no draft to send — the click
+    # would currently bounce with a 'no draft' error from the slash-command
+    # handler. The note block below tells the operator how to recover.
+    buttons: list[dict] = [
+        {
             "tag": "button",
-            "text": {"tag": "plain_text", "content": "✅ Approve & send draft"},
+            "text": {"tag": "plain_text", "content": "✅ Approve"},
             "type": "primary",
             "value": {"paid_action": "approve", "request_id": spec.request_id},
-        })
-    buttons.append({
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": "❌ Reject"},
-        "type": "danger",
-        "value": {"paid_action": "reject", "request_id": spec.request_id},
-    })
+        },
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "✏️ Edit"},
+            "value": {"paid_action": "edit", "request_id": spec.request_id},
+        },
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "❌ Reject"},
+            "type": "danger",
+            "value": {"paid_action": "reject", "request_id": spec.request_id},
+        },
+    ]
 
     note_content = (
         "Tip: to override the draft instead of sending it as-is, reply "
         f"/paid-approve {spec.request_id} &lt;your text&gt;"
         if spec.has_draft else
-        f"This is a sensitive-topic request — no draft was generated. "
-        f"To answer: /paid-approve {spec.request_id} &lt;your reply&gt;. "
-        f"To deflect: tap ❌ Reject."
+        f"⚠️ No draft was generated (PAID couldn't ground a reply from your "
+        f"SOP). The ✅ button alone won't send anything — type your own "
+        f"reply with /paid-approve {spec.request_id} &lt;your text&gt;, or "
+        f"tap ❌ Reject to deflect to you."
     )
 
     return {
@@ -147,10 +160,18 @@ def format_telegram(spec: ApprovalCardSpec) -> dict:
         draft_section = (
             f"\n*PAID's draft (junior will see this on approve):*\n{draft_quoted}\n"
         )
+        action_hint = ""
     else:
         draft_section = (
-            "\n*Draft:* (none — sensitive topic; approve with custom text "
-            f"`/paid-approve {spec.request_id} <your reply>`)\n"
+            "\n*Draft:* _none — PAID couldn't ground a reply from your SOP_\n"
+        )
+        # has_draft=False: the ✅/✏️ buttons render but clicking them won't
+        # send anything (no draft to send / edit). The action hint below
+        # tells the operator the correct recovery path explicitly.
+        action_hint = (
+            "\n⚠️ The ✅ button won't send anything (no draft). Reply with "
+            f"`/paid-approve {spec.request_id} <your text>` to send your own, "
+            "or tap ❌ Reject.\n"
         )
 
     text = (
@@ -164,6 +185,7 @@ def format_telegram(spec: ApprovalCardSpec) -> dict:
         f"\n"
         f"*Message:*\n{_telegram_escape_markdown(msg_quoted)}\n"
         f"{draft_section}"
+        f"{action_hint}"
         f"\n"
         f"⏱️ Auto-defer in {spec.timeout_min} min\n"
         f"\n"
@@ -171,22 +193,24 @@ def format_telegram(spec: ApprovalCardSpec) -> dict:
     )
 
     # Inline keyboard — button click NOT routed back to PAID; visual only.
-    # callback_data is included anyway so the future v1.x can reuse the
-    # same button payloads if/when we wire callback handling upstream.
-    buttons_row: list[dict] = []
-    if spec.has_draft:
-        buttons_row.append({
+    # All three buttons render every time (v1.2.2): the consistent visual
+    # model is more important than hiding a button that wouldn't work
+    # anyway. The action_hint text above tells the operator that ✅ won't
+    # actually send when has_draft=False.
+    buttons_row: list[dict] = [
+        {
             "text": "✅ Approve",
             "callback_data": f"paid_approve:{spec.request_id}",
-        })
-        buttons_row.append({
+        },
+        {
             "text": "✏️ Edit",
             "callback_data": f"paid_edit:{spec.request_id}",
-        })
-    buttons_row.append({
-        "text": "❌ Reject",
-        "callback_data": f"paid_reject:{spec.request_id}",
-    })
+        },
+        {
+            "text": "❌ Reject",
+            "callback_data": f"paid_reject:{spec.request_id}",
+        },
+    ]
 
     return {
         "text": text,
@@ -252,36 +276,41 @@ def format_slack(spec: ApprovalCardSpec) -> dict:
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"*Draft:* _none — sensitive topic_\n"
-                    f"Approve with custom text: `/paid-approve {spec.request_id} <reply>`"
+                    f"*Draft:* _none — PAID couldn't ground a reply from your SOP_\n"
+                    f":warning: The ✅ button won't send anything. "
+                    f"Reply with `/paid-approve {spec.request_id} <your text>` "
+                    f"to send your own, or tap ❌ Reject."
                 ),
             },
         })
 
     # Action buttons — visual only, click is NOT routed to PAID. action_id
     # uses the same paid_* prefix as TG callback_data for symmetry/v1.x.
-    button_elements: list[dict] = []
-    if spec.has_draft:
-        button_elements.append({
+    # All three buttons render every time (v1.2.2): consistent visual model
+    # across cards is more useful than hiding a button that wouldn't fire.
+    # The 'no draft' note above explains the recovery path explicitly.
+    button_elements: list[dict] = [
+        {
             "type": "button",
             "style": "primary",
             "text": {"type": "plain_text", "text": "✅ Approve", "emoji": True},
             "value": spec.request_id,
             "action_id": "paid_approve",
-        })
-        button_elements.append({
+        },
+        {
             "type": "button",
             "text": {"type": "plain_text", "text": "✏️ Edit", "emoji": True},
             "value": spec.request_id,
             "action_id": "paid_edit",
-        })
-    button_elements.append({
-        "type": "button",
-        "style": "danger",
-        "text": {"type": "plain_text", "text": "❌ Reject", "emoji": True},
-        "value": spec.request_id,
-        "action_id": "paid_reject",
-    })
+        },
+        {
+            "type": "button",
+            "style": "danger",
+            "text": {"type": "plain_text", "text": "❌ Reject", "emoji": True},
+            "value": spec.request_id,
+            "action_id": "paid_reject",
+        },
+    ]
 
     blocks.extend([
         {"type": "actions", "elements": button_elements},
