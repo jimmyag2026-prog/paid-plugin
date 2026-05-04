@@ -405,6 +405,157 @@ def phase_c_alert_owner(paid_dir: Path) -> None:
 
 
 # --------------------------------------------------------------------------
+# PHASE D — Multi-platform v0.1 (Slack + Telegram dispatch)
+# --------------------------------------------------------------------------
+
+
+def phase_d_multiplatform(paid_dir: Path) -> None:
+    _phase("PHASE D · multi-platform v0.1 (TG/Slack card dispatch)")
+    import importlib
+    import json as _json
+    from paid import (
+        approval, card_formatters, card_spec, identity, storage,
+    )
+    # Phase C monkey-patched hermes_io.send_dm to raise; reload to get a clean
+    # module-level state for Phase D (other tests may have other patches too).
+    from paid import hermes_io as _hermes_io_mod
+    importlib.reload(_hermes_io_mod)
+    hermes_io = _hermes_io_mod
+    storage.PAID_DIR = paid_dir
+
+    # D1 — ApprovalCardSpec → format_telegram payload structurally OK
+    spec = card_spec.ApprovalCardSpec(
+        request_id="d1-rid",
+        junior_name="Smoke J",
+        junior_platform="lark",
+        junior_msg="please approve my Q3 plan draft",
+        topic="planning",
+        confidence=0.65,
+        stakes="medium",
+        draft="On it — replying within an hour.",
+        has_draft=True,
+        timeout_min=30,
+        instructions="reply /paid-approve d1-rid",
+    )
+    tg_payload = card_formatters.format_telegram(spec)
+    _check("D1 format_telegram returns text+reply_markup",
+           "text" in tg_payload and "reply_markup" in tg_payload)
+    _check("D1 TG keyboard has 3 buttons (with draft)",
+           len([b for row in tg_payload["reply_markup"]["inline_keyboard"] for b in row]) == 3)
+    _check("D1 TG text contains request_id",
+           "d1-rid" in tg_payload["text"])
+
+    # D2 — ApprovalCardSpec → format_slack returns valid Block Kit
+    sl_payload = card_formatters.format_slack(spec)
+    _check("D2 format_slack returns blocks+text",
+           isinstance(sl_payload.get("blocks"), list)
+           and len(sl_payload.get("text", "")) > 0)
+    _check("D2 Slack actions block has 3 buttons",
+           any(b["type"] == "actions" and len(b["elements"]) == 3
+               for b in sl_payload["blocks"]))
+
+    # D3 — send_dm(platform=telegram, options_block) routes to send_telegram_card
+    captured = {}
+    original_tg = hermes_io.send_telegram_card
+    def fake_tg(*args, **kwargs):
+        captured["tg"] = (args, kwargs)
+        return {"ok": True, "msg_id": "tg-d3", "platform": "telegram"}
+    hermes_io.send_telegram_card = fake_tg
+    try:
+        result = hermes_io.send_dm(
+            "telegram", "12345", "smoke msg",
+            options_block=[
+                {"key": "a", "label": "accept"},
+                {"key": "pass", "label": "skip"},
+            ],
+        )
+        _check("D3 send_dm(tg, options) → send_telegram_card called",
+               "tg" in captured and result["ok"] is True)
+        if "tg" in captured:
+            kb = captured["tg"][1].get("keyboard")
+            _check("D3 keyboard has 2 rows (one per option)",
+                   isinstance(kb, list) and len(kb) == 2)
+    finally:
+        hermes_io.send_telegram_card = original_tg
+
+    # D4 — send_dm(platform=slack, options_block) routes to send_slack_block
+    captured.clear()
+    original_sl = hermes_io.send_slack_block
+    def fake_sl(*args, **kwargs):
+        captured["sl"] = (args, kwargs)
+        return {"ok": True, "msg_id": "sl-d4", "platform": "slack"}
+    hermes_io.send_slack_block = fake_sl
+    try:
+        result = hermes_io.send_dm(
+            "slack", "D12345", "smoke msg",
+            options_block=[{"key": "a", "label": "accept"}],
+        )
+        _check("D4 send_dm(slack, options) → send_slack_block called",
+               "sl" in captured and result["ok"] is True)
+        if "sl" in captured:
+            blocks = captured["sl"][0][1]
+            _check("D4 blocks include section + actions",
+                   any(b["type"] == "section" for b in blocks)
+                   and any(b["type"] == "actions" for b in blocks))
+    finally:
+        hermes_io.send_slack_block = original_sl
+
+    # D5 — owner v2 preferred_platform=slack → _notify_owner_about_request
+    # uses slack path. Need to load plugin entry for this assertion.
+    (paid_dir / "owner.json").write_text(_json.dumps({
+        "schema_version": 2, "owner_id": "smoke", "name": "Smoke",
+        "preferred_platform": "slack",
+        "identities": [
+            {"platform": "telegram", "user_id": "1"},
+            {"platform": "slack", "user_id": "U1", "home_chat_id": "D1"},
+        ],
+    }))
+    spec_obj = importlib.util.spec_from_file_location(
+        "paid_smoke_plug_d", REPO_ROOT / "__init__.py"
+    )
+    plug = importlib.util.module_from_spec(spec_obj)
+    spec_obj.loader.exec_module(plug)
+    sl_calls: list = []
+    plug.hermes_io.send_slack_block = lambda *a, **k: (
+        sl_calls.append((a, k)) or {"ok": True, "msg_id": "x"}
+    )
+    plug.hermes_io.send_lark_card = lambda *a, **k: (_ for _ in ()).throw(AssertionError("D5: lark used"))
+    plug.hermes_io.send_telegram_card = lambda *a, **k: (_ for _ in ()).throw(AssertionError("D5: tg used"))
+    plug.hermes_io.send_dm = lambda *a, **k: (_ for _ in ()).throw(AssertionError("D5: plain used"))
+    req = approval.PendingApproval(
+        request_id="d5-rid", ts_created=1.0,
+        counterparty_id="cp", counterparty_platform="lark",
+        counterparty_user_id="ou", counterparty_display="J",
+        junior_session_id="s", junior_question="?",
+        draft_answer="ok", topic="x", stakes="medium", confidence=0.7,
+    )
+    plug._notify_owner_about_request(req)
+    _check("D5 preferred_platform=slack → send_slack_block invoked",
+           len(sl_calls) == 1)
+    if sl_calls:
+        _check("D5 Slack target uses home_chat_id=D1 (not user_id=U1)",
+               sl_calls[0][0][0] == "D1")
+
+    # D6 — migration script upgrade_payload pure function smoke
+    from importlib import util as _ilu
+    mig_spec = _ilu.spec_from_file_location(
+        "paid_mig_d6", REPO_ROOT / "bin" / "migrate_owner_v1_to_v2.py"
+    )
+    mig = _ilu.module_from_spec(mig_spec)
+    mig_spec.loader.exec_module(mig)
+    new, changes = mig.upgrade_payload({
+        "owner_id": "x",
+        "identities": [{"platform": "telegram", "user_id": "1"}],
+    })
+    _check("D6 migration: schema_version stamped", new["schema_version"] == 2)
+    _check("D6 migration: home_chat_id backfilled = user_id",
+           new["identities"][0]["home_chat_id"] == "1")
+    _check("D6 migration: preferred_platform = first identity",
+           new["preferred_platform"] == "telegram")
+    _check("D6 migration: change log non-empty", len(changes) >= 3)
+
+
+# --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
 
@@ -440,6 +591,13 @@ def main() -> int:
         phase_c_alert_owner(phase_c_dir)
     except Exception as e:
         _check(f"PHASE C unexpected exception: {type(e).__name__}", False, str(e))
+
+    phase_d_dir = paid_dir / "phase_d"
+    phase_d_dir.mkdir(exist_ok=True)
+    try:
+        phase_d_multiplatform(phase_d_dir)
+    except Exception as e:
+        _check(f"PHASE D unexpected exception: {type(e).__name__}", False, str(e))
 
     # Summary
     total = len(_RESULTS)
