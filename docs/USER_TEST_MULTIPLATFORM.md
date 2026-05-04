@@ -66,22 +66,56 @@ To get your `user_id`:
 
 ### B.3 Configure hermes
 
-On the host running PAID's hermes (your laptop or VPS), edit
-`~/.hermes/.env`:
+On the host running PAID's hermes (your laptop or VPS), three things
+must be in place before hermes will actually load the Telegram adapter.
+Skipping any of them makes hermes silently fall back to "feishu only";
+PAID logs `loaded=['feishu']` and TG cards never appear.
+
+#### B.3.a · `~/.hermes/.env`
 
 ```bash
-# Add these two lines (use your actual values):
 TELEGRAM_TOKEN=1234567890:AAH-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-# TELEGRAM_WEBHOOK_URL=    # leave UNSET — PAID/hermes uses polling by default
 
-# (optional, only if you deploy hermes behind a reverse proxy and want
-#  push delivery instead of polling — most owners can ignore)
+# REQUIRED — comma-separated allowlist of TG user IDs hermes will accept
+# inbound from. Without this, hermes denies ALL telegram users including
+# you and never starts the adapter.
+TELEGRAM_ALLOWED_USERS=123456789
+
+# (do NOT set TELEGRAM_WEBHOOK_URL unless you genuinely want webhook
+#  mode — it requires TELEGRAM_WEBHOOK_SECRET as a safety gate, see
+#  https://github.com/NousResearch/hermes-agent/security/advisories/GHSA-3vpc-7q5r-276h
+#  default polling mode is what most owners want)
 ```
 
-> ⚠️ **Don't set `TELEGRAM_WEBHOOK_URL`** unless you really want webhook
-> mode. With it set, hermes also requires `TELEGRAM_WEBHOOK_SECRET` (it
-> refuses to start otherwise — this is hermes-side security
-> [GHSA-3vpc-7q5r-276h](https://github.com/NousResearch/hermes-agent/security/advisories/GHSA-3vpc-7q5r-276h)).
+#### B.3.b · `~/.hermes/config.yaml`
+
+`.env` alone is **not enough** — hermes' config loader reads platform
+enable from `config.yaml`'s top-level `platforms:` block. If that block
+is absent, the env override path doesn't kick in (verified on
+hermes-agent v0.12.0; behaviour may improve in later versions). Add a
+`platforms:` block at the bottom of `~/.hermes/config.yaml`:
+
+```yaml
+# Multi-platform v0.1 — explicit platform enables.
+platforms:
+  feishu:
+    enabled: true
+  telegram:
+    enabled: true
+    token: 1234567890:AAH-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+```
+
+(Yes, the token appears twice — once in `.env`, once in `config.yaml`.
+File mode 600 protects both. If you only put it in one, hermes might
+read the other path and miss it.)
+
+#### B.3.c · DM the bot once before any smoke test
+
+Telegram bots **cannot send the first message** in a chat — the user
+has to DM the bot at least once to establish the chat. Open Telegram,
+search `@<your_bot_username>`, send any text (e.g. `hi`). PAID's
+`_alert_owner` smoke will silently no-op if you skip this — TG accepts
+the API call but drops the message.
 
 ### B.4 Add yourself to PAID's owner.json
 
@@ -375,6 +409,34 @@ Look for:
 | `401 Unauthorized` (TG) | bad bot token | Copy fresh token from BotFather; no spaces |
 | `invalid_auth` (Slack) | bad bot token | Reinstall app to workspace; copy `xoxb-` token |
 | `not_allowed_token_type` (Slack Socket Mode) | passed `xoxb-` where `xapp-` needed | Set both `SLACK_BOT_TOKEN` AND `SLACK_APP_TOKEN` separately |
+
+### D.2.5 PAID logs `loaded=['feishu']` after adding TG token
+
+You added `TELEGRAM_TOKEN` to `.env` and restarted hermes, but PAID's
+plugin_runtime.log still shows:
+
+```
+[approval] notify owner via tg:... → ok: False, error: "no active adapter
+for platform=telegram; loaded=['feishu']"
+```
+
+This is the most-debugged dogfood gotcha (5/4 — burned 30 min). hermes
+needs all THREE of these in place before the TG adapter starts:
+
+1. `TELEGRAM_TOKEN` in `.env` (you have this)
+2. `TELEGRAM_ALLOWED_USERS=<your_user_id>` in `.env` (without it, hermes'
+   "no allowlist → deny all" rule keeps the adapter from going up)
+3. `platforms:` block at the top level of `config.yaml` with both
+   `feishu: enabled: true` AND `telegram: enabled: true, token: ...`
+
+`.env` alone is not enough — see Section B.3 above for the exact YAML.
+
+Quick verify after `hermes gateway restart`:
+```bash
+# look for both adapters in startup
+journalctl --user -u hermes-gateway --since "30 seconds ago" 2>/dev/null \
+  | grep -iE "telegram|adapter loaded"
+```
 
 ### D.3 PAID sends to wrong place / nothing happens
 

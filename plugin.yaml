@@ -1,7 +1,13 @@
 name: paid-v1
-version: 1.2.2
+version: 1.2.3
 description: PAID — Personal AI Delegate (three-state approval pipeline)
 author: PAID project
+# PAID's owner CLI is built on hermes v0.11+ plugin surface
+# (ctx.register_command is what /paid-pending /paid-approve /paid-reject
+# /paid-status /card all need). On older hermes, the slash commands
+# silently don't register — owner ends up with a J3 dead-end. PAID's
+# register() checks for this and warns loudly via _alert_owner.
+minimum_hermes_version: "0.11.0"
 provides_hooks:
   - pre_gateway_dispatch
   - pre_llm_call

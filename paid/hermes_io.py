@@ -251,6 +251,23 @@ def call_llm(
     if not isinstance(content, str):
         raise LLMCallError(f"LLM returned non-string content: {type(content).__name__}")
 
+    # Best-effort cost ledger record. Uses the OpenAI-compatible 'usage'
+    # block when present; absent → record with zero tokens (still captures
+    # call frequency). Lazy import avoids a hot-path dep cycle if cost.py
+    # ever needs to call back into hermes_io.
+    try:
+        from . import cost as _cost  # noqa: WPS433 — intentional lazy
+        usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
+        _cost.record_call(
+            model=str(payload.get("model", "") or "default"),
+            prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+            completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+        )
+    except Exception:
+        # Cost tracking is observability — never let a ledger write fail
+        # the LLM call that just succeeded.
+        pass
+
     return content
 
 
