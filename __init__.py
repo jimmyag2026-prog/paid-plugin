@@ -474,6 +474,157 @@ def _notify_owner_about_unknown_sender(
 # Hook handlers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Sprint D — review skill routing (spec §6 plugin glue contract)
+# ---------------------------------------------------------------------------
+
+# v0.1 only the explicit /review trigger opens a session — classifier's
+# needs_review path is intentionally dead code (M1.7 evaluates flipping
+# this on after pilot). spec §2 + design/05_backlog.md M1 §2.
+
+def _wrap_reply_for_hermes(text: str) -> dict:
+    """ReviewReply.text → hermes context override that forces an exact reply.
+    Same pattern as PAID's other 'IGNORE the user, reply EXACTLY with' paths
+    (verified in v1.0.0 dogfood). Single-quoted to keep Hermes from
+    splitting on apostrophes inside `text` — strip + escape conservatively."""
+    safe = text.replace("\\", "\\\\").replace("'", "\\'")
+    return {
+        "context": (
+            f"IGNORE the user message. Reply EXACTLY with the following "
+            f"text and nothing else, preserving all line breaks: '{safe}'"
+        )
+    }
+
+
+def _maybe_route_to_review_skill(cp, user_message: str,
+                                 hook_kwargs: dict) -> dict | None:
+    """Route junior inbound to paid_review skill if applicable.
+
+    Returns:
+      - None: not for review skill; caller (on_pre_llm_call) falls through to J2
+      - {"context": "..."}: skill consumed the message; hermes should reply
+        exactly with the skill's text (no LLM thinking on top)
+
+    Routing rules (spec §6 entry table):
+      1. /review cancel             → force_close any active session
+      2. /review or /r <subject>    → intake (refused if active exists)
+      3. cp.active_review_session   → handle_inbound (regular QA tick)
+      4. else                       → None (J2 path)
+    """
+    text = (user_message or "").strip()
+    text_lower = text.lower()
+
+    has_active = bool(getattr(cp, "active_review_session", "") or "")
+    starts_just_r = text_lower in ("/r", "/review")  # bare /r needs a subject
+    is_review_cmd = (
+        text_lower.startswith("/review")
+        or text_lower.startswith("/r ")
+        or starts_just_r
+    )
+
+    # ---- Path 1: /review cancel ----
+    if text_lower in ("/review cancel", "/r cancel"):
+        if not has_active:
+            return _wrap_reply_for_hermes(
+                "你目前没有进行中的 review session 可以取消。"
+                "发 /review <subject> 开新一轮。"
+            )
+        try:
+            from paid_review import api as _review_api
+            msg = _review_api.force_close(
+                cp.active_review_session, reason="junior_cancel",
+            )
+        except Exception as exc:
+            _safe_log(f"[review] cancel EXC sid={cp.active_review_session}: {exc}")
+            msg = f"取消失败: {exc}"
+        try:
+            identity.clear_active_review_session(cp, archive={
+                "sid": cp.active_review_session,
+                "closed_reason": "junior_cancel",
+            })
+        except Exception:
+            pass
+        return _wrap_reply_for_hermes(
+            f"已关闭，发 /review <subject> 开新一轮。\n\n{msg}"
+        )
+
+    # ---- Path 2: /review <subject> or /r <subject> ----
+    if is_review_cmd and not text_lower.startswith("/review cancel"):
+        if has_active:
+            return _wrap_reply_for_hermes(
+                f"你已有进行中的 review session: {cp.active_review_session}。"
+                "先 /review cancel 再开新的。"
+            )
+        # Strip command prefix
+        if text_lower.startswith("/review"):
+            initial = text[len("/review"):].lstrip(" :：")
+        else:
+            initial = text[len("/r"):].lstrip(" :：")
+        if not initial and starts_just_r:
+            return _wrap_reply_for_hermes(
+                "请告诉我要 review 的 subject。例: /review Q3 OKR 草稿"
+            )
+        # Run intake
+        try:
+            from paid_review import api as _review_api
+            sid = _review_api.intake(
+                cp=cp, initial_message=initial or text,
+                attachments=hook_kwargs.get("attachments", []),
+            )
+            identity.set_active_review_session(cp, sid)
+        except Exception as exc:
+            _safe_log(f"[review] intake EXC cp={cp.cp_id}: {exc}")
+            return _wrap_reply_for_hermes(
+                f"开 review session 失败: {exc}。请重试或换个 subject。"
+            )
+        # Drive the state machine ONE step (intake side-effect already
+        # wrote SUBJECT stage; handle_inbound with empty text returns the
+        # subject_ask reply). intake() in api.py already does the SUBJECT
+        # transition + saves subject_candidates, so we synthesize the
+        # subject_ask reply by calling handle_inbound with the empty
+        # trigger placeholder.
+        try:
+            reply = _review_api.handle_inbound(sid, "", hook_kwargs)
+        except Exception as exc:
+            _safe_log(f"[review] post-intake handle_inbound EXC sid={sid}: {exc}")
+            return _wrap_reply_for_hermes(
+                f"已创建 session {sid} 但首条响应失败: {exc}"
+            )
+        return _wrap_reply_for_hermes(reply.text)
+
+    # ---- Path 3: active session, non-/review message ----
+    if has_active:
+        try:
+            from paid_review import api as _review_api
+            reply = _review_api.handle_inbound(
+                cp.active_review_session, user_message, hook_kwargs,
+            )
+        except Exception as exc:
+            _safe_log(
+                f"[review] handle_inbound EXC sid={cp.active_review_session}: {exc}"
+            )
+            return _wrap_reply_for_hermes(
+                "review skill 暂时出错，可以发 /review cancel 退出再试。"
+            )
+
+        # spec §6 plugin职责 #5: closed=True → clear active_session
+        # spec §6 plugin职责 #4: stage=SCAN+event_kind=scan_progress → just send
+        if reply.closed:
+            try:
+                identity.clear_active_review_session(cp, archive={
+                    "sid": cp.active_review_session,
+                    "stage": reply.stage,
+                    "event_kind": reply.event_kind,
+                })
+            except Exception as exc:
+                _safe_log(f"[review] clear_active EXC: {exc}")
+        # SCAN progress: do NOT clear; session continues.
+        return _wrap_reply_for_hermes(reply.text)
+
+    # ---- Path 4: not a review-skill message ----
+    return None
+
+
 def on_pre_llm_call(**kwargs) -> dict | None:
     """Main PAID entry: identify → classify → decide → return context to Hermes.
 
@@ -560,6 +711,32 @@ def on_pre_llm_call(**kwargs) -> dict | None:
                     f"\"我没办法处理这个请求，请直接 @ {owner_name}.\""
                 )
             }
+
+        # Sprint D — review skill routing (M1 v0.1).
+        # MUST be after L1 injection check (safety first) and BEFORE the
+        # classifier (so /review inbound and active-session messages bypass
+        # J2 entirely). Returns a context dict if the skill consumed the
+        # message; None means "fall through to J2".
+        try:
+            review_ctx = _maybe_route_to_review_skill(
+                cp, user_message, kwargs,
+            )
+        except Exception as exc:
+            tb = traceback.format_exc()
+            _safe_log(f"[review] router EXC {exc}\n{tb}")
+            review_ctx = None  # fall back to J2 — never block the hook
+        if review_ctx is not None:
+            audit.log_action(
+                session_id=session_id, counterparty=cp,
+                junior_msg=user_message,
+                classification=None, action=None,
+                extra={"platform": platform, "routed_to": "review_skill"},
+            )
+            _safe_log(
+                f"[review] cp={cp.cp_id} routed to skill "
+                f"(active_session={cp.active_review_session or '<new>'})"
+            )
+            return review_ctx
 
         sop_excerpt = retrieval.retrieve_sop_context(user_message)
         persona = storage.read_text(storage.PAID_DIR / "persona.md") or ""
