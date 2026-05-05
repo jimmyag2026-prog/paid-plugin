@@ -2,6 +2,11 @@
 
 Sprint A: happy path INTAKE→SUBJECT→QA→CLOSED works end-to-end with a fake
 LLM adapter.  MERGE and GATE handlers raise NotImplementedError (Sprint B/C).
+
+Sprint B: SUBJECT→SCAN now runs the full 4-pillar + Responder Sim two-layer
+scan (paid_review.core.scan); QA reply classification uses short-code fast
+path + LLM free-text fallback (paid_review.core.qa). Findings rendering
+moved to qa.render_finding for i18n + consistent layout.
 """
 
 from __future__ import annotations
@@ -110,36 +115,24 @@ def _build_subject_options(initial_message: str) -> list[str]:
         return [initial_message[:80]]
 
 
-def _build_findings(subject: str, initial_message: str) -> list[Annotation]:
-    """Call LLM to produce 4-pillar findings as Annotation objects."""
-    prompt = (
-        f"Review subject: {subject}\n\nDocument:\n{initial_message}\n\n"
-        "Return JSON: a list of findings, each with fields: "
-        '"id" (string), "pillar" (intent|data|logic|feasibility|stakeholder|risk|roi), '
-        '"text" (finding description). '
-        "Produce 2-5 findings."
+def _build_findings(subject: str, initial_message: str,
+                    *, owner_name: str = "the owner",
+                    responder_profile: str = "") -> list[Annotation]:
+    """Run the Sprint B 2-layer scan (4-pillar + Responder Sim).
+
+    Sprint A used a single mixed LLM call as a placeholder; Sprint B
+    delegates to paid_review.core.scan which does two separate LLM
+    calls (each layer can fail/succeed independently) and merges + dedups.
+    Both layers return [] if the LLM fails — caller must handle the
+    no_findings short-circuit (Ⓜ17, already implemented in _handle_subject).
+    """
+    from paid_review.core import scan
+    return scan.run_full_scan(
+        subject=subject,
+        document=initial_message,
+        owner_name=owner_name,
+        responder_profile=responder_profile,
     )
-    try:
-        raw = _call_llm(prompt)
-        items = json.loads(raw)
-        if not isinstance(items, list):
-            raise ValueError("expected list")
-        findings = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            findings.append(
-                Annotation(
-                    id=str(item.get("id", uuid.uuid4().hex[:6])),
-                    pillar=str(item.get("pillar", "intent")),
-                    text=str(item.get("text", "")),
-                    status="open",
-                )
-            )
-        return findings
-    except Exception as exc:
-        logger.warning("_build_findings LLM parse failed: %s", exc)
-        return []
 
 
 def _render_options(opts: list[str]) -> str:
@@ -151,23 +144,28 @@ def _render_options(opts: list[str]) -> str:
     return "\n".join(parts)
 
 
-def _finding_text(ann: Annotation, index: int, total: int) -> str:
-    return (
-        f"【Finding {index}/{total} · {ann.pillar}】\n{ann.text}\n\n"
-        "(a) 接受\n(b) 保留异议\n(c) 标为无解\n(skip) 跳过"
-    )
+def _finding_text(ann: Annotation, index: int, total: int,
+                  lang: str = "zh") -> str:
+    """Sprint B: delegated to qa.render_finding for i18n + consistency."""
+    from paid_review.core import qa
+    return qa.render_finding(ann, index, total, lang=lang)
 
 
-def _reply_kind_for_answer(text: str) -> str | None:
-    t = text.strip().lower()
-    if t in ("a", "accept", "接受"):
-        return "accepted"
-    if t in ("b", "reject", "保留异议", "dissent"):
-        return "rejected"
-    if t in ("c", "unresolvable", "无解", "标为无解"):
-        return "unresolvable"
-    if t in ("skip",):
-        return "modified"   # treat skip as modified for now
+def _reply_kind_for_answer(text: str, finding: Annotation | None = None) -> str | None:
+    """Sprint A short-code matcher; superseded by qa.classify_reply (which
+    adds free-text LLM fallback). Kept as a thin wrapper for the few
+    legacy call sites that don't have the finding object handy.
+
+    Returns None when text is unrecognized AND no finding is provided
+    (caller should treat as modified or fall back to LLM).
+    """
+    from paid_review.core import qa
+    short = qa._short_code(text)
+    if short is not None:
+        return short
+    if finding is not None:
+        # Free-text path requires a finding for context
+        return qa.classify_reply(text, finding)
     return None
 
 
@@ -387,10 +385,18 @@ def _handle_qa(
             event_kind="finding",
         )
 
-    status = _reply_kind_for_answer(text)
-    if status is None:
-        # Free text → treat as modified (custom rebuttal)
-        status = "modified"
+    # Sprint B: short-code fast path → free-text LLM fallback (qa.classify_reply)
+    from paid_review.core import qa as _qa
+    short = _qa._short_code(text)
+    if short is not None:
+        status = short
+    else:
+        # Free text → classify via LLM with finding context
+        current_ann = ann_by_id.get(cursor.current_id)
+        if current_ann is not None:
+            status = _qa.classify_reply(text, current_ann)
+        else:
+            status = "modified"  # defensive fallback when finding missing
 
     update_status(sid_dir, cursor.current_id, status)
 
