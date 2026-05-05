@@ -341,18 +341,11 @@ def _handle_qa(
                 state, sid_dir, reason="rounds_exhausted"
             )
 
-        # Sprint A: stub MERGE/GATE — go directly to CLOSED
-        state.verdict = "READY"
-        transition(state, "CLOSED")
-        state.closed_at = _now_iso()
-        state.last_event_kind = "close_propose"
-        save_state(state)
-        return ReviewReply(
-            text="QA 完成！（Sprint A stub: 直接关闭，MERGE/GATE 在 Sprint B/C 实现）",
-            stage="CLOSED",
-            event_kind="close_propose",
-            closed=True,
-        )
+        # Sprint C: real GATE path. Skip MERGE for now (perm=suggest is
+        # default but Sprint D/E adds revised.md generation; v0.1 ships
+        # with perm=none semantics — junior's accepted findings are the
+        # final material). Run final_gate → deliver → CLOSED.
+        return _do_gate_and_close(state, sid_dir)
 
     # --- (more) command ---
     if t == "(more)" or t == "more":
@@ -434,7 +427,14 @@ def _handle_qa(
 def _do_force_close(
     state: SessionState, sid_dir: Path, reason: str
 ) -> ReviewReply:
-    """Internal: set state to CLOSED with FORCED_PARTIAL and save."""
+    """Internal: set state to CLOSED with FORCED_PARTIAL and save.
+
+    Also writes the audit + summary artifacts so the owner has something
+    to read about the partial session (Sprint C). Skips the GATE LLM call
+    since the session never reached a clean close.
+    """
+    from paid_review.core import deliver as _deliver
+
     state.forced = True
     state.forced_reason = reason
     state.verdict = "FORCED_PARTIAL"
@@ -443,6 +443,24 @@ def _do_force_close(
     state.last_event_kind = "cancelled"
     save_state(state)
     open_n = open_count(sid_dir)
+
+    # Write artifacts (audit at minimum; summary is best-effort) but DO
+    # NOT archive — operator may want to inspect the partial directory.
+    try:
+        norm = sid_dir / "normalized.md"
+        document = norm.read_text(encoding="utf-8") if norm.exists() else ""
+        _deliver.write_artifacts(
+            sid_dir,
+            subject=state.subject or "(force-closed before subject set)",
+            junior_name=state.cp_id,
+            junior_platform=state.platform,
+            rounds=state.rounds, verdict=state.verdict,
+            document=document, forced_reason=reason,
+        )
+    except Exception:
+        # Force-close path must never raise; missing artifacts is a soft fail.
+        logger.warning("force_close: artifact write failed for sid=%s", state.sid)
+
     return ReviewReply(
         text=(
             f"Review session 已强制关闭（原因: {reason}）。"
@@ -450,6 +468,94 @@ def _do_force_close(
         ),
         stage="CLOSED",
         event_kind="cancelled",
+        closed=True,
+    )
+
+
+def _do_gate_and_close(
+    state: SessionState, sid_dir: Path
+) -> ReviewReply:
+    """Internal: GATE form-check → deliver → CLOSED.
+
+    Sprint C entry. Called when QA done and rounds within limit.
+
+    Verdict logic per spec INV-5 + final_gate.md:
+      - GATE returns FAIL → state.rounds += 1 + transition back to QA;
+        rounds_exhausted check happens in _handle_qa next time
+      - GATE returns READY / READY_WITH_OPEN_ITEMS → write artifacts +
+        archive + return summary as ReviewReply text
+    """
+    from paid_review.core import final_gate as _gate
+    from paid_review.core import deliver as _deliver
+    from paid import storage as _storage
+
+    annotations = load_annotations(sid_dir)
+    norm = sid_dir / "normalized.md"
+    document = norm.read_text(encoding="utf-8") if norm.exists() else ""
+    subject = state.subject or "(no subject)"
+
+    gate_result = _gate.run_final_gate(
+        subject=subject, final_document=document,
+        annotations=annotations, rounds=state.rounds,
+    )
+
+    # Persist the gate JSON for forensic / dashboard use
+    try:
+        (sid_dir / "final_gate.json").write_text(
+            json.dumps(gate_result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    verdict = gate_result.get("verdict", "READY_WITH_OPEN_ITEMS")
+
+    if verdict == "FAIL":
+        # Intent gate failed — back to QA + rounds++ (INV-2)
+        state.rounds += 1
+        # FAIL is transient: per INV-5 matrix, FAIL only valid AT GATE→QA edge;
+        # we leave verdict=FAIL momentarily then transition flips it via the
+        # save path. Use direct assignment + transition (validate will accept
+        # FAIL on GATE; then the next QA stage will require verdict=PENDING).
+        state.verdict = "FAIL"  # transient marker
+        transition(state, "QA")
+        # Once in QA, INV-5 requires verdict=PENDING — reset
+        state.verdict = "PENDING"
+        state.last_event_kind = "gate_fail"
+        save_state(state)
+        rationale = gate_result.get("rationale", "")
+        return ReviewReply(
+            text=(
+                f"Final gate FAIL — Intent pillar 没通过。本轮 rounds={state.rounds}。\n"
+                f"原因: {rationale}\n"
+                "请继续 QA 修补，回 done 再次尝试。"
+            ),
+            stage="QA",
+            event_kind="finding",
+        )
+
+    # READY or READY_WITH_OPEN_ITEMS — go to CLOSED
+    state.verdict = verdict if verdict in ("READY", "READY_WITH_OPEN_ITEMS") else "READY_WITH_OPEN_ITEMS"
+    state.closed_at = _now_iso()
+    transition(state, "CLOSED")
+    state.last_event_kind = "close_propose"
+    save_state(state)
+
+    # Write summary + audit + archive
+    sessions_root = _storage.PAID_DIR / "review" / "sessions"
+    delivered = _deliver.deliver(
+        sid_dir, sessions_root,
+        subject=subject,
+        junior_name=state.cp_id,
+        junior_platform=state.platform,
+        rounds=state.rounds, verdict=state.verdict,
+        document=document,
+    )
+
+    return ReviewReply(
+        text=delivered["summary"],   # owner gets the 6-section brief
+        stage="CLOSED",
+        event_kind="close_propose",
         closed=True,
     )
 

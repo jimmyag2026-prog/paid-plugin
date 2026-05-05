@@ -117,7 +117,10 @@ def test_happy_path_end_to_end(paid_tmp, monkeypatch):
     from paid_review.core.state import load_state
     state = load_state(sid)
     assert state.stage == "CLOSED"
-    assert state.verdict in ("READY", "FORCED_PARTIAL")  # Sprint A stub uses READY
+    # Sprint A used "READY" stub on done; Sprint C runs final_gate which
+    # can legitimately return READY_WITH_OPEN_ITEMS when junior left
+    # findings as rejected/unresolvable. FORCED_PARTIAL covers force-close.
+    assert state.verdict in ("READY", "READY_WITH_OPEN_ITEMS", "FORCED_PARTIAL")
     assert state.closed_at is not None
 
     # --- list_open should not show this session ---

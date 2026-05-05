@@ -117,13 +117,43 @@ def transition(state: SessionState, new_stage: Stage) -> SessionState:
 # ---------------------------------------------------------------------------
 
 def session_dir(sid: str) -> Path:
+    """Active session dir. NOTE: after deliver.archive() moves a CLOSED
+    session to _closed/<month>/<sid>/, this path no longer exists — use
+    resolve_session_dir() if you also need to find archived sessions."""
     from paid import storage
     return storage.PAID_DIR / "review" / "sessions" / sid
 
 
+def resolve_session_dir(sid: str) -> Path | None:
+    """Find sid's directory whether it's active or already archived.
+
+    Searches:
+      1. sessions/<sid>/                        (active)
+      2. sessions/_closed/*/<sid>/              (archived after CLOSED)
+
+    Returns None if no match — used by load_state + show + list_open.
+    """
+    active = session_dir(sid)
+    if active.exists():
+        return active
+    closed_root = active.parent / "_closed"
+    if closed_root.exists():
+        for month_dir in closed_root.iterdir():
+            if not month_dir.is_dir():
+                continue
+            candidate = month_dir / sid
+            if candidate.exists():
+                return candidate
+    return None
+
+
 def load_state(sid: str) -> SessionState | None:
-    """Load SessionState from sessions/<sid>/meta.json. Returns None if missing."""
-    meta = session_dir(sid) / "meta.json"
+    """Load SessionState from sessions/<sid>/meta.json or _closed/.../meta.json.
+    Returns None if missing."""
+    sid_dir = resolve_session_dir(sid)
+    if sid_dir is None:
+        return None
+    meta = sid_dir / "meta.json"
     if not meta.exists():
         return None
     try:
