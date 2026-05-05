@@ -176,16 +176,29 @@ def _reply_kind_for_answer(text: str, finding: Annotation | None = None) -> str 
 def _handle_intake(
     state: SessionState, text: str, sid_dir: Path
 ) -> ReviewReply:
-    """INTAKE: generate subject candidates from initial message, move → SUBJECT."""
-    # Store initial message as normalized.md for later use
+    """INTAKE: generate subject candidates from normalized doc, move → SUBJECT.
+
+    Reads the seeded normalized.md (written by intake() via ingest backend)
+    rather than the trigger text, since the plugin calls handle_inbound with
+    text="" right after intake() returns. Falls back to trigger text for
+    legacy callers that haven't seeded normalized.md.
+    """
     normalized = sid_dir / "normalized.md"
     normalized.parent.mkdir(parents=True, exist_ok=True)
-    if not normalized.exists():
-        normalized.write_text(text, encoding="utf-8")
+    if normalized.exists():
+        seed = normalized.read_text(encoding="utf-8")
+    else:
+        seed = text or ""
+        normalized.write_text(seed, encoding="utf-8")
 
-    candidates = _build_subject_options(text)
+    # If ingest produced nothing AND trigger has content, fall back to trigger
+    if not seed.strip() and text and text.strip():
+        seed = text.strip()
+        normalized.write_text(seed, encoding="utf-8")
+
+    candidates = _build_subject_options(seed)
     if not candidates:
-        candidates = [text[:80]]
+        candidates = [seed[:80] if seed else "(待补充)"]
 
     # Store candidates so SUBJECT handler can resolve selection
     meta_extra = sid_dir / "subject_candidates.json"
@@ -636,6 +649,26 @@ def intake(
         finally:
             if _fcntl is not None:
                 _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_UN)
+
+    # Run ingest OUTSIDE the cp.profile.json lock — it writes only into the
+    # session dir which is unique per sid so no contention. Best-effort:
+    # any failure leaves normalized.md missing and _handle_intake falls back
+    # to the trigger text. R5: never raises out of intake().
+    try:
+        from paid_review import ingest as _ingest_mod
+        sid_dir = session_dir(sid)
+        sid_dir.mkdir(parents=True, exist_ok=True)
+        result = _ingest_mod.ingest(initial_message, attachments or [], sid_dir)
+        (sid_dir / "normalized.md").write_text(
+            result.normalized_text or (initial_message or ""),
+            encoding="utf-8",
+        )
+        if result.errors:
+            logger.warning(
+                "[review] sid=%s ingest had %d errors", sid, len(result.errors)
+            )
+    except Exception as exc:
+        logger.warning("[review] sid=%s ingest crashed: %s", sid, exc)
 
     return sid
 
