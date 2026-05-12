@@ -156,6 +156,95 @@ def test_shape_context_direct_chinese_signoff_instruction():
     assert "助理" in out
 
 
+# --- v1.2.5: direct-state hard rules against approval-mimicking phrasing ---
+# Regression for 2026-05-12 dogfood: in direct state the LLM was emitting
+# "已记录待确认 / 等待 Jimmy 确认" (faking an approval flow that doesn't
+# exist) and "rewriting" SOP content (calendly.com/jimmy → jimmyyin). The
+# hard-rule block in _direct_context tells the LLM both behaviours are
+# forbidden — these tests assert the rules are present in the prompt.
+
+_FAKE_ESCALATION_PHRASES_ZH = ["等待", "确认", "已记录", "转给"]
+_FAKE_ESCALATION_PHRASES_EN = ["forward", "follow up", "awaiting", "logged"]
+
+
+def test_direct_state_chinese_includes_hard_rules():
+    out = shape_context(
+        Action(state="direct", reason="ok"),
+        FakeClassification(draft_answer="周一到周五 10:00-18:30"),
+        persona="P", counterparty=FakeCounterparty(),
+        sop_excerpt="logistics: 办公室 10:00-18:30",
+        owner_name="Jimmy", lang="zh",
+    )
+    # Hard rule block header present
+    assert "硬规则" in out
+    # All three rules referenced (approval-mimicking, SOP-rewriting, no-fake-action)
+    assert "不要假装走审批流程" in out or "审批流程" in out
+    assert "SOP" in out
+    # Owner name substituted for placeholder
+    assert "Jimmy" in out
+    # Specific forbidden phrasings listed so the LLM knows what NOT to emit
+    for phrase in _FAKE_ESCALATION_PHRASES_ZH:
+        assert phrase in out, f"hard-rule list missing forbidden phrase: {phrase}"
+
+
+def test_direct_state_english_includes_hard_rules():
+    out = shape_context(
+        Action(state="direct", reason="ok"),
+        FakeClassification(draft_answer="Office: Mon-Fri 10:00-18:30"),
+        persona="P", counterparty=FakeCounterparty(),
+        sop_excerpt="logistics: office 10-18:30",
+        owner_name="Jimmy", lang="en",
+    )
+    assert "Hard rules" in out
+    assert "approval flow" in out.lower() or "approval" in out.lower()
+    assert "verbatim" in out or "SOP says X" in out
+    for phrase in _FAKE_ESCALATION_PHRASES_EN:
+        assert phrase.lower() in out.lower(), f"missing forbidden phrase: {phrase}"
+
+
+def test_direct_state_hard_rules_use_actual_owner_name():
+    """OWNER placeholder must be replaced — pilots have different names and
+    a literal 'OWNER' in the prompt is confusing for the LLM."""
+    out = shape_context(
+        Action(state="direct", reason="ok"),
+        FakeClassification(draft_answer="x"),
+        persona="P", counterparty=FakeCounterparty(),
+        sop_excerpt="", owner_name="Alice", lang="zh",
+    )
+    assert "Alice" in out
+    # Literal OWNER token must not leak through (substitution failed if it does)
+    assert "OWNER" not in out
+
+    out_en = shape_context(
+        Action(state="direct", reason="ok"),
+        FakeClassification(draft_answer="x"),
+        persona="P", counterparty=FakeCounterparty(),
+        sop_excerpt="", owner_name="Alice", lang="en",
+    )
+    assert "Alice" in out_en
+    assert "OWNER" not in out_en
+
+
+def test_direct_state_request_decline_unaffected():
+    """Hard-rules block is direct-only — request/decline still use the
+    exact-reply override (no persona / SOP / rules leakage)."""
+    req = shape_context(
+        Action(state="request", reason="default"),
+        FakeClassification(topic="logistics"), persona="P",
+        counterparty=FakeCounterparty(), sop_excerpt="",
+        owner_name="Jimmy", lang="zh",
+    )
+    assert "硬规则" not in req
+
+    dec = shape_context(
+        Action(state="decline", reason="blacklist"),
+        FakeClassification(topic="equity"), persona="P",
+        counterparty=FakeCounterparty(), sop_excerpt="",
+        owner_name="Jimmy", lang="zh",
+    )
+    assert "硬规则" not in dec
+
+
 def test_shape_context_request_english_warm_copy():
     a = Action(state="request", reason="default")
     out = shape_context(

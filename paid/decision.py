@@ -236,6 +236,39 @@ def decide_action(
 # ---------------------------------------------------------------------------
 
 
+_DIRECT_HARD_RULES_ZH = (
+    "硬规则（不可违反，比 persona / SOP 优先级高）：\n"
+    "1. **直答状态不要假装走审批流程**：禁止使用「等待 OWNER 确认」、"
+    "「已记录待确认」、「我会转给 OWNER」、「OWNER 稍后会回复」、"
+    "「已转交 OWNER」这类暗示后续动作的话术。如果问题需要 OWNER 决策，"
+    "classifier 本应判 request 状态——此时已是 direct，PAID 必须自己给出"
+    "最终答案，不许伪装升级。\n"
+    "2. **只用 SOP 字面内容**：禁止「纠正」或「补全」SOP 里的事实。"
+    "即使你认为某条信息应该是别的，也按 SOP 字面写的回复；不要新增或替换 "
+    "URL、地址、人名、政策细节。\n"
+    "3. **答不了就直说**：如果 SOP 不足以给出准确答案，直接告诉对方"
+    "「这点 SOP 里没明确写，建议直接问 OWNER」——不要编造"
+    "「我会跟进」、「已记录」之类不存在的动作。"
+)
+
+_DIRECT_HARD_RULES_EN = (
+    "Hard rules (override persona / SOP if they conflict):\n"
+    "1. **In direct state, do NOT fake an approval flow.** Never use language "
+    "like 'I'll forward this to OWNER / OWNER will follow up / awaiting "
+    "OWNER's confirmation / I've logged this for review'. If the question "
+    "actually needs OWNER's decision, the classifier should have picked "
+    "request state — since we're in direct, you MUST give the final answer "
+    "yourself, not pretend to escalate.\n"
+    "2. **Use SOP text verbatim.** Do NOT 'correct' or augment SOP content. "
+    "If SOP says X, treat X as authoritative — don't substitute URLs, "
+    "addresses, names, or policy details from memory.\n"
+    "3. **If SOP doesn't have it, say so plainly.** Tell the sender 'SOP "
+    "doesn't cover this — ask OWNER directly' rather than inventing "
+    "follow-up actions like 'I'll record / track / pass along' that don't "
+    "exist."
+)
+
+
 def _direct_context(
     persona: str,
     sop_excerpt: str,
@@ -243,17 +276,23 @@ def _direct_context(
     owner_name: str,
     lang: str,
 ) -> str:
-    """Direct-answer context: persona + SOP + draft + signoff instructions.
+    """Direct-answer context: persona + SOP + hard rules + draft + signoff.
 
-    The 'sign with' instruction is bilingual so the responding LLM signs in the
-    same language it's responding in.
+    Hard rules block exists because pre-v1.2.4 dogfood found the LLM
+    routinely simulating an approval workflow in direct state ("等待
+    Jimmy 确认 / 已记录待确认") and silently "correcting" SOP content
+    (e.g. rewriting calendly.com/jimmy → calendly.com/jimmyyin).
+    Persona alone can't catch this; persona is user-editable and these
+    rules are safety-class — they belong in code.
     """
     if lang == "zh":
+        hard_rules = _DIRECT_HARD_RULES_ZH.replace("OWNER", owner_name)
         signoff = (
             f"以 {owner_name} 的助理身份回复，开头简短说明你在替 {owner_name} 处理。"
             f"语气友好、直接，避免机器人腔。结尾用 — {owner_name}'s PAID 签名。"
         )
     else:
+        hard_rules = _DIRECT_HARD_RULES_EN.replace("OWNER", owner_name)
         signoff = (
             f"Respond as {owner_name}'s assistant. Open with a brief note that "
             f"you're handling this on {owner_name}'s behalf. Tone: friendly, "
@@ -262,6 +301,7 @@ def _direct_context(
     return (
         f"Persona:\n{persona}\n\n"
         f"Relevant SOP:\n{sop_excerpt}\n\n"
+        f"{hard_rules}\n\n"
         f"Draft (you may refine, do not invent facts beyond the SOP): {draft}\n\n"
         f"{signoff}"
     )
