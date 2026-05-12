@@ -79,3 +79,115 @@ def test_ensure_counterparty_idempotent(paid_tmp: Path):
 
 def test_load_counterparty_missing_returns_none(paid_tmp: Path):
     assert identity.load_counterparty("telegram", "ghost") is None
+
+
+# --- resolve_owner_lark_target — Lark routing helper ---------------------
+
+import os
+import pytest
+
+
+@pytest.fixture(autouse=False)
+def _clear_feishu_home(monkeypatch):
+    monkeypatch.delenv("FEISHU_HOME_CHANNEL", raising=False)
+    yield
+
+
+def test_resolve_lark_target_passthrough_when_caller_uid_is_routable(
+    paid_tmp, _clear_feishu_home
+):
+    """If caller already has a routable id (ou_/oc_/email), return it
+    unchanged — fastest path and avoids touching disk."""
+    assert identity.resolve_owner_lark_target("ou_abc123") == "ou_abc123"
+    assert identity.resolve_owner_lark_target("oc_chat99") == "oc_chat99"
+    assert identity.resolve_owner_lark_target("user@example.com") == "user@example.com"
+
+
+def test_resolve_lark_target_finds_ou_in_owner_when_caller_bare(
+    paid_tmp, _clear_feishu_home
+):
+    """Caller passes bare hex (legacy v1 user_id). Owner.json has a
+    second feishu identity with ou_ form. Helper must find and return
+    the routable one."""
+    _seed_owner(paid_tmp, [
+        {"platform": "feishu", "user_id": "8ea86e3b"},
+        {"platform": "feishu", "user_id": "ou_8580f481"},
+    ])
+    assert identity.resolve_owner_lark_target("8ea86e3b") == "ou_8580f481"
+
+
+def test_resolve_lark_target_skips_disabled_identities(
+    paid_tmp, _clear_feishu_home
+):
+    """Disabled identities don't count — owner muted that platform."""
+    _seed_owner(paid_tmp, [
+        {"platform": "feishu", "user_id": "8ea86e3b"},
+        {"platform": "feishu", "user_id": "ou_disabled", "enabled": False},
+    ])
+    monkey_env_set("FEISHU_HOME_CHANNEL", "oc_fallback")  # fallback should kick in
+    # Without env var, we'd return bare; with it, we'd return env.
+    # Confirm env wins because no routable identity exists.
+    os.environ["FEISHU_HOME_CHANNEL"] = "oc_fallback"
+    try:
+        assert identity.resolve_owner_lark_target("8ea86e3b") == "oc_fallback"
+    finally:
+        os.environ.pop("FEISHU_HOME_CHANNEL", None)
+
+
+def monkey_env_set(k, v):
+    """tiny shim because the test above mixes fixtures."""
+    os.environ[k] = v
+
+
+def test_resolve_lark_target_ignores_env_when_owner_has_routable_id(
+    paid_tmp, monkeypatch
+):
+    """The bug we fixed: FEISHU_HOME_CHANNEL must NOT override a valid
+    routable identity in owner.json."""
+    _seed_owner(paid_tmp, [
+        {"platform": "feishu", "user_id": "ou_correct_target"},
+    ])
+    monkeypatch.setenv("FEISHU_HOME_CHANNEL", "oc_wrong_target_999")
+    assert identity.resolve_owner_lark_target("ou_correct_target") == "ou_correct_target"
+    # And same result when caller passes a bare hex but owner has ou_:
+    assert identity.resolve_owner_lark_target("anything") == "ou_correct_target"
+
+
+def test_resolve_lark_target_falls_back_to_env_when_no_routable_anywhere(
+    paid_tmp, monkeypatch
+):
+    """Legacy v1 owner.json: only bare-hex identity. /sethome wrote
+    FEISHU_HOME_CHANNEL — preserve that fallback path."""
+    _seed_owner(paid_tmp, [{"platform": "feishu", "user_id": "8ea86e3b"}])
+    monkeypatch.setenv("FEISHU_HOME_CHANNEL", "oc_legacy_home")
+    assert identity.resolve_owner_lark_target("8ea86e3b") == "oc_legacy_home"
+
+
+def test_resolve_lark_target_returns_input_when_nothing_else(
+    paid_tmp, monkeypatch
+):
+    """No routable owner identity, no env var → echo caller's id back.
+    Lark will reject with [230001] and the caller will surface the
+    error — but the helper itself doesn't hide the misconfig."""
+    _seed_owner(paid_tmp, [{"platform": "feishu", "user_id": "8ea86e3b"}])
+    monkeypatch.delenv("FEISHU_HOME_CHANNEL", raising=False)
+    assert identity.resolve_owner_lark_target("8ea86e3b") == "8ea86e3b"
+
+
+def test_resolve_lark_target_no_owner_json(paid_tmp, monkeypatch):
+    """No owner.json at all — helper must not crash; falls through to
+    env or caller id."""
+    monkeypatch.setenv("FEISHU_HOME_CHANNEL", "oc_env_only")
+    assert identity.resolve_owner_lark_target("anything") == "oc_env_only"
+
+
+def test_resolve_lark_target_only_lark_identities_count(paid_tmp, monkeypatch):
+    """Telegram identity's user_id must not be considered for Lark routing
+    even if it happens to look like a number."""
+    _seed_owner(paid_tmp, [
+        {"platform": "telegram", "user_id": "ou_oddly_named_tg"},  # mis-named, ignore
+        {"platform": "feishu", "user_id": "8ea86e3b"},
+    ])
+    monkeypatch.setenv("FEISHU_HOME_CHANNEL", "oc_correct_fallback")
+    # No routable feishu identity → env fallback.
+    assert identity.resolve_owner_lark_target("8ea86e3b") == "oc_correct_fallback"

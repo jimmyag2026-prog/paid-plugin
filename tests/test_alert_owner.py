@@ -83,16 +83,53 @@ def test_alert_owner_sends_im_to_owner(paid_tmp, monkeypatch):
     assert "fatal_alerts.jsonl" in msg["message"]
 
 
-def test_alert_owner_lark_uses_home_channel_override(
+def test_alert_owner_lark_prefers_open_id_over_home_channel_env(
     paid_tmp, monkeypatch
 ):
-    _seed_owner(paid_tmp, identities=[{"platform": "feishu", "user_id": "ou_x"}])
+    """v1.2.4 fix: a routable ou_ identity in owner.json MUST win over
+    FEISHU_HOME_CHANNEL. Pre-fix the env var unconditionally overrode,
+    which leaked J3 cards / fatal alerts to whichever chat /sethome was
+    last run in (frequently a counterparty's DM with the bot)."""
+    _seed_owner(paid_tmp, identities=[{"platform": "feishu", "user_id": "ou_jimmy"}])
+    monkeypatch.setenv("FEISHU_HOME_CHANNEL", "oc_wrong_chat123")
+    sent = _patch_send_dm_capture(monkeypatch)
+    _plug._alert_owner("lark_routing", "detail")
+    assert len(sent) == 1
+    # Routable open_id wins — env var ignored.
+    assert sent[0]["user_id"] == "ou_jimmy"
+
+
+def test_alert_owner_lark_falls_back_to_home_channel_when_only_bare_uid(
+    paid_tmp, monkeypatch
+):
+    """Legacy path preserved: owner.json with bare-hex user_id (v1
+    schema, no routable form) still uses FEISHU_HOME_CHANNEL — that's
+    the original /sethome workaround case."""
+    _seed_owner(paid_tmp, identities=[{"platform": "feishu", "user_id": "8ea86e3b"}])
     monkeypatch.setenv("FEISHU_HOME_CHANNEL", "oc_homechannel123")
     sent = _patch_send_dm_capture(monkeypatch)
-    _plug._alert_owner("lark_test", "detail")
+    _plug._alert_owner("lark_legacy", "detail")
     assert len(sent) == 1
-    # Should target the home channel chat_id, NOT the bare open_id.
     assert sent[0]["user_id"] == "oc_homechannel123"
+
+
+def test_alert_owner_lark_picks_routable_among_multiple_feishu_identities(
+    paid_tmp, monkeypatch
+):
+    """Reproduces the 2026-05-12 dogfood bug: owner.json has TWO feishu
+    identities — bare-hex first, ou_ second. preferred_identity()
+    returns the bare one (insertion order). The helper must still find
+    the routable ou_ and use it, ignoring FEISHU_HOME_CHANNEL."""
+    _seed_owner(paid_tmp, identities=[
+        {"platform": "feishu", "user_id": "8ea86e3b", "enabled": True},
+        {"platform": "feishu", "user_id": "ou_8580f481e0c7fac2b36f3dd5f88144a1",
+         "enabled": True},
+    ])
+    monkeypatch.setenv("FEISHU_HOME_CHANNEL", "oc_evies_chat_456")
+    sent = _patch_send_dm_capture(monkeypatch)
+    _plug._alert_owner("lark_multi_id", "detail")
+    assert len(sent) == 1
+    assert sent[0]["user_id"] == "ou_8580f481e0c7fac2b36f3dd5f88144a1"
 
 
 def test_alert_owner_debounces_same_reason(paid_tmp, monkeypatch):

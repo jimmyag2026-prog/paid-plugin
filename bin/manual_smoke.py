@@ -376,9 +376,9 @@ def phase_c_alert_owner(paid_dir: Path) -> None:
     _check("alert: fatal_alerts.jsonl captured all 7 entries",
            len(fatal_lines) == 7, f"got {len(fatal_lines)}")
 
-    # 5) Lark FEISHU_HOME_CHANNEL override
+    # 5a) Lark: routable ou_ identity wins over FEISHU_HOME_CHANNEL (v1.2.4 fix)
     import os as _os
-    _os.environ["FEISHU_HOME_CHANNEL"] = "oc_homechannel123"
+    _os.environ["FEISHU_HOME_CHANNEL"] = "oc_wrong_chat_123"
     (paid_dir / "owner.json").write_text(json.dumps({
         "owner_id": "owner_smoke",
         "identities": [{"platform": "feishu", "user_id": "ou_x"}],
@@ -386,9 +386,22 @@ def phase_c_alert_owner(paid_dir: Path) -> None:
     }))
     sent.clear()
     plug._ALERT_LAST_SENT.clear()
-    plug._alert_owner("lark_smoke", "x")
-    _check("alert: Lark uses FEISHU_HOME_CHANNEL chat_id",
-           len(sent) == 1 and sent[0]["uid"] == "oc_homechannel123",
+    plug._alert_owner("lark_smoke_ou", "x")
+    _check("alert: Lark routable ou_ wins over FEISHU_HOME_CHANNEL",
+           len(sent) == 1 and sent[0]["uid"] == "ou_x",
+           f"got uid={sent[0]['uid'] if sent else 'none'}")
+
+    # 5b) Lark: bare-hex identity falls back to FEISHU_HOME_CHANNEL (legacy /sethome)
+    (paid_dir / "owner.json").write_text(json.dumps({
+        "owner_id": "owner_smoke",
+        "identities": [{"platform": "feishu", "user_id": "8ea86e3b"}],
+        "name": "Smoke Owner",
+    }))
+    sent.clear()
+    plug._ALERT_LAST_SENT.clear()
+    plug._alert_owner("lark_smoke_legacy", "x")
+    _check("alert: Lark bare-hex falls back to FEISHU_HOME_CHANNEL",
+           len(sent) == 1 and sent[0]["uid"] == "oc_wrong_chat_123",
            f"got uid={sent[0]['uid'] if sent else 'none'}")
     _os.environ.pop("FEISHU_HOME_CHANNEL", None)
 

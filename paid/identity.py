@@ -20,6 +20,7 @@ A migration helper ``bin/migrate_owner_v1_to_v2.py`` upgrades on disk.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,65 @@ from . import storage
 
 
 _OWNER_SCHEMA_VERSION = 2
+
+
+def _is_lark_routable(uid: str) -> bool:
+    """True iff ``uid`` is in a form Lark's IM API accepts directly.
+
+    ``ou_`` = open_id, ``oc_`` = chat_id, ``on_`` = union_id, email = email.
+    hermes_io._detect_lark_receive_id_type maps these to the right
+    ``receive_id_type`` and ``_send_lark_direct`` bypasses the adapter's
+    hard-coded chat_id, so any of these works without operator setup.
+    """
+    if not uid:
+        return False
+    if uid.startswith(("ou_", "oc_", "on_")):
+        return True
+    if "@" in uid:
+        tail = uid.split("@", 1)[1]
+        if "." in tail:
+            return True
+    return False
+
+
+def resolve_owner_lark_target(fallback_user_id: str) -> str:
+    """Pick the best Lark/feishu receive_id for owner DM delivery.
+
+    Precedence:
+      1. ``fallback_user_id`` if already Lark-routable (caller passed a
+         well-formed identity from preferred_identity()).
+      2. Any enabled feishu/lark identity in owner.json whose ``user_id``
+         is Lark-routable — handles the common case where
+         preferred_identity() returned a v1 bare-hex identity that comes
+         first in the list but a routable ou_/oc_/email exists later.
+      3. ``FEISHU_HOME_CHANNEL`` env var — legacy ``/sethome`` workaround
+         for owner.json that has no routable identity at all.
+      4. ``fallback_user_id`` unchanged — best effort; Lark will reject
+         with [230001] and the call site will surface the error.
+
+    This helper is the SINGLE source of truth for owner Lark routing.
+    ``__init__._alert_owner``, ``__init__._notify_owner_about_request``
+    (via ``_resolve_owner_send_target``), and ``bin/sweep_pending.py``
+    all delegate here so behavior stays consistent.
+
+    Why this matters: pre-v1.2.4, FEISHU_HOME_CHANNEL silently won
+    against owner.json. If ``/sethome`` was run from a wrong chat (a
+    counterparty's DM with the bot, or a group chat the counterparty
+    can see), every J3 approval card leaked to that chat. After this
+    fix, an ``ou_`` open_id in owner.json always wins — operator setup
+    error can't override a correctly-configured identity.
+    """
+    if _is_lark_routable(fallback_user_id):
+        return fallback_user_id
+    owner = load_owner()
+    if owner is not None:
+        for ident in owner.enabled_identities():
+            if ident.platform in ("feishu", "lark") and _is_lark_routable(ident.user_id):
+                return ident.user_id
+    chat_id = (os.environ.get("FEISHU_HOME_CHANNEL") or "").strip()
+    if chat_id:
+        return chat_id
+    return fallback_user_id
 
 
 @dataclass

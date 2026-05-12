@@ -100,14 +100,11 @@ def _alert_owner(swept: list[approval.PendingApproval]) -> None:
     if target is None:
         return
     plat, uid = target
-    # Re-use approval _resolve helper logic via an inline FEISHU_HOME_CHANNEL
-    # check so this script works without importing __init__ (which is the
-    # plugin entry point, not always import-safe outside the gateway).
-    import os as _os
+    # Use the same Lark routing helper as __init__._alert_owner /
+    # _notify_owner_about_request — prefer a routable owner identity
+    # over the FEISHU_HOME_CHANNEL env override.
     if plat in ("feishu", "lark"):
-        chat_id = (_os.environ.get("FEISHU_HOME_CHANNEL") or "").strip()
-        if chat_id:
-            uid = chat_id
+        uid = identity.resolve_owner_lark_target(uid)
 
     summary = "📭 PAID timeout sweep:\n" + "\n".join(
         f"  #{r.request_id}  {r.counterparty_display or r.counterparty_user_id} "
