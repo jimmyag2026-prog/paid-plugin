@@ -178,13 +178,13 @@ def _alert_owner(reason: str, detail: str) -> None:
                 if target is None:
                     raise RuntimeError("no owner identity")
                 plat, uid = target
-            # If owner is on Lark/Feishu and FEISHU_HOME_CHANNEL is set,
-            # prefer the chat_id (matches sweep_pending.py heuristic so
-            # alerts land in the same surface).
+            # For Lark/feishu, resolve to a directly-routable identity
+            # (ou_/oc_/email) when owner.json has one. Falls back to
+            # FEISHU_HOME_CHANNEL only when no routable identity exists.
+            # Single source of truth — _notify_owner_about_request and
+            # sweep_pending.py use the same helper.
             if plat in ("feishu", "lark"):
-                home = (os.environ.get("FEISHU_HOME_CHANNEL") or "").strip()
-                if home:
-                    uid = home
+                uid = identity.resolve_owner_lark_target(uid)
             short_detail = (detail or "").strip().splitlines()[0][:300]
             body = (
                 f"⚠️ PAID fatal alert\n"
@@ -249,21 +249,20 @@ def _owner_primary_identity(owner: identity.Owner | None) -> tuple[str, str] | N
 
 
 def _resolve_owner_send_target(platform: str, user_id: str) -> str:
-    """Return a Lark/feishu chat_id when one is configured via /sethome.
+    """Pick the right receive_id for owner DM/card.
 
-    The hermes feishu adapter's send() hard-codes receive_id_type=chat_id,
-    so passing the bare tenant user_id from owner.json fails with
-    [230001] invalid receive_id from the Lark API. ``/sethome`` saves the
-    owner↔bot DM chat_id into FEISHU_HOME_CHANNEL — fall back to that for
-    owner approval-card delivery. Other platforms unchanged.
+    Lark/feishu: delegates to ``identity.resolve_owner_lark_target`` so
+    a routable ``ou_``/``oc_``/email identity in owner.json wins over
+    the ``FEISHU_HOME_CHANNEL`` env var. Other platforms: unchanged.
 
-    Note: this helper is owner-specific. Junior dispatch still has the
-    same chat_id problem; tracked as a known v0.5 issue (see README).
+    Pre-v1.2.4 this unconditionally returned FEISHU_HOME_CHANNEL for
+    Lark, which silently misrouted J3 cards when /sethome had been run
+    from the wrong chat. The new helper still falls back to the env
+    var when owner.json has only bare-hex (non-routable) identities,
+    preserving the legacy /sethome path for backward compat.
     """
     if platform in ("feishu", "lark"):
-        chat_id = (os.environ.get("FEISHU_HOME_CHANNEL") or "").strip()
-        if chat_id:
-            return chat_id
+        return identity.resolve_owner_lark_target(user_id)
     return user_id
 
 
