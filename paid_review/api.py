@@ -622,7 +622,13 @@ def _do_gate_and_close(
         rationale = gate_result.get("rationale", "")
 
         if state.rounds >= state.max_rounds:
-            # No more rounds left — force-close as partial.
+            # No more rounds left — force-close as partial. v1.3.6 fix:
+            # also write the 6-section brief + audit + archive so the
+            # owner gets the same deliverable as the READY path. Pre-fix
+            # the rounds-exhausted close returned only the 1-line "FAIL
+            # after N rounds" string and skipped deliver(), leaving the
+            # session dir un-archived and the owner without findings
+            # detail.
             state.verdict = "FORCED_PARTIAL"
             state.forced = True
             state.forced_reason = "rounds_exhausted"
@@ -630,11 +636,38 @@ def _do_gate_and_close(
             transition(state, "CLOSED")
             state.last_event_kind = "close_propose"
             save_state(state)
+
+            sessions_root = _storage.PAID_DIR / "review" / "sessions"
+            try:
+                delivered = _deliver.deliver(
+                    sid_dir, sessions_root,
+                    subject=subject,
+                    junior_name=state.cp_id,
+                    junior_platform=state.platform,
+                    rounds=state.rounds, verdict=state.verdict,
+                    document=document,
+                    forced_reason=f"rounds_exhausted (gate rationale: {rationale})",
+                )
+                brief_text = delivered["summary"]
+            except Exception as exc:
+                logger.warning(
+                    "_do_gate_and_close rounds_exhausted: deliver crashed "
+                    "sid=%s: %s", state.sid, exc,
+                )
+                state.delivery_failed = True
+                try:
+                    save_state(state)
+                except Exception:
+                    pass
+                brief_text = (
+                    f"⚠️ Review session {state.sid} closed FORCED_PARTIAL after "
+                    f"{state.rounds} rounds, but summary write failed: {exc}\n\n"
+                    f"Gate rationale: {rationale}\n"
+                    f"原始材料 + annotations 在 sessions/{state.sid}/ 目录里。"
+                )
+
             return ReviewReply(
-                text=(
-                    f"Final gate FAIL after {state.rounds} rounds; "
-                    f"已强制收尾（FORCED_PARTIAL）。\n原因: {rationale}"
-                ),
+                text=brief_text,
                 stage="CLOSED",
                 event_kind="close_propose",
                 closed=True,
