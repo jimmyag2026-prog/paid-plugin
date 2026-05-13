@@ -223,13 +223,67 @@ def test_active_session_routes_to_handle_inbound(paid_tmp, monkeypatch):
     assert "next finding" in out["context"]
 
 
-def test_active_session_closed_reply_clears_active(paid_tmp, monkeypatch):
+def _seed_owner_lark(paid_tmp, open_id="ou_jimmy"):
+    """Standard owner.json with a routable Lark ou_ identity."""
+    import json as _json
+    (paid_tmp / "owner.json").write_text(_json.dumps({
+        "schema_version": 2,
+        "owner_id": "owner_jimmy",
+        "name": "Jimmy",
+        "preferred_platform": "feishu",
+        "identities": [
+            {"platform": "feishu", "user_id": open_id,
+             "home_chat_id": open_id, "enabled": True},
+        ],
+    }))
+
+
+def _seed_owner_telegram(paid_tmp, tg_uid="6914282833"):
+    import json as _json
+    (paid_tmp / "owner.json").write_text(_json.dumps({
+        "schema_version": 2,
+        "owner_id": "owner_jimmy",
+        "name": "Jimmy",
+        "preferred_platform": "telegram",
+        "identities": [
+            {"platform": "telegram", "user_id": tg_uid,
+             "home_chat_id": tg_uid, "enabled": True},
+        ],
+    }))
+
+
+def _patch_send_dm_capture(monkeypatch):
+    sent = []
+
+    def _fake(platform, user_id, message, **kw):
+        sent.append({"platform": platform, "user_id": user_id, "message": message})
+        return {"ok": True, "msg_id": "stub", "platform": platform}
+
+    monkeypatch.setattr(_plug.hermes_io, "send_dm", _fake)
+    return sent
+
+
+def test_active_session_closed_reply_dispatches_brief_to_owner_not_junior(
+    paid_tmp, monkeypatch
+):
+    """v1.3.1 fix: on close, the 6-section brief MUST go to owner (via
+    hermes_io.send_dm), NOT to the junior. Junior gets a short
+    confirmation that does NOT leak brief contents.
+
+    Pre-fix the plugin glue returned reply.text (which is the brief) to
+    hermes, sending it to the original sender (= the junior /review
+    caller). That leaked verdict + internal findings to whoever called
+    /review."""
+    _seed_owner_lark(paid_tmp)
     cp = _make_cp(active_session="sid_close")
     calls = {"clear": []}
+    sent = _patch_send_dm_capture(monkeypatch)
+
+    BRIEF = "# 会前简报\n## 1. 议题摘要\nVerdict: READY\n## 2. 关键 findings ..."
 
     def fake_handle(sid, text, hook_kwargs):
         return SimpleNamespace(
-            text="# 会前简报\n## 1. 议题摘要\nx",
+            text=BRIEF,
             stage="CLOSED", event_kind="close_propose", closed=True,
         )
     monkeypatch.setattr(_review_api_module, "handle_inbound", fake_handle)
@@ -237,10 +291,120 @@ def test_active_session_closed_reply_clears_active(paid_tmp, monkeypatch):
                         lambda cp, archive: calls["clear"].append(archive))
 
     out = _plug._maybe_route_to_review_skill(cp, "done", {})
+
+    # 1) Owner got the brief via send_dm to the routable ou_ identity
+    assert len(sent) == 1
+    assert sent[0]["platform"] == "feishu"
+    assert sent[0]["user_id"] == "ou_jimmy"
+    assert "会前简报" in sent[0]["message"]
+    assert "READY" in sent[0]["message"]
+    assert "sid_close" in sent[0]["message"]  # header includes sid
+
+    # 2) Junior got a short confirmation, NOT the brief
     assert out is not None
-    assert "会前简报" in out["context"]
+    junior_text = out["context"]
+    assert "已完成" in junior_text
+    assert "会前简报" not in junior_text  # brief body NOT leaked
+    assert "READY" not in junior_text     # verdict NOT leaked
+    assert "findings" not in junior_text  # findings NOT leaked
+
+    # 3) Session cleared
     assert len(calls["clear"]) == 1
     assert calls["clear"][0]["sid"] == "sid_close"
+
+
+def test_close_routes_to_telegram_when_owner_preferred_platform_is_tg(
+    paid_tmp, monkeypatch
+):
+    """Multi-platform: owner on TG → brief lands on TG, not feishu."""
+    _seed_owner_telegram(paid_tmp)
+    cp = _make_cp(active_session="sid_tg")
+    sent = _patch_send_dm_capture(monkeypatch)
+    monkeypatch.setattr(_plug.identity, "clear_active_review_session",
+                        lambda cp, archive: None)
+    monkeypatch.setattr(_review_api_module, "handle_inbound", lambda *a, **k:
+        SimpleNamespace(text="brief body", stage="CLOSED",
+                        event_kind="close_propose", closed=True))
+
+    _plug._maybe_route_to_review_skill(cp, "done", {})
+    assert len(sent) == 1
+    assert sent[0]["platform"] == "telegram"
+    assert sent[0]["user_id"] == "6914282833"
+
+
+def test_close_with_no_owner_returns_degraded_message_but_clears_session(
+    paid_tmp, monkeypatch
+):
+    """No owner.json → can't push brief, but session must still close
+    cleanly so cp can /review again. Junior gets a clear degraded msg."""
+    # No owner seed
+    cp = _make_cp(active_session="sid_no_owner")
+    sent = _patch_send_dm_capture(monkeypatch)
+    cleared = []
+    monkeypatch.setattr(_plug.identity, "clear_active_review_session",
+                        lambda cp, archive: cleared.append(archive))
+    monkeypatch.setattr(_review_api_module, "handle_inbound", lambda *a, **k:
+        SimpleNamespace(text="brief", stage="CLOSED",
+                        event_kind="close_propose", closed=True))
+
+    out = _plug._maybe_route_to_review_skill(cp, "done", {})
+    assert sent == []         # no owner = no send attempt
+    assert len(cleared) == 1  # session STILL cleared
+    assert "owner" in out["context"].lower()
+
+
+def test_close_send_dm_exception_still_clears_session(paid_tmp, monkeypatch):
+    """send_dm raises → session must still close + junior gets a
+    confirmation (no crash into hermes). Brief is queued/alerted on a
+    separate path so it's not lost."""
+    _seed_owner_lark(paid_tmp)
+    cp = _make_cp(active_session="sid_boom")
+    cleared = []
+
+    def explode(*a, **kw):
+        raise RuntimeError("gateway down")
+    monkeypatch.setattr(_plug.hermes_io, "send_dm", explode)
+    monkeypatch.setattr(_plug.identity, "clear_active_review_session",
+                        lambda cp, archive: cleared.append(archive))
+    monkeypatch.setattr(_plug, "_alert_owner", lambda *a, **kw: None)
+    monkeypatch.setattr(_review_api_module, "handle_inbound", lambda *a, **k:
+        SimpleNamespace(text="brief", stage="CLOSED",
+                        event_kind="close_propose", closed=True))
+
+    out = _plug._maybe_route_to_review_skill(cp, "done", {})
+    assert len(cleared) == 1  # session closed despite send failure
+    assert out is not None
+    assert "已完成" in out["context"]  # junior still gets confirmation
+
+
+def test_intake_path_close_short_circuit_also_routes_to_owner(
+    paid_tmp, monkeypatch
+):
+    """Defensive: if the immediate post-intake handle_inbound("") closes
+    (e.g. SCAN no_findings short-circuit), brief must STILL go to owner,
+    not junior. Same split as the QA-driven close path."""
+    _seed_owner_lark(paid_tmp)
+    cp = _make_cp(active_session="")  # fresh, no active session
+    sent = _patch_send_dm_capture(monkeypatch)
+
+    monkeypatch.setattr(_review_api_module, "intake",
+                        lambda **kw: "sid_immediate_close")
+    monkeypatch.setattr(_plug.identity, "set_active_review_session",
+                        lambda cp, sid: setattr(cp, "active_review_session", sid))
+    monkeypatch.setattr(_plug.identity, "clear_active_review_session",
+                        lambda cp, archive: None)
+    monkeypatch.setattr(_review_api_module, "handle_inbound", lambda *a, **k:
+        SimpleNamespace(text="empty doc brief", stage="CLOSED",
+                        event_kind="close_propose", closed=True))
+
+    out = _plug._maybe_route_to_review_skill(cp, "/review trivial",
+                                             {"attachments": []})
+    # Owner got brief
+    assert len(sent) == 1
+    assert "empty doc brief" in sent[0]["message"]
+    # Junior got short confirmation
+    assert "已完成" in out["context"]
+    assert "empty doc brief" not in out["context"]
 
 
 def test_active_session_scan_progress_does_not_clear(paid_tmp, monkeypatch):

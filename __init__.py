@@ -589,6 +589,12 @@ def _maybe_route_to_review_skill(cp, user_message: str,
             return _wrap_reply_for_hermes(
                 f"已创建 session {sid} 但首条响应失败: {exc}"
             )
+        # Defensive: if intake-triggered first step already closes (e.g.
+        # SCAN no_findings short-circuit), route the brief to owner not
+        # junior — same split as the QA-driven close path below.
+        if reply.closed:
+            junior_close_text = _dispatch_review_close_to_owner(cp, reply)
+            return _wrap_reply_for_hermes(junior_close_text)
         return _wrap_reply_for_hermes(reply.text)
 
     # ---- Path 3: active session, non-/review message ----
@@ -606,22 +612,100 @@ def _maybe_route_to_review_skill(cp, user_message: str,
                 "review skill 暂时出错，可以发 /review cancel 退出再试。"
             )
 
-        # spec §6 plugin职责 #5: closed=True → clear active_session
-        # spec §6 plugin职责 #4: stage=SCAN+event_kind=scan_progress → just send
+        # spec §6 plugin职责 #5: closed=True → clear active_session +
+        # dispatch the 6-section brief to OWNER (the brief is the owner's
+        # deliverable; junior must NOT see the internal findings/verdict).
+        # SCAN progress: do NOT clear; session continues — just relay text.
         if reply.closed:
-            try:
-                identity.clear_active_review_session(cp, archive={
-                    "sid": cp.active_review_session,
-                    "stage": reply.stage,
-                    "event_kind": reply.event_kind,
-                })
-            except Exception as exc:
-                _safe_log(f"[review] clear_active EXC: {exc}")
-        # SCAN progress: do NOT clear; session continues.
+            junior_close_text = _dispatch_review_close_to_owner(cp, reply)
+            return _wrap_reply_for_hermes(junior_close_text)
         return _wrap_reply_for_hermes(reply.text)
 
     # ---- Path 4: not a review-skill message ----
     return None
+
+
+def _dispatch_review_close_to_owner(cp, reply) -> str:
+    """On review session close: push the 6-section brief to owner via DM,
+    clear the cp's active_review_session, and return a short confirmation
+    string for the junior.
+
+    The brief contains internal findings + verdict + recommendations the
+    junior must not see — that's why we split the channels here rather
+    than just returning reply.text (which would send the brief to the
+    junior, the original /review caller).
+
+    All steps are best-effort: owner send failure falls back to
+    outbound_queue.jsonl + fatal_alerts.jsonl (via existing _alert_owner
+    debounce) so the brief is recoverable even when IM is down. The
+    session is always closed on disk regardless of delivery outcome,
+    so a fresh /review can be opened.
+    """
+    sid = cp.active_review_session
+    brief = reply.text or ""
+
+    # 1) Clear active session bookkeeping first — even if owner-send
+    #    fails, the cp must be able to open a new /review.
+    try:
+        identity.clear_active_review_session(cp, archive={
+            "sid": sid,
+            "stage": reply.stage,
+            "event_kind": reply.event_kind,
+        })
+    except Exception as exc:
+        _safe_log(f"[review] clear_active EXC sid={sid}: {exc}")
+
+    # 2) Resolve owner identity. No owner = silent log + ask junior to
+    #    follow up directly (degraded but not crashed).
+    owner = identity.load_owner()
+    pref = owner.preferred_identity() if owner else None
+    if pref is None:
+        _safe_log(
+            f"[review] close sid={sid}: no owner identity — brief stayed on "
+            f"disk only (~/.hermes/paid/review/sessions/_closed/.../{sid}/)"
+        )
+        return (
+            "Review 已完成，但 owner 端没收到通知（系统未配置 owner 身份）。"
+            "请直接 ping owner 让他来取 summary。— PAID"
+        )
+
+    plat = pref.platform
+    uid = pref.home_chat_id
+    if plat in ("feishu", "lark"):
+        uid = identity.resolve_owner_lark_target(uid)
+
+    # 3) Send brief to owner. Long briefs may need chunking on some
+    #    platforms (Lark text DM ~30k char ceiling; TG ~4k). Naive
+    #    single-send is fine for v0.1 (briefs are typically <2k); add
+    #    chunking later if we hit a real ceiling.
+    cp_name = getattr(cp, "display_name", "") or cp.cp_id
+    brief_with_header = (
+        f"📝 Review session closed — sid `{sid}`\n"
+        f"From: {cp_name} ({cp.platform})\n"
+        f"Verdict: {reply.stage} / {getattr(reply, 'event_kind', '')}\n"
+        f"\n{brief}\n"
+        f"\n_Full session archive: ~/.hermes/paid/review/sessions/_closed/.../{sid}/_"
+    )
+    try:
+        result = hermes_io.send_dm(plat, uid, brief_with_header, fallback_to_queue=True)
+        _safe_log(
+            f"[review] close sid={sid}: brief → {plat}:{uid} → ok={result.get('ok')}"
+        )
+    except Exception as exc:
+        _safe_log(f"[review] close sid={sid}: send brief EXC: {exc}")
+        try:
+            _alert_owner(
+                "review_brief_send_failed",
+                f"sid={sid} cp={cp.cp_id} target={plat}:{uid}: {exc}"
+            )
+        except Exception:
+            pass
+
+    # 4) Short close message for junior — must NOT leak brief contents.
+    return (
+        "Review session 已完成 ✅ Summary 已发给 owner，他会跟你直接对接后续。"
+        "谢谢配合 — PAID"
+    )
 
 
 def on_pre_llm_call(**kwargs) -> dict | None:
