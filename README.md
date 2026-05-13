@@ -15,25 +15,31 @@ It runs locally, all logs stay on your machine, and it speaks through
 your existing IM accounts (Telegram / Lark / Feishu / WhatsApp / WeCom /
 Slack — whichever Hermes is wired up to).
 
-**Status: v1.4.0 — Lark inline-approve wired.** End-to-end loop is
-wired, **586 tests passing**, verified live on Lark approval-card
-flow with `hermes-agent` v0.12.0. Ships interactive Lark approval
-cards with **fully-routed ✅ / ✏️ / ❌ buttons** (click ✅ with draft
-→ direct dispatch; click ✅ without draft → inline "type your reply"
-prompt; click ❌ → direct deflection), Telegram InlineKeyboard cards,
-Slack Block Kit cards, a local-only Flask web dashboard, daily
-snapshot reports, and a `paid status` upgrade with today's metrics +
-activity dots.
+**Status: v1.4.0 — approval card clicks wired (Lark + Telegram).**
+End-to-end loop is wired, **600 tests passing**, verified live on Lark
+approval-card flow and Telegram button-callback flow with
+`hermes-agent` v0.12.0. Ships interactive Lark approval cards and
+Telegram InlineKeyboard cards both with **fully-routed
+✅ Approve / ✏️ Reply / ❌ Reject** buttons; Slack Block Kit cards (click
+routing follow-up); a local-only Flask web dashboard; daily snapshot
+reports; and a `paid status` upgrade with today's metrics + activity
+dots.
 
-**v1.3 → v1.4 (2026-05-13)** — Lark approval cards work end-to-end on
-click. Pre-v1.4 the click reached PAID but the response string didn't
-get delivered back to owner's Lark chat (synthetic-command reply
-unreliable). v1.4 rewires `_cmd_card` to push every outcome via
-`send_dm`. For the empty-draft case (J3 out-of-scope topics that
-PAID can't ground from SOP), ✅ Approve / ✏️ Edit now arm an
-"awaiting input" slot — the owner's next plain-text reply in the
-same chat becomes the answer forwarded to the junior. `/paid-cancel-input`
-clears the slot if the owner changes their mind.
+**v1.3 → v1.4 (2026-05-13)** — Approval cards work end-to-end on click.
+
+- **Lark**: pre-v1.4 the click reached PAID but the response string
+  didn't get delivered back to owner's Lark chat (synthetic-command
+  reply was unreliable). v1.4 rewires `_cmd_card` to push every outcome
+  via `send_dm`. ✅ Approve = direct send (default agreement when draft
+  is empty); ✏️ Reply = arm awaiting_input, owner's next plain-text
+  reply in this chat becomes the answer; ❌ Reject = direct deflection.
+  `/paid-cancel-input` clears the slot.
+- **Telegram**: lazy-attaches a `CallbackQueryHandler` on the live
+  `python-telegram-bot` Application via `adapter._app` so `paid_*`
+  callback_data routes back to PAID (M3.5.C, see
+  [`design/08`](https://github.com/jimmyag2026-prog/paid-may/blob/main/design/08_multiplatform_design.md) §1).
+  No hermes upstream changes.
+- **Slack**: same shape, planned for v1.4.x once a workspace is wired live.
 
 **v1.1 → v1.2 (2026-05-03)** — Multi-platform v0.1: TG + Slack approval
 cards. Owner picks `preferred_platform` in `owner.json` (v2 schema with

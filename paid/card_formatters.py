@@ -205,11 +205,14 @@ def format_telegram(spec: ApprovalCardSpec) -> dict:
         f"📍 {spec.instructions}"
     )
 
-    # Inline keyboard — button click NOT routed back to PAID; visual only.
-    # All three buttons render every time (v1.2.2): the consistent visual
-    # model is more important than hiding a button that wouldn't work
-    # anyway. The action_hint text above tells the operator that ✅ won't
-    # actually send when has_draft=False.
+    # Inline keyboard — button clicks ROUTE back to PAID since v1.4.0 via
+    # the lazy-attached CallbackQueryHandler in __init__.py
+    # (_ensure_telegram_callback_registered). ✅ Approve / ❌ Reject act
+    # immediately; ✏️ Edit currently acknowledges + tells the operator to
+    # use /paid-approve <id> <text> (inline-edit is M2.2 follow-up).
+    # All three buttons render every time: the consistent visual model is
+    # more important than hiding a button that wouldn't work; the
+    # action_hint text above explains the no-draft + edit paths.
     buttons_row: list[dict] = [
         {
             "text": "✅ Approve",
