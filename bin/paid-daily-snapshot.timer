@@ -1,0 +1,10 @@
+[Unit]
+Description=Run paid-daily-snapshot once per day (00:30 UTC = end-of-PDT-day rollup)
+
+[Timer]
+OnCalendar=*-*-* 00:30:00
+AccuracySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
