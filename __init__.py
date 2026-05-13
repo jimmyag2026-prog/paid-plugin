@@ -1056,7 +1056,17 @@ def on_post_llm_call(**kwargs) -> None:
 # ---------------------------------------------------------------------------
 
 def on_pre_gateway_dispatch(**kwargs) -> dict | None:
-    """Drop inbound messages that trip the L1 injection regex.
+    """Drop inbound messages that trip the L1 injection regex AND route
+    counterparty-issued /review and /r slash commands directly to the
+    paid_review skill (bypassing hermes' slash dispatcher).
+
+    Routing /review here instead of via ctx.register_command is the only
+    way to get sender identity into the handler. The register_command
+    handler signature is ``fn(raw_args: str) -> str`` — no source, no
+    platform, no user_id — and the ``HERMES_GATEWAY_*`` env vars that
+    older PAID code assumed exist are not actually set by hermes.
+    pre_gateway_dispatch DOES receive ``event.source`` with full
+    platform + user_id, so review routing must live here.
 
     ``kwargs``: event (MessageEvent), gateway (GatewayRunner), session_store.
     Returns ``{"action": "skip"}`` to drop; None to let dispatch proceed.
@@ -1079,6 +1089,23 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
         text = str(getattr(event, "text", "") or "")
         if not text:
             return None
+
+        # /review and /r interception — before L1 so injection guard
+        # still applies to the rest of the message but we don't need to
+        # match "/review" against injection patterns (it's our own
+        # command syntax).
+        stripped = text.lstrip()
+        if (
+            stripped.startswith("/review")
+            and (len(stripped) == 7 or stripped[7] in " \n\t")
+        ) or (
+            stripped.startswith("/r")
+            and (len(stripped) == 2 or stripped[2] in " \n\t")
+        ):
+            if platform and sender_id:
+                return _handle_review_in_pre_gateway(
+                    platform, sender_id, stripped,
+                )
 
         l1_hit, l1_labels = safety.detect_prompt_injection(text)
         if not l1_hit:
@@ -1270,74 +1297,13 @@ def _cmd_reject(raw_args: str) -> str:
     return f"PAID: #{rid} rejected → {delivery}"
 
 
-def _cmd_review(raw_args: str) -> str:
-    """Slash-command entry for ``/review`` and ``/r``.
-
-    v1.3.2 bugfix: pre-fix, ``/review`` was intercepted only in
-    ``on_pre_llm_call`` via ``_maybe_route_to_review_skill``. But
-    hermes' slash-command dispatcher inspects every inbound starting
-    with ``/`` BEFORE pre_llm_call fires — so unregistered ``/review``
-    returned "unknown command" to the junior and our route was never
-    reached. Fix: register ``/review`` + ``/r`` as hermes commands so
-    the dispatcher delegates here instead of erroring out.
-
-    Caller identity comes from env vars hermes sets per-event
-    (HERMES_GATEWAY_PLATFORM + HERMES_GATEWAY_SENDER_ID). Same trust
-    model as the existing slash commands. Owner is filtered out — /review
-    is a counterparty-side command; owner using it would short-circuit
-    is_owner downstream and confuse routing.
-    """
-    platform = os.environ.get("HERMES_GATEWAY_PLATFORM", "").strip()
-    sender_id = os.environ.get("HERMES_GATEWAY_SENDER_ID", "").strip()
-    if not platform or not sender_id:
-        # Out-of-band call (CLI / test) — refuse, /review only makes sense
-        # in the context of a counterparty inbound.
-        return "/review only works as an inbound message from a counterparty."
-
-    # Owner using /review is almost certainly a misclick — bail with a
-    # helpful pointer rather than starting a self-review.
-    if identity.is_owner(platform, sender_id):
-        return (
-            "/review is for the counterparties messaging you to send THEIR drafts "
-            "for audit. As owner you don't need it — for your own drafts, just "
-            "send them through PAID directly."
-        )
-
-    cp = identity.ensure_counterparty(platform, sender_id)
-
-    # Reconstruct the original text (slash dispatcher strips the command
-    # name); pass through the same router that handles the inbound path
-    # so we keep a single code path for both registration and any future
-    # plain-text fallback.
-    rebuilt_text = f"/review {raw_args}".rstrip() if raw_args else "/review"
-    result = _maybe_route_to_review_skill(
-        cp, rebuilt_text, {"attachments": []}
-    )
-    if result is None:
-        # Router didn't pick this up — shouldn't happen since we rebuilt
-        # a /review prefix, but degrade gracefully.
-        return (
-            "review skill 没接住这条消息。"
-            "请直接发 /review <要 review 的草稿正文>。"
-        )
-    # _maybe_route_to_review_skill wraps in {"context": "...EXACTLY...'..."} for
-    # the pre_llm_call hook. For slash commands we want the raw text to
-    # appear in the chat, so unwrap it.
-    ctx_str = result.get("context", "") if isinstance(result, dict) else ""
-    return _unwrap_hermes_context(ctx_str)
-
-
-def _cmd_review_short(raw_args: str) -> str:
-    """Short alias /r for /review (less typing on mobile)."""
-    return _cmd_review(raw_args)
-
-
 def _unwrap_hermes_context(ctx_str: str) -> str:
     """Pull the actual reply text back out of a _wrap_reply_for_hermes
     output. The wrapper produces strings like:
         IGNORE the user question. Reply EXACTLY with: '<actual reply>' Nothing else.
-    For slash-command return, we want just the inner text. If the
-    wrapper format ever drifts, fall back to the whole context."""
+    For direct-send paths (pre_gateway_dispatch /review interception),
+    we want just the inner text. If the wrapper format ever drifts,
+    fall back to the whole context."""
     marker = "EXACTLY with: '"
     end_marker = "' Nothing else."
     if marker in ctx_str and end_marker in ctx_str:
@@ -1347,6 +1313,54 @@ def _unwrap_hermes_context(ctx_str: str) -> str:
         # Reverse the escaping the wrapper applied
         return inner.replace("\\\\", "\\").replace("\\'", "'")
     return ctx_str
+
+
+def _handle_review_in_pre_gateway(
+    platform: str, sender_id: str, text: str,
+) -> dict:
+    """Intercept /review and /r from a counterparty in pre_gateway_dispatch.
+
+    Resolves the cp, routes through ``_maybe_route_to_review_skill``,
+    sends the reply directly via ``hermes_io.send_dm`` (since
+    pre_gateway_dispatch returns dispatcher metadata, not message
+    content), and returns ``{"action": "skip"}`` to suppress hermes'
+    own slash dispatcher from also responding.
+
+    Called only when the inbound is from a non-owner — owner check
+    happens in the caller (on_pre_gateway_dispatch).
+
+    Returns the action dict for pre_gateway_dispatch — always "skip"
+    on this path, since the message is now fully handled.
+    """
+    try:
+        cp = identity.ensure_counterparty(platform, sender_id)
+    except Exception as exc:
+        _safe_log(f"[review pre_gw] ensure_counterparty EXC plat={platform} sid={sender_id}: {exc}")
+        # Don't suppress — let normal dispatch handle the unknown sender.
+        return None
+
+    try:
+        result = _maybe_route_to_review_skill(cp, text, {"attachments": []})
+    except Exception as exc:
+        _safe_log(f"[review pre_gw] router EXC cp={cp.cp_id}: {exc}")
+        result = None
+
+    if result is None:
+        reply_text = (
+            "review skill 没接住这条消息。"
+            "请直接发 /review <要 review 的草稿正文>。"
+        )
+    else:
+        ctx_str = result.get("context", "") if isinstance(result, dict) else ""
+        reply_text = _unwrap_hermes_context(ctx_str)
+
+    try:
+        hermes_io.send_dm(platform, sender_id, reply_text, fallback_to_queue=True)
+    except Exception as exc:
+        _safe_log(f"[review pre_gw] send_dm EXC cp={cp.cp_id}: {exc}")
+
+    _safe_log(f"[review pre_gw] handled /review for cp={cp.cp_id} reply_len={len(reply_text)}")
+    return {"action": "skip", "reason": "paid_review_routed"}
 
 
 def _cmd_card(raw_args: str) -> str:
@@ -1539,29 +1553,17 @@ def register(ctx) -> None:
         except Exception as exc:
             _safe_log(f"/card registration skipped: {exc}")
 
-        # `/review` + `/r` route to the paid_review skill. These are
-        # COUNTERPARTY-side commands — owner using them short-circuits.
-        # Registration is required because hermes' slash dispatcher
-        # rejects unregistered ``/<word>`` with "unknown command"
-        # BEFORE pre_llm_call fires; we can't intercept in pre_llm_call
-        # alone. (v1.3.2 bugfix dropped from the original Sprint D
-        # wiring — caught in dogfood.)
-        try:
-            ctx.register_command(
-                "review", _cmd_review,
-                description="Open or continue a 4-pillar review session (counterparty-side).",
-                args_hint="<draft text> | cancel",
-            )
-            ctx.register_command(
-                "r", _cmd_review_short,
-                description="Short alias for /review.",
-                args_hint="<draft text> | cancel",
-            )
-            _safe_log("registered: /review + /r (paid_review skill entry)")
-        except Exception as exc:
-            _safe_log(f"/review registration skipped: {exc}")
+        # /review + /r are routed via pre_gateway_dispatch (see
+        # on_pre_gateway_dispatch), NOT registered as hermes slash
+        # commands. Reason: hermes' register_command handler signature
+        # is fn(raw_args:str)->str — no sender context. pre_gateway_dispatch
+        # IS given the full MessageEvent with platform + user_id, which
+        # we need to resolve the counterparty correctly. (v1.3.3 first
+        # attempted register_command + env-var lookup; the env vars
+        # don't actually exist in hermes — caught in second dogfood.)
 
         _safe_log("hooks: pre_llm_call, post_llm_call, pre_gateway_dispatch")
-        _safe_log("commands: /paid-pending /paid-approve /paid-reject /paid-status /card /review /r")
+        _safe_log("commands: /paid-pending /paid-approve /paid-reject /paid-status /card")
+        _safe_log("pre_gateway_dispatch routes: /review /r (paid_review skill, cp-side)")
     else:
         _safe_log("hooks: pre_llm_call, post_llm_call (commands skipped — hermes < 0.11)")

@@ -108,10 +108,11 @@ def test_register_good_ctx_registers_all_commands(paid_tmp, monkeypatch):
     # still register; on _GoodCtx all 3 land).
     assert "pre_llm_call" in ctx.hooks_registered
     assert "post_llm_call" in ctx.hooks_registered
-    # All 7 commands (v1.3.2 added /review + /r for paid_review skill).
+    # v1.3.4: /review + /r moved to pre_gateway_dispatch (cp identity
+    # requires event.source, which slash dispatcher doesn't pass).
+    # 5 owner commands remain.
     assert set(ctx.commands_registered) == {
-        "paid-pending", "paid-approve", "paid-reject", "paid-status",
-        "card", "review", "r",
+        "paid-pending", "paid-approve", "paid-reject", "paid-status", "card",
     }
 
 
