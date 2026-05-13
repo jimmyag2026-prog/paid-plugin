@@ -1321,19 +1321,43 @@ def _cmd_reject(raw_args: str) -> str:
 
 def _unwrap_hermes_context(ctx_str: str) -> str:
     """Pull the actual reply text back out of a _wrap_reply_for_hermes
-    output. The wrapper produces strings like:
-        IGNORE the user question. Reply EXACTLY with: '<actual reply>' Nothing else.
-    For direct-send paths (pre_gateway_dispatch /review interception),
-    we want just the inner text. If the wrapper format ever drifts,
-    fall back to the whole context."""
-    marker = "EXACTLY with: '"
-    end_marker = "' Nothing else."
-    if marker in ctx_str and end_marker in ctx_str:
-        start = ctx_str.index(marker) + len(marker)
-        end = ctx_str.rindex(end_marker)
+    output. PAID has TWO wrap formats in production (verified in
+    grep 2026-05-13):
+
+      Format A — paid/decision.py request/decline/direct contexts:
+          IGNORE the user question. Reply EXACTLY with: '<text>' Nothing else.
+
+      Format B — __init__.py:_wrap_reply_for_hermes (review skill):
+          IGNORE the user message. Reply EXACTLY with the following text
+          and nothing else, preserving all line breaks: '<text>'
+
+    Pre-v1.3.8 this function matched only Format A → Format B fell
+    through → the wrapper text leaked verbatim to the cp in
+    pre_gateway_dispatch direct-send paths (confirmed in 2026-05-13
+    dogfood when Evie saw the IGNORE instruction in her chat after
+    a /review intake). Now handles both.
+    """
+    # Format A
+    mark_a = "EXACTLY with: '"
+    end_a = "' Nothing else."
+    if mark_a in ctx_str and end_a in ctx_str:
+        start = ctx_str.index(mark_a) + len(mark_a)
+        end = ctx_str.rindex(end_a)
         inner = ctx_str[start:end]
-        # Reverse the escaping the wrapper applied
         return inner.replace("\\\\", "\\").replace("\\'", "'")
+
+    # Format B
+    mark_b = "preserving all line breaks: '"
+    if mark_b in ctx_str:
+        start = ctx_str.index(mark_b) + len(mark_b)
+        # Format B ends at the LAST quote (no trailing " Nothing else.")
+        trimmed = ctx_str.rstrip()
+        if trimmed.endswith("'"):
+            end = trimmed.rfind("'", start)
+            if end > start:
+                inner = ctx_str[start:end]
+                return inner.replace("\\\\", "\\").replace("\\'", "'")
+
     return ctx_str
 
 
