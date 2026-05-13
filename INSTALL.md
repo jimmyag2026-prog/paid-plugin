@@ -17,6 +17,36 @@ into `~/.hermes/plugins/paid-v1/`.
 
 ---
 
+## 0.1 ⚠️ Operator pre-flight — suppress hermes onboarding prompts
+
+When a counterparty DMs the bot for the first time, hermes fires a
+one-time "📬 No home channel is set for <Platform>... Type /sethome
+to make this chat your home channel" notice. That's an operator-level
+prompt that counterparties should never see — it confuses them and
+leaks internal config language on their first interaction.
+
+Set a home-channel env var per enabled platform in `~/.hermes/.env`:
+
+```bash
+# Lark/Feishu — owner open_id (ou_...) or a dedicated chat_id (oc_...)
+FEISHU_HOME_CHANNEL=ou_<owner_open_id>
+
+# Telegram — owner's numeric user_id (private DMs use uid as chat_id)
+TELEGRAM_HOME_CHANNEL=<owner_tg_user_id>
+
+# Slack — owner's DM channel id (D...)
+# SLACK_HOME_CHANNEL=D012345
+
+# Other platforms: see hermes-agent/cron/scheduler.py
+# _HOME_TARGET_ENV_VARS for the full mapping.
+```
+
+Restart hermes after editing. Without these, the counterparty's first
+inbound triggers the hermes notice — purely cosmetic, but the kind of
+detail that erodes pilot trust at first contact.
+
+---
+
 ## 1. Get the code into the plugin slot
 
 Either clone directly:
