@@ -78,9 +78,12 @@ def test_alert_owner_sends_im_to_owner(paid_tmp, monkeypatch):
     assert msg["platform"] == "telegram"
     assert msg["user_id"] == "11111"
     assert "classifier_crash" in msg["message"]
-    # First line of detail is included; "fatal_alerts.jsonl" pointer present.
+    # First line of detail is included. v1.3.7 dropped the server-path
+    # pointer ("see ~/.hermes/paid/fatal_alerts.jsonl") from user-facing
+    # text to avoid leaking filesystem layout to IM; operator gets a
+    # hint to ask their admin for the full trace instead.
     assert "stacktrace line 1" in msg["message"]
-    assert "fatal_alerts.jsonl" in msg["message"]
+    assert "operator" in msg["message"] or "trace" in msg["message"]
 
 
 def test_alert_owner_lark_prefers_open_id_over_home_channel_env(

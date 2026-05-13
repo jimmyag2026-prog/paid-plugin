@@ -191,7 +191,7 @@ def _alert_owner(reason: str, detail: str) -> None:
                 f"reason: {reason}\n"
                 f"ts: {ts}\n"
                 f"detail: {short_detail}\n"
-                f"(see ~/.hermes/paid/fatal_alerts.jsonl for full trace)"
+                f"(ask your operator for the full trace if needed)"
             )
             hermes_io.send_dm(plat, uid, body, fallback_to_queue=True)
             _mark_alert_sent("im", reason)
@@ -660,13 +660,15 @@ def _dispatch_review_close_to_owner(cp, reply) -> str:
     owner = identity.load_owner()
     pref = owner.preferred_identity() if owner else None
     if pref is None:
+        # Log retains server path for operator forensics; user-facing
+        # return text only references the sid.
         _safe_log(
             f"[review] close sid={sid}: no owner identity — brief stayed on "
             f"disk only (~/.hermes/paid/review/sessions/_closed/.../{sid}/)"
         )
         return (
             "Review 已完成，但 owner 端没收到通知（系统未配置 owner 身份）。"
-            "请直接 ping owner 让他来取 summary。— PAID"
+            f"请直接 ping owner 让他来取 summary (sid: {sid})。— PAID"
         )
 
     plat = pref.platform
@@ -684,7 +686,7 @@ def _dispatch_review_close_to_owner(cp, reply) -> str:
         f"From: {cp_name} ({cp.platform})\n"
         f"Verdict: {reply.stage} / {getattr(reply, 'event_kind', '')}\n"
         f"\n{brief}\n"
-        f"\n_Full session archive: ~/.hermes/paid/review/sessions/_closed/.../{sid}/_"
+        f"\n_Session ID: {sid} (full archive available from your operator)_"
         f"\n_Note: v1 ships without MERGE — junior did NOT revise the doc. "
         f"Audit is on the original draft._"
     )
@@ -1095,13 +1097,33 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
         # match "/review" against injection patterns (it's our own
         # command syntax).
         stripped = text.lstrip()
-        if (
+        is_review_cmd = (
             stripped.startswith("/review")
             and (len(stripped) == 7 or stripped[7] in " \n\t")
         ) or (
             stripped.startswith("/r")
             and (len(stripped) == 2 or stripped[2] in " \n\t")
-        ):
+        )
+
+        # Active review session: route ALL inbound (not just /review prefix)
+        # directly here, bypassing pre_llm_call. Reason: when active-session
+        # Q&A goes through pre_llm_call, the reply is wrapped in
+        # "IGNORE the user question. Reply EXACTLY with: '<text>'" for the
+        # LLM. ~20% of the time the LLM doesn't comply and free-styles —
+        # which leaks the IGNORE wrapper instruction text to the cp.
+        # Confirmed in 2026-05-12 dogfood (orphan J3 ca58f7e3 had the raw
+        # IGNORE wrapper as its junior_question). Direct send_dm here
+        # eliminates the LLM-compliance dependency entirely.
+        has_active_review = False
+        if platform and sender_id and not is_review_cmd:
+            try:
+                cp_quick = identity.load_counterparty(platform, sender_id)
+                if cp_quick and cp_quick.active_review_session:
+                    has_active_review = True
+            except Exception:
+                pass
+
+        if is_review_cmd or has_active_review:
             if platform and sender_id:
                 return _handle_review_in_pre_gateway(
                     platform, sender_id, stripped,

@@ -663,7 +663,7 @@ def _do_gate_and_close(
                     f"⚠️ Review session {state.sid} closed FORCED_PARTIAL after "
                     f"{state.rounds} rounds, but summary write failed: {exc}\n\n"
                     f"Gate rationale: {rationale}\n"
-                    f"原始材料 + annotations 在 sessions/{state.sid}/ 目录里。"
+                    f"原始材料 + annotations 已在 session 目录留存，请联系 admin 取回。"
                 )
 
             return ReviewReply(
@@ -725,8 +725,8 @@ def _do_gate_and_close(
         brief_text = (
             f"⚠️ Review session {state.sid} 关闭了 verdict={state.verdict}，"
             f"但 summary 落盘/归档失败：{exc}\n\n"
-            f"原始材料 + annotations 还在 sessions/{state.sid}/ "
-            f"目录里，需要人工 recover。"
+            f"原始材料 + annotations 已在 session 目录留存，需要人工 recover — "
+            f"请联系 admin。"
         )
 
     return ReviewReply(
