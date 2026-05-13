@@ -86,11 +86,19 @@ def _max_rounds_from_env(default: int = 3) -> int:
 
 
 def _call_llm(prompt: str, system: str = "") -> str:
-    """Thin wrapper so tests can monkeypatch paid.hermes_io.call_llm."""
+    """Thin wrapper so tests can monkeypatch paid.hermes_io.call_llm.
+
+    v1.3.5 fix: pre-fix used system_prompt= and user_message= kwargs
+    which don't exist on hermes_io.call_llm — every call raised
+    TypeError, swallowed by wrapping try/except → silent return.
+    Same root-cause bug existed in scan.py / qa.py / final_gate.py /
+    build_summary.py — all fixed in this commit. Tests never caught
+    it because they monkeypatch _call_llm directly.
+    """
     from paid import hermes_io
     return hermes_io.call_llm(
-        system_prompt=system or "You are a review assistant.",
-        user_message=prompt,
+        prompt=prompt,
+        system=system or "You are a review assistant.",
     )
 
 
@@ -316,7 +324,11 @@ def _handle_subject(
     # with a distinctive forced_reason so the brief makes clear the
     # scan never actually ran.
     if not findings and len(failed_layers) >= 2:
-        state.verdict = "FAIL"
+        # FORCED_PARTIAL is the canonical "closed without clean outcome"
+        # verdict per INV-5; FAIL is only legal at the GATE→QA edge.
+        # (v1.3.5: pre-fix was state.verdict='FAIL' which crashed
+        # transition() with InvalidStateError. Caught in dogfood.)
+        state.verdict = "FORCED_PARTIAL"
         transition(state, "CLOSED")
         state.forced = True
         state.forced_reason = "scan_unavailable"
@@ -597,22 +609,45 @@ def _do_gate_and_close(
     verdict = gate_result.get("verdict", "FAIL")
 
     if verdict == "FAIL":
-        # Intent gate failed — back to QA + rounds++ (INV-2)
+        # Intent gate failed.
+        # v1.3.5 fix: pre-existing bug surfaced by v1.3.2 H5 (which made
+        # FAIL the default verdict on gate failures, so this path now
+        # actually runs). Old code set state.verdict="FAIL" THEN called
+        # transition("QA") — but transition() validates the new stage
+        # against the CURRENT verdict, and QA only accepts verdict=PENDING.
+        # InvalidStateError raised every time. Fix: rounds-exhausted path
+        # → force-close FORCED_PARTIAL; otherwise reset verdict to PENDING
+        # BEFORE transitioning back to QA.
         state.rounds += 1
-        # FAIL is transient: per INV-5 matrix, FAIL only valid AT GATE→QA edge;
-        # we leave verdict=FAIL momentarily then transition flips it via the
-        # save path. Use direct assignment + transition (validate will accept
-        # FAIL on GATE; then the next QA stage will require verdict=PENDING).
-        state.verdict = "FAIL"  # transient marker
-        transition(state, "QA")
-        # Once in QA, INV-5 requires verdict=PENDING — reset
+        rationale = gate_result.get("rationale", "")
+
+        if state.rounds >= state.max_rounds:
+            # No more rounds left — force-close as partial.
+            state.verdict = "FORCED_PARTIAL"
+            state.forced = True
+            state.forced_reason = "rounds_exhausted"
+            state.closed_at = _now_iso()
+            transition(state, "CLOSED")
+            state.last_event_kind = "close_propose"
+            save_state(state)
+            return ReviewReply(
+                text=(
+                    f"Final gate FAIL after {state.rounds} rounds; "
+                    f"已强制收尾（FORCED_PARTIAL）。\n原因: {rationale}"
+                ),
+                stage="CLOSED",
+                event_kind="close_propose",
+                closed=True,
+            )
+
+        # Still have rounds — go back to QA with verdict reset.
         state.verdict = "PENDING"
         state.last_event_kind = "gate_fail"
+        transition(state, "QA")
         save_state(state)
-        rationale = gate_result.get("rationale", "")
         return ReviewReply(
             text=(
-                f"Final gate FAIL — Intent pillar 没通过。本轮 rounds={state.rounds}。\n"
+                f"Final gate FAIL — Intent pillar 没通过。本轮 rounds={state.rounds}/{state.max_rounds}。\n"
                 f"原因: {rationale}\n"
                 "请继续 QA 修补，回 done 再次尝试。"
             ),

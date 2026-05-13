@@ -42,11 +42,23 @@ def _load_prompt(name: str) -> str:
 
 def _call_llm(prompt: str, system: str = "") -> str:
     """Lazy import so tests can monkeypatch paid.hermes_io.call_llm
-    OR paid_review.core.scan._call_llm directly."""
+    OR paid_review.core.scan._call_llm directly.
+
+    v1.3.5 fix: was passing system_prompt= and user_message= which are
+    NOT real hermes_io.call_llm kwargs. Pre-fix every scan LLM call
+    raised TypeError → caught by run_*'s try/except → silent return [].
+    The no_findings short-circuit then auto-closed every review as
+    verdict=READY without the scan ever actually running. Surfaced by
+    v1.3.2 B4 (which started failing scan_unavailable when both layers
+    return error) — first time we saw the real error message.
+
+    Tests didn't catch it because they monkeypatch _call_llm itself
+    (not hermes_io.call_llm), so the broken call is never exercised.
+    """
     from paid import hermes_io
     return hermes_io.call_llm(
-        system_prompt=system or "You are a critical reviewer.",
-        user_message=prompt,
+        prompt=prompt,
+        system=system or "You are a critical reviewer.",
     )
 
 

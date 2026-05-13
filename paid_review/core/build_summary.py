@@ -31,8 +31,8 @@ def _now_iso() -> str:
 def _call_llm(prompt: str, system: str = "") -> str:
     from paid import hermes_io
     return hermes_io.call_llm(
-        system_prompt=system or "You are writing a decision-ready brief.",
-        user_message=prompt,
+        prompt=prompt,
+        system=system or "You are writing a decision-ready brief.",
     )
 
 

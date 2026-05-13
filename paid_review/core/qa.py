@@ -96,8 +96,8 @@ def _load_prompt() -> str:
 def _call_llm(prompt: str, system: str = "") -> str:
     from paid import hermes_io
     return hermes_io.call_llm(
-        system_prompt=system or "Classify the reply as instructed.",
-        user_message=prompt,
+        prompt=prompt,
+        system=system or "Classify the reply as instructed.",
     )
 
 

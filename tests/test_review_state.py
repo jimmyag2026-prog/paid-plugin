@@ -210,8 +210,15 @@ def test_inv3_done_blocked_with_open_findings(paid_tmp):
     assert reloaded.stage == "QA"
 
 
-def test_inv3_done_allowed_when_all_resolved(paid_tmp):
-    """handle_inbound('done') proceeds when all findings are non-open."""
+def test_inv3_done_allowed_when_all_resolved(paid_tmp, monkeypatch):
+    """handle_inbound('done') proceeds when all findings are non-open.
+
+    v1.3.5 update: H5 made the gate's default verdict on LLM failure
+    FAIL (was READY_WITH_OPEN_ITEMS). Without mocking the gate, this
+    test now hits the FAIL→retry-QA path instead of the legacy
+    silent-pass-through. Mock the gate to a clean READY so the test
+    actually exercises the 'done with all resolved → CLOSED' path it
+    was written for."""
     from paid import storage
     storage.PAID_DIR = paid_tmp
 
@@ -226,10 +233,17 @@ def test_inv3_done_allowed_when_all_resolved(paid_tmp):
     cursor = Cursor(current_id=None, pending=[], done=["f1"])
     save_cursor(sid_dir, cursor)
 
+    # Mock final_gate to a clean READY so we exercise the intended
+    # "done → close" path. Without this we'd be testing the H5 fallback.
+    from paid_review.core import final_gate as _gate
+    monkeypatch.setattr(
+        _gate, "run_final_gate",
+        lambda **kw: {"verdict": "READY", "rationale": "all good"},
+    )
+
     from paid_review.api import handle_inbound
     reply = handle_inbound(state.sid, "done", {})
 
-    # Sprint A stub closes to CLOSED directly
     assert reply.stage == "CLOSED"
     assert reply.closed is True
 
