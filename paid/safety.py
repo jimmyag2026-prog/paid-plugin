@@ -22,9 +22,41 @@ Design choices:
 from __future__ import annotations
 
 import re
+import unicodedata
 from pathlib import Path
 
 from . import hermes_io, storage
+
+
+# v1.3.2 B2: invisible / formatting Unicode that's commonly abused to
+# slip past regex-only injection guards. Strip these before matching so
+# `disreg​ard prior instructions` doesn't bypass the regex.
+_INVISIBLE_CHARS = (
+    "​"   # zero-width space
+    "‌"   # zero-width non-joiner
+    "‍"   # zero-width joiner
+    "﻿"   # BOM / zero-width no-break space
+    "‪‫‬‭‮"  # RTL/LTR override + embed
+    "⁦⁧⁨⁩"        # isolate controls
+)
+_INVISIBLE_TRANSLATION = {ord(c): None for c in _INVISIBLE_CHARS}
+
+
+def _normalize_for_injection_match(s: str) -> str:
+    """NFKC-normalize + strip invisible/formatting chars + casefold.
+
+    Catches homoglyph + zero-width + RTL-override bypass attempts cheaply.
+    NFKC folds e.g. fullwidth `Ｉgnore` → `Ignore` and Greek `ι` → `i`
+    where the compatibility decomposition allows it. Casefold ≈ lower
+    but handles non-ASCII case (Turkish I etc).
+
+    Note: NFKC is intentionally generous — it'll also normalise legit
+    fullwidth CJK punctuation. That's fine for an injection-detection
+    pre-pass; we don't store this normalized form back.
+    """
+    if not s:
+        return ""
+    return unicodedata.normalize("NFKC", s).translate(_INVISIBLE_TRANSLATION).casefold()
 
 
 # ---------------------------------------------------------------------------
@@ -96,12 +128,21 @@ def detect_prompt_injection(user_message: str) -> tuple[bool, list[str]]:
     ``labels`` is the list of pattern labels that fired, in pattern order.
     The first hit alone is enough for an upstream block; the full list is
     handy for the audit log.
+
+    v1.3.2 B2: matches against an NFKC-normalised + invisible-stripped
+    + casefolded copy of the message, so fullwidth (`Ｉgnore`), Greek
+    homoglyph (`ιgnore`), zero-width spaced (`disre​gard`), and
+    RTL-override prefixed payloads are caught by the same regex set
+    that previously only matched plain ASCII. The original message is
+    NOT mutated — downstream LLM dispatch + audit log see the
+    untouched text.
     """
     if not user_message:
         return False, []
+    needle = _normalize_for_injection_match(user_message)
     hits: list[str] = []
     for label, pat in _INJECTION_PATTERNS:
-        if pat.search(user_message):
+        if pat.search(needle):
             hits.append(label)
     return (bool(hits), hits)
 

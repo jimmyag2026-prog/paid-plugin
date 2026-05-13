@@ -73,7 +73,7 @@ def _heuristic_fallback_brief(*, subject: str, junior_name: str,
     Better to ship something the owner can act on than to block delivery."""
     counts = Counter(a.status for a in annotations)
     return (
-        f"# 会前简报 — {subject}\n\n"
+        f"# Quality Audit — {subject}\n\n"
         f"_Junior: {junior_name} · Rounds: {rounds} · 产出时间: {_now_iso()}_\n"
         f"_⚠️ 此 brief 由 fallback 模板生成 (LLM 不可用)；详细 audit 见 summary_audit.md_\n\n"
         f"## 1. 议题摘要\n(brief 主体生成失败；请直接读 junior 原文 + audit)\n\n"

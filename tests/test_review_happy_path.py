@@ -75,15 +75,17 @@ def test_happy_path_end_to_end(paid_tmp, monkeypatch):
     cp_reloaded = identity.load_counterparty("telegram", "101")
     assert cp_reloaded.active_review_session == sid
 
-    # --- Step 2: INTAKE handler → SUBJECT ---
+    # --- Step 2: INTAKE handler → SUBJECT (v1.3.2 H7: top-candidate confirm) ---
     reply = handle_inbound(sid, "Q3 营销预算草稿，请 review", {})
     assert reply.stage == "SUBJECT"
     assert reply.event_kind == "subject_ask"
-    assert "(a)" in reply.text
+    # H7 new UX: top candidate quoted, yes-to-confirm
+    assert "**" in reply.text  # bolded top candidate
+    assert "yes" in reply.text.lower()
     assert reply.closed is False
 
     # --- Step 3: SUBJECT → SCAN → QA (first finding) ---
-    reply = handle_inbound(sid, "a", {})  # pick candidate (a)
+    reply = handle_inbound(sid, "yes", {})  # H7: affirm top candidate
     assert reply.stage == "QA", f"Expected QA, got {reply.stage}: {reply.text}"
     assert reply.event_kind == "finding"
     assert "f1" in reply.text.lower() or "data" in reply.text.lower() or "sales" in reply.text.lower()

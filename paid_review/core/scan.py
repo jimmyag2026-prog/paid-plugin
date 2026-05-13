@@ -191,14 +191,75 @@ def run_full_scan(*, subject: str, document: str,
     (p1, p2, ...), responder sim findings after (r1, r2, ...).
 
     De-dup is best-effort — if both layers emit the same `text`
-    substring, the second occurrence is dropped. This is the entry
-    api._handle_subject calls.
+    substring, the second occurrence is dropped.
+
+    Note: callers that need to distinguish "LLM failed → 0 findings"
+    from "LLM ran fine → 0 findings" should use
+    ``run_full_scan_with_errors`` instead. Pre-v1.3.2 dogfood review
+    flagged this as a silent-trust-erosion path: a transient LLM
+    outage looks identical to "your draft is decision-ready".
     """
-    a = run_four_pillar(subject=subject, document=document)
-    b = run_responder_sim(
+    annotations, _failed = run_full_scan_with_errors(
         subject=subject, document=document,
         owner_name=owner_name, responder_profile=responder_profile,
     )
+    return annotations
+
+
+def run_full_scan_with_errors(*, subject: str, document: str,
+                              owner_name: str = "the owner",
+                              responder_profile: str = ""
+                              ) -> tuple[list[Annotation], list[str]]:
+    """Same as ``run_full_scan`` but also reports per-layer LLM failures.
+
+    Returns ``(annotations, failed_layers)``. ``failed_layers`` is a
+    subset of ``["four_pillar", "responder_sim"]``:
+
+      - ``[]`` — both layers succeeded (annotations may still be empty
+        if the LLMs genuinely had nothing to flag).
+      - ``["responder_sim"]`` — Layer B's LLM call failed; 4-pillar
+        findings still usable but coverage is partial.
+      - ``["four_pillar", "responder_sim"]`` — both LLMs failed;
+        annotations will be empty. Caller MUST NOT interpret this as
+        "no findings = ready"; the scan never produced a signal.
+
+    Callers should escalate on full failure rather than silently close
+    the review with verdict=READY.
+    """
+    failed: list[str] = []
+
+    try:
+        raw_a = _call_llm(_load_prompt("four_pillar")
+                          .replace("{subject}", subject)
+                          .replace("{document}", document))
+        items_a = _parse_findings_json(raw_a)
+        a: list[Annotation] = []
+        for i, item in enumerate(items_a, start=1):
+            ann = _annotation_from_dict(item, source="four_pillar", default_id=f"p{i}")
+            if ann is not None:
+                a.append(ann)
+    except Exception as exc:
+        logger.warning("run_full_scan_with_errors: 4-pillar LLM failed: %s", exc)
+        failed.append("four_pillar")
+        a = []
+
+    try:
+        raw_b = _call_llm(_load_prompt("responder_sim")
+                          .replace("{subject}", subject)
+                          .replace("{document}", document)
+                          .replace("{owner_name}", owner_name)
+                          .replace("{responder_profile}",
+                                   responder_profile.strip() or "(no profile yet)"))
+        items_b = _parse_findings_json(raw_b)
+        b: list[Annotation] = []
+        for i, item in enumerate(items_b, start=1):
+            ann = _annotation_from_dict(item, source="responder_sim", default_id=f"r{i}")
+            if ann is not None:
+                b.append(ann)
+    except Exception as exc:
+        logger.warning("run_full_scan_with_errors: responder_sim LLM failed: %s", exc)
+        failed.append("responder_sim")
+        b = []
 
     # Naive de-dup: skip a responder_sim finding whose text is fully
     # contained in any 4-pillar finding's text. Cheap, conservative.
@@ -211,4 +272,4 @@ def run_full_scan(*, subject: str, document: str,
             continue
         deduped_b.append(ann)
 
-    return a + deduped_b
+    return a + deduped_b, failed

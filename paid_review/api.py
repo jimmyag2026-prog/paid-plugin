@@ -117,17 +117,21 @@ def _build_subject_options(initial_message: str) -> list[str]:
 
 def _build_findings(subject: str, initial_message: str,
                     *, owner_name: str = "the owner",
-                    responder_profile: str = "") -> list[Annotation]:
+                    responder_profile: str = ""
+                    ) -> tuple[list[Annotation], list[str]]:
     """Run the Sprint B 2-layer scan (4-pillar + Responder Sim).
 
-    Sprint A used a single mixed LLM call as a placeholder; Sprint B
-    delegates to paid_review.core.scan which does two separate LLM
-    calls (each layer can fail/succeed independently) and merges + dedups.
-    Both layers return [] if the LLM fails — caller must handle the
-    no_findings short-circuit (Ⓜ17, already implemented in _handle_subject).
+    Returns ``(annotations, failed_layers)``. v1.3.2 — previously
+    returned just the list, which couldn't distinguish "LLM ran fine,
+    0 findings" from "both LLMs failed, 0 findings". The latter case
+    used to silently close the review as READY (Ⓜ17 short-circuit),
+    which means a transient LLM outage produced a clean bill of
+    health. Caller (_handle_subject) now checks failed_layers and
+    escalates instead of auto-closing when the scan never produced a
+    real signal.
     """
     from paid_review.core import scan
-    return scan.run_full_scan(
+    return scan.run_full_scan_with_errors(
         subject=subject,
         document=initial_message,
         owner_name=owner_name,
@@ -211,22 +215,40 @@ def _handle_intake(
     state.last_event_kind = "subject_ask"
     save_state(state)
 
-    opts = _render_options(candidates)
+    # v1.3.2 H7: fast-start subject confirmation.
+    # Pre-fix UX was 3-5 round-trips: PAID lists a/b/c → user picks → if
+    # pass/custom → asks "输入自定义主题" → user types. Pilot bounced off.
+    # New UX: auto-select the top candidate as the assumed subject and ask
+    # one yes/no — if "yes"/empty/affirm, proceed; else treat user's text
+    # as the corrected subject. Other candidates surfaced as hints.
+    top = candidates[0]
+    alt_hint = ""
+    if len(candidates) > 1:
+        alt_hint = "\n\n_其它候选: " + " / ".join(candidates[1:5]) + "_"
     return ReviewReply(
         text=(
-            f"收到！请确认 review 的主题：\n\n{opts}\n\n"
-            "(pass) 不用以上选项，我自己说\n(custom) 输入自定义主题"
+            f"收到。我把 review 的主题理解为：\n\n**{top}**\n\n"
+            f"对的话回 `yes` 我直接开始；要换主题就直接把正确的主题打过来。"
+            f"{alt_hint}"
         ),
         stage="SUBJECT",
         event_kind="subject_ask",
     )
 
 
+_SUBJECT_AFFIRM_TOKENS = {"yes", "y", "ok", "okay", "对", "对的", "是", "是的", "正确",
+                          "确认", "好的", "可以", "go", "start"}
+
+
 def _handle_subject(
     state: SessionState, text: str, sid_dir: Path
 ) -> ReviewReply:
-    """SUBJECT: resolve selection → run (fake) SCAN → enter QA with first finding."""
-    t = text.strip().lower()
+    """SUBJECT: resolve top-candidate confirmation OR explicit subject → run
+    SCAN → enter QA. v1.3.2 H7 simplifies grammar: yes-token confirms top
+    candidate; legacy a/b/c letter pick still works for back-compat;
+    anything else is treated as a corrected subject."""
+    t_raw = text.strip()
+    t = t_raw.lower()
 
     # Load stored candidates
     cand_path = sid_dir / "subject_candidates.json"
@@ -237,22 +259,37 @@ def _handle_subject(
         except Exception:
             candidates = []
 
-    label_map = dict(zip("abcdefghij", candidates))
+    top = candidates[0] if candidates else ""
 
-    if t in label_map:
-        subject = label_map[t]
-    elif t in ("pass", "custom") or t not in ("a", "b", "c", "d", "e"):
-        # Free-text subject
-        subject = text.strip() if text.strip().lower() not in ("pass", "custom") else ""
-        if not subject:
+    # 1) Affirm token → use the top candidate we proposed in subject_ask
+    if t in _SUBJECT_AFFIRM_TOKENS:
+        if not top:
             return ReviewReply(
-                text="请输入你的自定义主题：",
+                text="还没有 subject 候选；请直接把要 review 的主题打出来。",
                 stage="SUBJECT",
                 event_kind="subject_ask",
             )
-    else:
+        subject = top
+    # 2) Legacy a/b/c picker still works
+    elif t in dict(zip("abcdefghij", candidates)):
+        subject = dict(zip("abcdefghij", candidates))[t]
+    # 3) pass / custom is now redundant but tolerated (legacy)
+    elif t in ("pass", "custom"):
         return ReviewReply(
-            text="不太懂，请回 a/b/c 或输入自定义主题。",
+            text="把要 review 的主题直接打出来就行（不再需要 pass / custom）。",
+            stage="SUBJECT",
+            event_kind="subject_ask",
+        )
+    # 4) Anything else (non-empty) is treated as a corrected subject
+    elif t_raw:
+        subject = t_raw
+    else:
+        # Empty inbound (rare; user hit enter) — re-prompt with top
+        return ReviewReply(
+            text=(
+                f"还在等你确认主题：**{top or '(待补充)'}**\n"
+                f"回 `yes` 开始，或打出正确的主题。"
+            ),
             stage="SUBJECT",
             event_kind="subject_ask",
         )
@@ -270,9 +307,35 @@ def _handle_subject(
     if norm.exists():
         initial_message = norm.read_text(encoding="utf-8")
 
-    findings = _build_findings(subject, initial_message)
+    findings, failed_layers = _build_findings(subject, initial_message)
+
+    # v1.3.2 B4: distinguish "scan ran fine, 0 findings" from "scan
+    # LLMs failed → 0 findings". Pre-fix both paths short-circuited to
+    # verdict=READY which gave a transient outage a clean bill of
+    # health. Now both-layers-failed escalates to owner via force_close
+    # with a distinctive forced_reason so the brief makes clear the
+    # scan never actually ran.
+    if not findings and len(failed_layers) >= 2:
+        state.verdict = "FAIL"
+        transition(state, "CLOSED")
+        state.forced = True
+        state.forced_reason = "scan_unavailable"
+        state.closed_at = _now_iso()
+        state.last_event_kind = "close_propose"
+        save_state(state)
+        return ReviewReply(
+            text=(
+                "⚠️ Review 扫描层都没拿到 LLM 响应（可能是限流或临时故障）。"
+                "已上报给 owner，他会跟你直接对接。session 已关闭。"
+            ),
+            stage="CLOSED",
+            event_kind="close_propose",
+            closed=True,
+        )
 
     # no_findings short-circuit (Ⓜ17): SCAN → CLOSED verdict=READY
+    # Only when at MOST one layer failed AND that one was the
+    # non-empty layer (i.e. we have evidence the scan actually ran).
     if not findings:
         state.verdict = "READY"
         transition(state, "CLOSED")
@@ -281,8 +344,13 @@ def _handle_subject(
         state.closed_at = _now_iso()
         state.last_event_kind = "close_propose"
         save_state(state)
+        partial_note = ""
+        if failed_layers:
+            partial_note = (
+                f"\n\n_注：{failed_layers[0]} 层 LLM 调用失败，已用单层结果。_"
+            )
         return ReviewReply(
-            text="扫描完成，没有发现需要讨论的 finding。材料已达 decision-ready。",
+            text="扫描完成，没有发现需要讨论的 finding。材料已达 decision-ready。" + partial_note,
             stage="CLOSED",
             event_kind="close_propose",
             closed=True,
@@ -521,7 +589,12 @@ def _do_gate_and_close(
     except Exception:
         pass
 
-    verdict = gate_result.get("verdict", "READY_WITH_OPEN_ITEMS")
+    # v1.3.2 H5: conservative default. Pre-fix default was
+    # READY_WITH_OPEN_ITEMS — if the gate LLM crashed or returned
+    # malformed JSON, the review silently passed. New default = FAIL so
+    # a broken gate forces escalation back to QA (or eventual rounds
+    # exhaustion → FORCED_PARTIAL) instead of fabricating a pass.
+    verdict = gate_result.get("verdict", "FAIL")
 
     if verdict == "FAIL":
         # Intent gate failed — back to QA + rounds++ (INV-2)
@@ -554,19 +627,42 @@ def _do_gate_and_close(
     state.last_event_kind = "close_propose"
     save_state(state)
 
-    # Write summary + audit + archive
+    # v1.3.2 C3: deliver() can raise on disk full / Lark API outage /
+    # filesystem perms. Pre-fix the exception bubbled up after state
+    # was already saved CLOSED — junior got nothing, owner got
+    # nothing, and PAID had to be debugged via SSH. Now we catch, mark
+    # state.delivery_failed=True, and surface a degraded ReviewReply
+    # the plugin glue can route to the owner alert path.
     sessions_root = _storage.PAID_DIR / "review" / "sessions"
-    delivered = _deliver.deliver(
-        sid_dir, sessions_root,
-        subject=subject,
-        junior_name=state.cp_id,
-        junior_platform=state.platform,
-        rounds=state.rounds, verdict=state.verdict,
-        document=document,
-    )
+    try:
+        delivered = _deliver.deliver(
+            sid_dir, sessions_root,
+            subject=subject,
+            junior_name=state.cp_id,
+            junior_platform=state.platform,
+            rounds=state.rounds, verdict=state.verdict,
+            document=document,
+        )
+        brief_text = delivered["summary"]
+    except Exception as exc:
+        logger.warning(
+            "_do_gate_and_close: deliver crashed sid=%s verdict=%s: %s",
+            state.sid, state.verdict, exc,
+        )
+        state.delivery_failed = True
+        try:
+            save_state(state)
+        except Exception:
+            pass
+        brief_text = (
+            f"⚠️ Review session {state.sid} 关闭了 verdict={state.verdict}，"
+            f"但 summary 落盘/归档失败：{exc}\n\n"
+            f"原始材料 + annotations 还在 sessions/{state.sid}/ "
+            f"目录里，需要人工 recover。"
+        )
 
     return ReviewReply(
-        text=delivered["summary"],   # owner gets the 6-section brief
+        text=brief_text,             # owner gets the brief (plugin glue routes)
         stage="CLOSED",
         event_kind="close_propose",
         closed=True,

@@ -188,3 +188,61 @@ def test_classify_empty_response_returns_fallback():
     assert result.in_scope is False
     assert result.confidence == 0.0
     assert "empty" in result.reasoning.lower()
+
+
+# ---- v1.3.2 H2: fallback rate counter for silent-degradation visibility ----
+
+
+def test_fallback_rate_starts_empty():
+    classifier.reset_classifier_history()
+    fb, total, ratio = classifier.fallback_rate_recent()
+    assert fb == 0 and total == 0 and ratio == 0.0
+
+
+def test_fallback_rate_tracks_real_vs_fallback(monkeypatch):
+    classifier.reset_classifier_history()
+    # Mock the LLM to alternate: good JSON, then exception, good, exception
+    good = json.dumps({
+        "topic": "logistics", "stakes": "low", "in_scope": True,
+        "is_blacklisted": False, "confidence": 0.9,
+        "needs_retrieval": False, "suggested_queries": [],
+        "draft_answer": "x", "reasoning": "ok",
+    })
+    calls = {"n": 0}
+
+    def fake_llm(**kwargs):
+        calls["n"] += 1
+        if calls["n"] % 2 == 0:
+            raise RuntimeError("LLM down")
+        return good
+
+    monkeypatch.setattr(classifier.hermes_io, "call_llm", fake_llm)
+
+    cp = FakeCP(topics_allowed=["logistics"])
+    for _ in range(4):
+        classifier.classify("hi", cp, "Jimmy", "")
+
+    fb, total, ratio = classifier.fallback_rate_recent()
+    assert total == 4
+    assert fb == 2  # 2 of 4 raised exception
+    assert ratio == 0.5
+
+    classifier.reset_classifier_history()
+
+
+def test_fallback_rate_window_caps_at_100(monkeypatch):
+    classifier.reset_classifier_history()
+    monkeypatch.setattr(
+        classifier.hermes_io, "call_llm",
+        lambda **kw: (_ for _ in ()).throw(RuntimeError("always fail")),
+    )
+    cp = FakeCP(topics_allowed=["logistics"])
+    for _ in range(120):
+        classifier.classify("msg", cp, "J", "")
+
+    fb, total, ratio = classifier.fallback_rate_recent()
+    assert total == 100  # capped
+    assert fb == 100
+    assert ratio == 1.0
+
+    classifier.reset_classifier_history()

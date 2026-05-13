@@ -256,6 +256,39 @@ def is_fallback(c: Classification) -> bool:
     return c.reasoning.startswith("[fallback]")
 
 
+# v1.3.2 H2: rolling window of last N classifier outcomes (True=fallback).
+# Lives in-process; per-hermes-restart resets. Surfaced via
+# fallback_rate_recent() so /paid-status can show "classifier fallback
+# rate: X% (last N)" — pre-fix, silent classifier outages just produced
+# 100% request-state routing with no operator visibility.
+import collections as _collections
+
+_CLASSIFIER_HISTORY_MAX = 100
+_classifier_history: _collections.deque[bool] = _collections.deque(maxlen=_CLASSIFIER_HISTORY_MAX)
+
+
+def _record_classification(c: Classification) -> None:
+    _classifier_history.append(is_fallback(c))
+
+
+def fallback_rate_recent() -> tuple[int, int, float]:
+    """Return (fallback_count, total_count, ratio_0_to_1).
+
+    ``total_count`` ≤ ``_CLASSIFIER_HISTORY_MAX``. ``ratio`` is 0.0 on
+    empty history (no classifications yet, not a 0% real signal).
+    """
+    total = len(_classifier_history)
+    if total == 0:
+        return (0, 0, 0.0)
+    fb = sum(1 for x in _classifier_history if x)
+    return (fb, total, fb / total)
+
+
+def reset_classifier_history() -> None:
+    """Test hook + manual reset; not used in normal operation."""
+    _classifier_history.clear()
+
+
 # --------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------
@@ -287,6 +320,10 @@ def classify(
             temperature=0.1,  # deterministic gating; not creative
         )
     except Exception as e:  # noqa: BLE001 — classifier never raises upward
-        return Classification(reasoning=f"[fallback] classifier LLM call failed: {e}")
+        result = Classification(reasoning=f"[fallback] classifier LLM call failed: {e}")
+        _record_classification(result)
+        return result
 
-    return _parse_classification(raw)
+    result = _parse_classification(raw)
+    _record_classification(result)
+    return result

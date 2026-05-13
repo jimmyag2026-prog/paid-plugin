@@ -97,8 +97,9 @@ def _patch_llm(monkeypatch, value):
 
 
 def test_summary_uses_llm_output_when_starts_with_header(monkeypatch):
+    # v1.3.2 H6 rename: brief is now "Quality Audit", not "会前简报"
     fake_brief = (
-        "# 会前简报 — Q3 plan\n\n"
+        "# Quality Audit — Q3 plan\n\n"
         "_Junior: Evie · Rounds: 2_\n\n"
         "## 1. 议题摘要\n要 owner 决定是否批 Q3 预算 240k\n"
     )
@@ -108,7 +109,7 @@ def test_summary_uses_llm_output_when_starts_with_header(monkeypatch):
         junior_platform="feishu", rounds=2, verdict="READY",
         document="...", annotations=_make_anns(),
     )
-    assert out == fake_brief.strip()  # build_summary strips trailing whitespace
+    assert out == fake_brief.strip()
     assert "议题摘要" in out
 
 
@@ -120,7 +121,7 @@ def test_summary_falls_back_when_llm_doesnt_start_with_header(monkeypatch):
         junior_platform="feishu", rounds=2, verdict="READY_WITH_OPEN_ITEMS",
         document="...", annotations=_make_anns(),
     )
-    assert out.startswith("# 会前简报")
+    assert out.startswith("# Quality Audit")
     assert "fallback" in out.lower()
     assert "READY_WITH_OPEN_ITEMS" in out
 
@@ -132,7 +133,7 @@ def test_summary_fallback_on_llm_exception(monkeypatch):
         rounds=1, verdict="FORCED_PARTIAL",
         document="x", annotations=_make_anns(),
     )
-    assert out.startswith("# 会前简报")
+    assert out.startswith("# Quality Audit")
     assert "fallback" in out.lower()
     # Heuristic includes finding counts
     assert "接受: 1" in out

@@ -292,3 +292,51 @@ def test_run_full_scan_one_layer_succeeds_other_fails(monkeypatch):
     out = scan.run_full_scan(subject="x", document="y")
     assert len(out) == 1
     assert out[0].id == "p1"
+
+
+# ----- v1.3.2 B4: run_full_scan_with_errors reports per-layer failure -----
+
+
+def test_run_full_scan_with_errors_both_ok(monkeypatch):
+    """Both LLMs succeed → empty failed_layers list."""
+    fp = json.dumps([{"id": "p1", "pillar": "Intent", "issue": "vague"}])
+    rs = json.dumps([{"id": "r1", "pillar": "Background", "issue": "no anchor"}])
+    calls = {"n": 0}
+    def fake_llm(prompt, system=""):
+        calls["n"] += 1
+        return fp if calls["n"] == 1 else rs
+    monkeypatch.setattr(scan, "_call_llm", fake_llm)
+
+    annotations, failed = scan.run_full_scan_with_errors(subject="x", document="y")
+    assert len(annotations) == 2
+    assert failed == []
+
+
+def test_run_full_scan_with_errors_both_fail_reports_both(monkeypatch):
+    """Both LLMs raise → annotations=[] AND failed=['four_pillar','responder_sim'].
+    Caller (api._handle_subject) keys off this to escalate instead of
+    silently closing as READY (v1.3.2 B4 fix)."""
+    monkeypatch.setattr(
+        scan, "_call_llm",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("rate limit")),
+    )
+    annotations, failed = scan.run_full_scan_with_errors(subject="x", document="y")
+    assert annotations == []
+    assert "four_pillar" in failed and "responder_sim" in failed
+
+
+def test_run_full_scan_with_errors_partial_fail_reports_one(monkeypatch):
+    """4-pillar succeeds, responder_sim fails → failed=['responder_sim'],
+    annotations contains 4-pillar findings (partial coverage usable)."""
+    fp = json.dumps([{"id": "p1", "pillar": "Intent", "issue": "v"}])
+    calls = {"n": 0}
+    def fake_llm(prompt, system=""):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return fp
+        raise RuntimeError("responder sim LLM down")
+    monkeypatch.setattr(scan, "_call_llm", fake_llm)
+
+    annotations, failed = scan.run_full_scan_with_errors(subject="x", document="y")
+    assert len(annotations) == 1
+    assert failed == ["responder_sim"]

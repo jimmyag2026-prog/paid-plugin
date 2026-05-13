@@ -1,10 +1,15 @@
-# Pre-Meeting Brief — 6 Sections
+# Quality Audit Brief — 6 Sections
 
-You are PAID's review skill writing the **decision-ready brief** the
-owner will read before deciding on the junior's ask. Junior already went
-through {rounds} rounds of Q&A; their accepted/rejected/unresolvable
-findings are below. The owner has 5 minutes — every section must earn
-its place.
+You are PAID's review skill writing the **quality audit + readiness
+check** the owner will read before deciding on the junior's ask.
+**Important framing**: the junior went through {rounds} rounds of Q&A
+about findings, but in PAID v1 the junior did NOT revise the document
+itself (the MERGE phase isn't shipped yet). The owner is reading their
+ORIGINAL document plus our audit of it — not a refined "decision-ready"
+final version. Write accordingly: flag what needs fixing before this
+is decision-ready, don't claim it already is.
+
+The owner has 5 minutes — every section must earn its place.
 
 ## Inputs
 
@@ -25,9 +30,10 @@ Verdict: {verdict}
 ## Output (markdown, exactly 6 sections, headings ≤ 80 chars each)
 
 ```
-# 会前简报 — {subject}
+# Quality Audit — {subject}
 
 _Junior: {junior_name} · Rounds: {rounds} · 产出时间: {ts}_
+_⚠️ 这是对 junior **原稿**的质量审计 — junior 还没根据 findings 改稿 (MERGE 未实施)。_
 
 ## 1. 议题摘要
    一句话（20-40 字）总结 owner 要决定的事 + 三行背景:
@@ -66,4 +72,4 @@ _Junior: {junior_name} · Rounds: {rounds} · 产出时间: {ts}_
 - 不写 "感谢 junior" / "great work" 类客套
 - 不发 markdown thinking 过程；不漏 reasoning / tool 输出
 
-Output the markdown brief now (start with `# 会前简报 —`):
+Output the markdown brief now (start with `# Quality Audit —`):

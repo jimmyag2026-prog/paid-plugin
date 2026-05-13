@@ -65,6 +65,11 @@ class SessionState:
     last_event_kind: str = ""
     llm_cost_usd: float = 0.0
     trace_id: str | None = None
+    # v1.3.2: marks a session that reached CLOSED but whose summary/audit
+    # write or archive step crashed (disk full, Lark API outage, perms).
+    # Plugin glue surfaces this to the owner alert path so the brief
+    # isn't silently lost. Junior gets a degraded-but-honest message.
+    delivery_failed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +186,7 @@ def load_state(sid: str) -> SessionState | None:
         last_event_kind=data.get("last_event_kind", ""),
         llm_cost_usd=float(data.get("llm_cost_usd", 0.0)),
         trace_id=data.get("trace_id"),
+        delivery_failed=bool(data.get("delivery_failed", False)),
     )
 
 

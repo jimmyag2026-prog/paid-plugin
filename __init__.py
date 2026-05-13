@@ -680,11 +680,13 @@ def _dispatch_review_close_to_owner(cp, reply) -> str:
     #    chunking later if we hit a real ceiling.
     cp_name = getattr(cp, "display_name", "") or cp.cp_id
     brief_with_header = (
-        f"📝 Review session closed — sid `{sid}`\n"
+        f"📋 Quality Audit complete — sid `{sid}`\n"
         f"From: {cp_name} ({cp.platform})\n"
         f"Verdict: {reply.stage} / {getattr(reply, 'event_kind', '')}\n"
         f"\n{brief}\n"
         f"\n_Full session archive: ~/.hermes/paid/review/sessions/_closed/.../{sid}/_"
+        f"\n_Note: v1 ships without MERGE — junior did NOT revise the doc. "
+        f"Audit is on the original draft._"
     )
     try:
         result = hermes_io.send_dm(plat, uid, brief_with_header, fallback_to_queue=True)
@@ -910,6 +912,21 @@ def on_pre_llm_call(**kwargs) -> dict | None:
         return None
 
 
+def _bump_l4_incident_counter(cp_id: str) -> None:
+    """Append to ~/.hermes/paid/l4_incidents.jsonl so /paid-status can
+    surface 'cp X had Y L4 hits in the last 7d'. We append rather than
+    mutate cp.profile.json to avoid file-lock contention with intake
+    and to keep cp profile schema stable. v1.3.2 C5 mitigation."""
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "cp_id": cp_id,
+    }
+    try:
+        storage.append_jsonl(storage.PAID_DIR / "l4_incidents.jsonl", rec)
+    except Exception:
+        pass
+
+
 def on_post_llm_call(**kwargs) -> None:
     """Audit the assistant's final response + run Layer 4 output checks.
 
@@ -969,19 +986,38 @@ def on_post_llm_call(**kwargs) -> None:
             # disregard so the operator at least has a paper-trail of "PAID
             # noticed and tried to contain it" rather than a silent leak.
             # Use any-CJK heuristic to pick the language.
+            #
+            # v1.3.2 C5 partial: strengthened the corrective wording (was
+            # "may have contained" — too soft for safety message); added a
+            # crisp placeholder so the counterparty has a clear substitute
+            # to act on. True C5 (block dispatch before send) blocked on
+            # hermes upstream (see backlog M2.5).
+            owner_name_for_msg = identity.display_name(identity.load_owner())
             if platform and sender_id:
                 try:
                     is_cjk = any(c >= "一" and c <= "鿿" for c in response)
                     correction = (
-                        "上一条回复可能包含了不该外发的信息，请忽略；让 Jimmy 直接回复你。"
+                        f"⚠️ 上一条回复包含了不该自动发出的信息，请忽略它。"
+                        f"我已通知 {owner_name_for_msg}，他会直接回复你。"
+                        f"— {owner_name_for_msg}'s PAID"
                         if is_cjk else
-                        "Heads-up: my previous reply may have contained sensitive "
-                        "information that shouldn't have been sent. Please disregard it "
-                        "— I'll let the owner respond directly."
+                        f"⚠️ Please disregard my previous reply — it contained "
+                        f"information that shouldn't have been sent automatically. "
+                        f"I've flagged {owner_name_for_msg} to follow up with you directly."
+                        f" — {owner_name_for_msg}'s PAID"
                     )
                     hermes_io.send_dm(platform, sender_id, correction, fallback_to_queue=True)
                 except Exception as exc:
                     _safe_log(f"[L4-LEAK] corrective send EXC: {exc}")
+
+            # Track per-cp L4 incident so repeat offenders are visible in
+            # /paid-status. Best-effort; failure must not break the post
+            # hook.
+            try:
+                if cp_id:
+                    _bump_l4_incident_counter(cp_id)
+            except Exception as exc:
+                _safe_log(f"[L4-LEAK] incident counter EXC: {exc}")
 
         audit.log_action(
             session_id=session_id,
@@ -1124,10 +1160,33 @@ def _cmd_pending(raw_args: str) -> str:
     if not _is_caller_owner_via_env():
         return ""  # silent for non-owners
     pendings = approval.list_pending()
+
+    # v1.3.2 H2: surface classifier fallback rate so owner can spot
+    # silent degradation. Pre-fix, if classifier was failing every call
+    # (network / API key bad), every inbound just got conservatively
+    # routed to request — the owner sees more J3 cards but has no
+    # signal that the classifier itself is broken.
+    health_lines = []
+    try:
+        from paid.classifier import fallback_rate_recent
+        fb, total, ratio = fallback_rate_recent()
+        if total >= 5:  # don't fire alarms before there's signal
+            pct = int(round(ratio * 100))
+            marker = " ⚠️" if ratio >= 0.20 else ""
+            health_lines.append(
+                f"Classifier fallback rate (last {total}): {pct}% ({fb}/{total}){marker}"
+            )
+    except Exception:
+        pass
+
     if not pendings:
-        return "PAID: no pending approvals."
-    lines = ["PAID pending approvals:"] + [_format_pending_summary(r) for r in pendings]
-    return "\n".join(lines)
+        body = ["PAID: no pending approvals."]
+    else:
+        body = ["PAID pending approvals:"] + [_format_pending_summary(r) for r in pendings]
+
+    if health_lines:
+        body = body + ["", "— Health —"] + health_lines
+    return "\n".join(body)
 
 
 def _resolve_request(raw_args: str) -> tuple[str, str]:
