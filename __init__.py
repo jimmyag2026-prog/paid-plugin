@@ -1093,6 +1093,33 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
             platform = getattr(plat_val, "value", str(plat_val)) if plat_val else ""
             sender_id = str(getattr(source, "user_id", "") or "")
 
+        # ============================================================
+        # PHASE 0 SMOKE LOG — throwaway, revert after manual test done.
+        # Captures fields needed by paid-may design 11 §2 exit table:
+        #   - chat_type (group/dm) → gates doc 10 group-routing impl path
+        #   - media_urls / media_types / message_type → gates doc 09
+        #     multimedia Tier 2/3 impl (consume hermes-downloaded files
+        #     vs PAID writes its own download_file)
+        # See paid-may/design/11_v1.5_sprint_plan.md §2 for the smoke
+        # protocol. REMOVE THIS BLOCK before merging anything to main.
+        # ============================================================
+        try:
+            _chat_type = getattr(source, "chat_type", None) if source is not None else None
+            _chat_id = getattr(source, "chat_id", None) if source is not None else None
+            _text_preview = (getattr(event, "text", "") or "")[:60]
+            _media_urls = list(getattr(event, "media_urls", []) or [])
+            _media_types = list(getattr(event, "media_types", []) or [])
+            _msg_type = getattr(event, "message_type", None)
+            _safe_log(
+                f"[v1.5-smoke] platform={platform!r} chat_type={_chat_type!r} "
+                f"sender_id={sender_id!r} chat_id={_chat_id!r} "
+                f"msg_type={_msg_type!r} text_len={len(_text_preview)} "
+                f"text_head={_text_preview!r} "
+                f"media_urls={_media_urls} media_types={_media_types}"
+            )
+        except Exception as _exc:
+            _safe_log(f"[v1.5-smoke] log block EXC: {_exc}")
+
         # First TG inbound after gateway boot: attach our paid_* button
         # callback handler to the live PTB Application. Idempotent — only
         # the first call does real work.
