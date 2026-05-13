@@ -1,5 +1,5 @@
 name: paid-v1
-version: 1.3.8
+version: 1.4.0
 description: PAID — Personal AI Delegate (three-state approval pipeline)
 author: PAID project
 # PAID's owner CLI is built on hermes v0.11+ plugin surface

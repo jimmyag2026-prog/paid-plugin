@@ -1086,6 +1086,36 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
             platform = getattr(plat_val, "value", str(plat_val)) if plat_val else ""
             sender_id = str(getattr(source, "user_id", "") or "")
         if platform and sender_id and identity.is_owner(platform, sender_id):
+            # Owner-side messages normally pass through to hermes / Claude.
+            # BUT: if the owner clicked ✅ / ✏️ on a card and we armed
+            # awaiting_input, the next plain-text reply in the same chat
+            # should be captured as the answer to forward to the junior —
+            # not handed to the LLM.
+            owner_text = str(getattr(event, "text", "") or "").strip()
+            chat_id_val = ""
+            if source is not None:
+                _cid = getattr(source, "chat_id", None)
+                chat_id_val = str(_cid) if _cid else ""
+            if (
+                owner_text
+                and not owner_text.startswith("/")
+                and (platform, sender_id) in _AWAITING_INPUT
+            ):
+                rid = _consume_awaiting_input(platform, sender_id, chat_id=chat_id_val or None)
+                if rid is not None:
+                    try:
+                        result_text = _do_approve(rid, override_text=owner_text)
+                    except Exception as exc:
+                        _safe_log(f"[card] owner-input do_approve EXC #{rid}: {exc}")
+                        result_text = f"PAID: #{rid} — internal error: {exc}"
+                    _send_owner_inline_message(
+                        f"✅ #{rid} approved with your reply.\n{result_text}"
+                    )
+                    _safe_log(
+                        f"[card] case-2 captured owner input for #{rid}; "
+                        f"text_len={len(owner_text)} → {result_text[:120]!r}"
+                    )
+                    return {"action": "skip", "reason": "paid_owner_input_consumed"}
             return None
 
         text = str(getattr(event, "text", "") or "")
@@ -1267,25 +1297,24 @@ def _dispatch_to_junior(req: approval.PendingApproval, text: str) -> str:
     return f"queued (gateway send failed): {result.get('error')[:120]}"
 
 
-def _cmd_approve(raw_args: str) -> str:
-    if not _is_caller_owner_via_env():
-        return ""
-    try:
-        rid, extra = _resolve_request(raw_args)
-    except ValueError as exc:
-        return f"PAID: {exc} — usage: /paid-approve <id> [optional override text]"
+def _do_approve(rid: str, override_text: str = "") -> str:
+    """Approve a pending request and dispatch the answer to the junior.
 
+    Returns the operator-facing summary string. Caller is responsible for
+    owner identity verification — used by both /paid-approve slash and
+    Lark/TG button callback paths.
+    """
     req = approval.get(rid)
     if req is None:
         return f"PAID: unknown request id #{rid}"
     if req.status != "pending":
         return f"PAID: #{rid} already {req.status} (resolved at {req.ts_resolved})"
 
-    final_text = extra.strip() or req.draft_answer.strip()
+    final_text = (override_text or "").strip() or (req.draft_answer or "").strip()
     if not final_text:
         return (
             f"PAID: #{rid} has no draft and no override text was given. "
-            f"Try: /paid-approve {rid} <your answer>"
+            f"Use the inline approve flow or /paid-approve {rid} <your answer>."
         )
 
     owner = identity.load_owner()
@@ -1297,14 +1326,8 @@ def _cmd_approve(raw_args: str) -> str:
     return f"PAID: #{rid} approved → {delivery}"
 
 
-def _cmd_reject(raw_args: str) -> str:
-    if not _is_caller_owner_via_env():
-        return ""
-    try:
-        rid, _ = _resolve_request(raw_args)
-    except ValueError as exc:
-        return f"PAID: {exc} — usage: /paid-reject <id>"
-
+def _do_reject(rid: str) -> str:
+    """Reject a pending request. See :func:`_do_approve` for caller contract."""
     req = approval.get(rid)
     if req is None:
         return f"PAID: unknown request id #{rid}"
@@ -1317,6 +1340,185 @@ def _cmd_reject(raw_args: str) -> str:
     delivery = _dispatch_to_junior(req, msg)
     approval.set_status(rid, "rejected", final_text=msg)
     return f"PAID: #{rid} rejected → {delivery}"
+
+
+def _cmd_approve(raw_args: str) -> str:
+    if not _is_caller_owner_via_env():
+        return ""
+    try:
+        rid, extra = _resolve_request(raw_args)
+    except ValueError as exc:
+        return f"PAID: {exc} — usage: /paid-approve <id> [optional override text]"
+    return _do_approve(rid, override_text=extra)
+
+
+def _cmd_reject(raw_args: str) -> str:
+    if not _is_caller_owner_via_env():
+        return ""
+    try:
+        rid, _ = _resolve_request(raw_args)
+    except ValueError as exc:
+        return f"PAID: {exc} — usage: /paid-reject <id>"
+    return _do_reject(rid)
+
+
+# ---------------------------------------------------------------------------
+# Inline approve flow — case 1 (direct) / case 2 (collect-then-send)
+#
+# Problem v1.3.x had: clicking ✅ Approve on a Lark / TG card returned a
+# string asking the owner to type ``/paid-approve <id> <text>``, but
+# (a) that return string is delivered by hermes' synthetic-command
+# reply path which doesn't reliably reach the owner's chat (verified
+# on VPS — 8/8 historical button clicks logged but zero visible
+# response to owner), and (b) even when it does reach, the owner
+# expectation is "click ✅ → it's done" or "click ✅ → ask me what
+# to say". Forcing them to switch to slash command syntax breaks that.
+#
+# This module fixes both:
+#   - all card-click outcomes are pushed via send_dm (not relying on
+#     synthetic-command reply delivery)
+#   - if the request already has a draft, ✅ Approve dispatches it
+#     immediately to the junior (case 1)
+#   - if the request has no draft, ✅ Approve records an "awaiting
+#     input" state for this owner and DMs them an inline prompt; the
+#     owner's NEXT plain-text reply (within 30 min, same owner chat)
+#     becomes the answer (case 2)
+#
+# State is module-level (in-memory only). If hermes restarts mid-flow,
+# the owner clicks ✅ again to re-arm. Acceptable trade-off vs the
+# complexity of persisting a new approval substate.
+# ---------------------------------------------------------------------------
+
+import time as _time
+
+_AWAITING_INPUT_TTL_SEC = 30 * 60  # matches J3 approval timeout default
+_AWAITING_INPUT: dict[tuple[str, str], dict] = {}
+# key:   (owner platform, owner home_chat_id / user_id) — whichever id is
+#        the source.user_id when owner DMs the bot (we store both keys for
+#        Lark where home_chat_id may differ from owner identity user_id).
+# value: {"rid": str, "since_ts": float, "expected_chat_id": str | None}
+
+
+def _awaiting_keys_for_owner(owner) -> list[tuple[str, str]]:
+    """All (platform, id) pairs that should match an owner's own messages
+    in pre_gateway_dispatch — to be safe across Lark home_chat_id vs
+    user_id ambiguity."""
+    if owner is None:
+        return []
+    out: list[tuple[str, str]] = []
+    for ident in getattr(owner, "identities", []) or []:
+        if not isinstance(ident, dict):
+            continue
+        if ident.get("enabled") is False:
+            continue
+        plat = str(ident.get("platform", "")).strip()
+        uid = str(ident.get("user_id", "")).strip()
+        hcid = str(ident.get("home_chat_id", "")).strip()
+        if plat and uid:
+            out.append((plat, uid))
+        if plat and hcid and hcid != uid:
+            out.append((plat, hcid))
+    return out
+
+
+def _record_awaiting_input(rid: str, expected_chat_id: str | None = None) -> None:
+    """Arm the owner-input capture for the owner's preferred identity.
+
+    Indexes by every (platform, id) pair the owner might appear as in
+    inbound events; the consumer pops by whichever key matches the
+    incoming MessageEvent.source.
+    """
+    owner = identity.load_owner()
+    keys = _awaiting_keys_for_owner(owner)
+    if not keys:
+        _safe_log(f"[card] cannot arm awaiting_input for #{rid}: no owner identities")
+        return
+    entry = {
+        "rid": rid,
+        "since_ts": _time.time(),
+        "expected_chat_id": expected_chat_id,
+    }
+    for key in keys:
+        _AWAITING_INPUT[key] = entry
+    _safe_log(f"[card] armed awaiting_input for #{rid} on owner keys={keys}")
+
+
+def _consume_awaiting_input(
+    platform: str, sender_id: str, chat_id: str | None = None,
+) -> str | None:
+    """If this owner has an active awaiting_input slot within TTL, return
+    its rid and clear ALL its keys. Otherwise return None.
+
+    chat_id is checked when present on both sides: only consume when
+    the inbound chat matches the chat where the card was clicked. This
+    keeps a stale awaiting_input from eating an owner's casual reply in
+    some unrelated chat.
+    """
+    key = (platform, sender_id)
+    entry = _AWAITING_INPUT.get(key)
+    if entry is None:
+        return None
+    if _time.time() - entry["since_ts"] > _AWAITING_INPUT_TTL_SEC:
+        # Expired — clear and don't consume.
+        _clear_awaiting_input_keys(entry["rid"])
+        return None
+    expected = entry.get("expected_chat_id")
+    if expected and chat_id and str(expected) != str(chat_id):
+        # Owner replied in a different chat than where they clicked — leave
+        # the slot armed for when they DO reply in the right chat.
+        return None
+    rid = entry["rid"]
+    _clear_awaiting_input_keys(rid)
+    return rid
+
+
+def _clear_awaiting_input_keys(rid: str) -> None:
+    """Remove every key that points to this rid (since we duplicate)."""
+    stale = [k for k, v in _AWAITING_INPUT.items() if v.get("rid") == rid]
+    for k in stale:
+        _AWAITING_INPUT.pop(k, None)
+
+
+def _default_approve_text(req) -> str:
+    """Generic "yes/agree" reply for the empty-draft approve path.
+
+    Picks language by inspecting the junior's question (zh vs en) so the
+    deflection text matches what the junior wrote in. This is reached
+    only when ✅ Approve is clicked on a card where the classifier
+    didn't ground a draft — owner is saying "yes, I agree with the
+    request as stated".
+    """
+    try:
+        lang = decision.detect_lang(req.junior_question or "")
+    except Exception:
+        lang = "zh"
+    return "Approved." if lang == "en" else "可以的。"
+
+
+def _send_owner_inline_message(text: str) -> bool:
+    """Best-effort push a short status message to the owner's preferred
+    identity. Returns True if the underlying send_dm reported success
+    (or fell through to outbound_queue).
+    """
+    owner = identity.load_owner()
+    pref = owner.preferred_identity() if owner else None
+    if pref is None:
+        target = _owner_primary_identity(owner)
+        if target is None:
+            _safe_log(f"[card] cannot push owner notice: no owner identity")
+            return False
+        plat, uid = target
+    else:
+        plat, uid = pref.platform, pref.home_chat_id
+    receive_target = _resolve_owner_send_target(plat, uid)
+    try:
+        result = hermes_io.send_dm(plat, receive_target, text, fallback_to_queue=True)
+    except Exception as exc:
+        _safe_log(f"[card] owner notice send_dm EXC: {exc}")
+        return False
+    if not isinstance(result, dict):
+        return False
+    return bool(result.get("ok") or result.get("queued"))
 
 
 def _unwrap_hermes_context(ctx_str: str) -> str:
@@ -1412,20 +1614,39 @@ def _handle_review_in_pre_gateway(
 def _cmd_card(raw_args: str) -> str:
     """Handle Lark card-button clicks routed by hermes as ``/card <tag> <json>``.
 
-    The feishu adapter creates a synthetic command of the form::
+    The feishu adapter (``gateway/platforms/feishu.py::_handle_card_action_event``)
+    creates a synthetic command of the form::
 
         /card button {"paid_action":"approve","request_id":"abc12345"}
 
-    when the operator clicks one of our approval card's buttons (no
-    ``hermes_action`` key, so it falls through to the generic dispatch).
-    We parse the JSON, find the matching action, and dispatch to the
-    existing ``_cmd_approve`` / ``_cmd_reject`` handlers — preserving a
-    single canonical code path.
+    when the operator clicks one of our approval card's buttons.
 
-    Owner gating: hermes only routes the synthetic command when the
-    button-clicker is an authorised user; ``_is_caller_owner_via_env``
-    re-checks anyway so other plugins / future versions can't accidentally
-    let a non-owner trigger an approve.
+    Why this returns ``""`` instead of a status string
+    ---------------------------------------------------
+    Pre-v1.4.0, this handler returned a status string ("PAID: #rid
+    approved → delivered to ...") relying on hermes to deliver that
+    return value back to the owner's Lark chat. VPS evidence (8/8
+    historical clicks logged but zero visible owner-side response)
+    showed that path is unreliable for synthetic commands. We now
+    always return ``""`` and push every outcome via ``send_dm`` directly.
+
+    Case 1 vs case 2
+    ----------------
+    Click ✅ Approve:
+      - Draft is non-empty (PAID could ground a reply from SOP) → dispatch
+        immediately to the junior; DM the owner with a confirmation.
+      - Draft is empty (J3 out-of-scope / sensitive topic) → arm an
+        "awaiting input" slot for the owner and DM them an inline prompt
+        asking for their reply. The owner's next plain-text message in
+        the same chat (intercepted in :func:`on_pre_gateway_dispatch`)
+        becomes the answer.
+
+    Click ❌ Reject:
+      - Always direct: dispatch the deflection text to the junior and
+        DM the owner with a confirmation.
+
+    Click ✏️ Edit:
+      - Same as approve case 2: arm awaiting input + DM inline prompt.
     """
     if not _is_caller_owner_via_env():
         return ""  # silent for non-owners
@@ -1450,29 +1671,83 @@ def _cmd_card(raw_args: str) -> str:
     if not action or not rid:
         return ""
 
+    req = approval.get(rid)
+    if req is None:
+        _send_owner_inline_message(f"PAID: unknown request id #{rid}")
+        return ""
+    if req.status != "pending":
+        _send_owner_inline_message(
+            f"PAID: #{rid} already {req.status} (resolved at {req.ts_resolved})."
+        )
+        return ""
+
+    junior_label = (req.counterparty_display or req.counterparty_user_id or "the sender")
+
     if action == "approve":
-        # Empty-draft handling: hard-blacklist topics (salary / equity / etc.)
-        # come through with no classifier-generated draft, since we don't want
-        # the LLM speculating on sensitive content. Clicking ✅ in that case
-        # has nothing to send. Redirect the owner to the slash form with an
-        # explicit override message rather than letting them click into a
-        # silent failure.
-        req = approval.get(rid)
-        if req is not None and req.status == "pending" and not (req.draft_answer or "").strip():
-            _safe_log(f"[card] approve clicked on #{rid} but draft empty — asking owner for override")
-            return (
-                f"PAID #{rid}: this is a sensitive-topic request and PAID didn't draft "
-                f"an answer. To approve, reply with your answer:\n"
-                f"  /paid-approve {rid} <your reply text>\n"
-                f"Or reject with:\n"
-                f"  /paid-reject {rid}"
-            )
-        return _cmd_approve(rid)
+        # ✅ Approve always means "yes, agree" — dispatch immediately to
+        # the junior. If the classifier didn't draft a reply (J3 cases
+        # where SOP doesn't cover), fall back to a language-matched
+        # default agreement ("可以的" / "Approved") so the click ALWAYS
+        # does something useful. Owner can use ✏️ Reply for a custom
+        # answer instead.
+        override = ""
+        if not (req.draft_answer or "").strip():
+            override = _default_approve_text(req)
+        result_text = _do_approve(rid, override_text=override)
+        _send_owner_inline_message(f"✅ #{rid} approved.\n{result_text}")
+        _safe_log(
+            f"[card] approve #{rid} "
+            f"({'draft' if not override else 'default-agree'}) → "
+            f"{result_text[:120]!r}"
+        )
+        return ""
+
+    if action in ("reply", "edit"):
+        # ✏️ Reply (legacy alias: "edit") — the only path that asks the
+        # owner to type a custom response. Arms an in-memory slot
+        # consumed by on_pre_gateway_dispatch when owner's next plain
+        # text arrives.
+        _record_awaiting_input(rid)
+        _send_owner_inline_message(
+            f"✏️ #{rid} 等你输入答复给 {junior_label}（30 分钟内有效）。\n"
+            f"\n"
+            f"⚠️ 接下来你在本聊天发的下一条普通文字会作为答复转给 ta。\n"
+            f"如果暂时不想回，发 /paid-cancel-input 取消，"
+            f"或发 /paid-reject {rid} 拒绝。"
+        )
+        _safe_log(f"[card] reply #{rid} — armed awaiting_input")
+        return ""
+
     if action == "reject":
-        return _cmd_reject(rid)
+        result_text = _do_reject(rid)
+        _send_owner_inline_message(f"❌ #{rid} rejected.\n{result_text}")
+        _safe_log(f"[card] reject #{rid} → {result_text[:120]!r}")
+        return ""
 
     _safe_log(f"[card] unknown paid_action={action!r} for #{rid}")
     return ""
+
+
+def _cmd_paid_cancel_input(raw_args: str) -> str:
+    """``/paid-cancel-input`` — clear any pending awaiting_input slot for
+    the calling owner.
+
+    Useful when the owner armed inline input by clicking ✅ / ✏️ but
+    decided not to reply right now — they don't want their next casual
+    message accidentally captured as the answer.
+    """
+    if not _is_caller_owner_via_env():
+        return ""
+    owner = identity.load_owner()
+    keys = _awaiting_keys_for_owner(owner)
+    rids_cleared: set[str] = set()
+    for key in keys:
+        entry = _AWAITING_INPUT.pop(key, None)
+        if entry is not None:
+            rids_cleared.add(entry["rid"])
+    if not rids_cleared:
+        return "PAID: no pending input."
+    return f"PAID: cancelled pending input for #{', #'.join(sorted(rids_cleared))}"
 
 
 def _cmd_status(raw_args: str) -> str:
@@ -1587,6 +1862,10 @@ def register(ctx) -> None:
             description="Show full state of one PAID request.",
             args_hint="<id>",
         )
+        ctx.register_command(
+            "paid-cancel-input", _cmd_paid_cancel_input,
+            description="Cancel a pending inline-input slot (after clicking ✅/✏️ on a card).",
+        )
         # `/card` intercepts hermes feishu adapter's synthetic command for
         # interactive-card button clicks. Lark sends button click events as
         # ``/card button {json}``; we parse and route to approve/reject.
@@ -1609,7 +1888,7 @@ def register(ctx) -> None:
         # don't actually exist in hermes — caught in second dogfood.)
 
         _safe_log("hooks: pre_llm_call, post_llm_call, pre_gateway_dispatch")
-        _safe_log("commands: /paid-pending /paid-approve /paid-reject /paid-status /card")
+        _safe_log("commands: /paid-pending /paid-approve /paid-reject /paid-status /paid-cancel-input /card")
         _safe_log("pre_gateway_dispatch routes: /review /r (paid_review skill, cp-side)")
     else:
         _safe_log("hooks: pre_llm_call, post_llm_call (commands skipped — hermes < 0.11)")
