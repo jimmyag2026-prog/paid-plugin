@@ -99,7 +99,7 @@ def test_check_capability_reports_minimum_required():
 # --------------------------------------------------------------------------
 
 
-def test_register_good_ctx_registers_all_5_commands(paid_tmp, monkeypatch):
+def test_register_good_ctx_registers_all_commands(paid_tmp, monkeypatch):
     # Stub _alert_owner so we don't try real send_dm.
     monkeypatch.setattr(_plug, "_alert_owner", lambda **kw: None)
     ctx = _GoodCtx()
@@ -108,9 +108,10 @@ def test_register_good_ctx_registers_all_5_commands(paid_tmp, monkeypatch):
     # still register; on _GoodCtx all 3 land).
     assert "pre_llm_call" in ctx.hooks_registered
     assert "post_llm_call" in ctx.hooks_registered
-    # All 5 commands.
+    # All 7 commands (v1.3.2 added /review + /r for paid_review skill).
     assert set(ctx.commands_registered) == {
-        "paid-pending", "paid-approve", "paid-reject", "paid-status", "card"
+        "paid-pending", "paid-approve", "paid-reject", "paid-status",
+        "card", "review", "r",
     }
 
 
