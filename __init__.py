@@ -20,11 +20,13 @@ Owner messages bypass the J2 pipeline and use Hermes default behaviour.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -729,6 +731,11 @@ def on_pre_llm_call(**kwargs) -> dict | None:
         if not sender_id or not platform:
             return None
 
+        # Defense in depth: pre_gateway_dispatch may not have fired (older
+        # hermes / unusual route). Try again from here on TG events.
+        if platform == "telegram":
+            _ensure_telegram_callback_registered()
+
         if identity.is_owner(platform, sender_id):
             _safe_log(f"[pre_llm] owner pass-through platform={platform} sender={sender_id}")
             return None
@@ -1085,6 +1092,13 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
             plat_val = getattr(source, "platform", None)
             platform = getattr(plat_val, "value", str(plat_val)) if plat_val else ""
             sender_id = str(getattr(source, "user_id", "") or "")
+
+        # First TG inbound after gateway boot: attach our paid_* button
+        # callback handler to the live PTB Application. Idempotent — only
+        # the first call does real work.
+        if platform == "telegram":
+            _ensure_telegram_callback_registered()
+
         if platform and sender_id and identity.is_owner(platform, sender_id):
             # Owner-side messages normally pass through to hermes / Claude.
             # BUT: if the owner clicked ✅ / ✏️ on a card and we armed
@@ -1301,8 +1315,11 @@ def _do_approve(rid: str, override_text: str = "") -> str:
     """Approve a pending request and dispatch the answer to the junior.
 
     Returns the operator-facing summary string. Caller is responsible for
-    owner identity verification — used by both /paid-approve slash and
-    Lark/TG button callback paths.
+    owner identity verification — used by three caller paths:
+      - /paid-approve slash command (env-gated)
+      - Lark card-button click via _cmd_card
+      - TG inline-keyboard callback (gated by query.from_user.id against
+        owner.json)
     """
     req = approval.get(rid)
     if req is None:
@@ -1371,22 +1388,22 @@ def _cmd_reject(raw_args: str) -> str:
 # reply path which doesn't reliably reach the owner's chat (verified
 # on VPS — 8/8 historical button clicks logged but zero visible
 # response to owner), and (b) even when it does reach, the owner
-# expectation is "click ✅ → it's done" or "click ✅ → ask me what
-# to say". Forcing them to switch to slash command syntax breaks that.
+# expectation is "click ✅ → it's done" or "click ✏️ Reply → ask me
+# what to say". Forcing them to switch to slash command syntax breaks
+# that.
 #
 # This module fixes both:
 #   - all card-click outcomes are pushed via send_dm (not relying on
 #     synthetic-command reply delivery)
-#   - if the request already has a draft, ✅ Approve dispatches it
-#     immediately to the junior (case 1)
-#   - if the request has no draft, ✅ Approve records an "awaiting
-#     input" state for this owner and DMs them an inline prompt; the
-#     owner's NEXT plain-text reply (within 30 min, same owner chat)
-#     becomes the answer (case 2)
+#   - ✅ Approve always dispatches immediately: with the draft if there
+#     is one, else with a language-matched default agreement
+#   - ✏️ Reply records an "awaiting input" state for this owner and DMs
+#     them an inline prompt; the owner's NEXT plain-text reply (within
+#     30 min, same owner chat) becomes the answer
 #
 # State is module-level (in-memory only). If hermes restarts mid-flow,
-# the owner clicks ✅ again to re-arm. Acceptable trade-off vs the
-# complexity of persisting a new approval substate.
+# the owner clicks ✏️ Reply again to re-arm. Acceptable trade-off vs
+# the complexity of persisting a new approval substate.
 # ---------------------------------------------------------------------------
 
 import time as _time
@@ -1609,6 +1626,253 @@ def _handle_review_in_pre_gateway(
 
     _safe_log(f"[review pre_gw] handled /review for cp={cp.cp_id} reply_len={len(reply_text)}")
     return {"action": "skip", "reason": "paid_review_routed"}
+
+
+# ---------------------------------------------------------------------------
+# Telegram inline-keyboard button callback routing (M3.5.C)
+#
+# Goal: owner clicks ✅ Approve / ❌ Reject on the TG approval card and PAID
+# actually acts on it — instead of falling back to ``/paid-approve <id>``
+# slash command, which was the v1.2 UX gap (5/4 dogfood: buttons rendered
+# but click did nothing).
+#
+# Approach (design 08 §1 path C): lazy-grab the live ``adapter._app``
+# (python-telegram-bot Application) on first hook fire for platform=telegram
+# and add our own ``CallbackQueryHandler`` filtered to ``^paid_``.
+#
+# Trade-offs:
+#   - We don't fork hermes or wait on upstream. Same compatibility bet as
+#     ``send_telegram_card`` which already reaches into ``adapter._bot``.
+#   - We register in PTB ``group=-1`` so we run BEFORE hermes' catch-all
+#     ``_handle_callback_query`` (group 0). After we handle a paid_* event,
+#     the catch-all still runs but matches no prefix branch and no-ops.
+#   - Registration is double-checked-lock idempotent. Failure is loud
+#     (fatal_alert + log) — never silent, per memory feedback_im_bot_api_traps.
+#   - Approve/reject dispatch off the event loop via run_in_executor so the
+#     blocking ``send_dm`` (which uses ``fut.result()`` on the same loop)
+#     can't deadlock.
+# ---------------------------------------------------------------------------
+
+_CALLBACK_LOCK = threading.Lock()
+_callback_registered: dict[str, bool] = {"telegram": False}
+
+
+def _ensure_telegram_callback_registered() -> None:
+    """Best-effort, idempotent. Attach PAID's CallbackQueryHandler to the
+    live TG adapter so paid_* button clicks route back to PAID.
+
+    Called on every TG-platform pre_llm_call / pre_gateway_dispatch — the
+    first successful call wins; subsequent calls are O(1) flag check.
+
+    Failures (no adapter, no _app, python-telegram-bot missing, add_handler
+    raises) set the flag anyway and emit a fatal_alert so the operator
+    sees that buttons WON'T work this run, and PAID falls back to slash
+    commands. We don't keep retrying because retrying a broken import on
+    every inbound message is just noise.
+    """
+    if _callback_registered.get("telegram"):
+        return
+    with _CALLBACK_LOCK:
+        if _callback_registered.get("telegram"):
+            return
+
+        # Locate live adapter
+        try:
+            adapter = hermes_io._get_gateway_adapter("telegram")
+        except hermes_io.SendDmError:
+            # Gateway not ready yet OR telegram adapter not loaded — keep
+            # retrying on subsequent hooks (don't set the flag).
+            return
+        except Exception as exc:
+            _safe_log(f"[tg-callback] adapter lookup EXC: {exc}")
+            return
+
+        app = getattr(adapter, "_app", None)
+        if app is None:
+            # Adapter exists but PTB Application not built yet (race between
+            # adapter constructor and connect()). Retry next hook.
+            return
+
+        # Locate PTB CallbackQueryHandler — module is vendored with hermes.
+        try:
+            from telegram.ext import CallbackQueryHandler  # type: ignore
+        except Exception as exc:
+            _callback_registered["telegram"] = True  # don't keep retrying a broken import
+            detail = (
+                f"python-telegram-bot CallbackQueryHandler import failed: {exc}. "
+                f"TG button clicks will NOT route to PAID this run; use "
+                f"/paid-approve / /paid-reject slash commands. Upgrade hermes "
+                f"or its python-telegram-bot dep."
+            )
+            _safe_log(f"[tg-callback] ⚠️  {detail}")
+            try:
+                _alert_owner(reason="paid_tg_callback_register", detail=detail)
+            except Exception:
+                pass
+            return
+
+        try:
+            app.add_handler(
+                CallbackQueryHandler(_on_paid_telegram_callback, pattern=r"^paid_"),
+                group=-1,
+            )
+            _callback_registered["telegram"] = True
+            _safe_log(
+                "[tg-callback] registered paid_* CallbackQueryHandler on "
+                "adapter._app (group=-1 — runs before hermes catch-all)"
+            )
+        except Exception as exc:
+            _callback_registered["telegram"] = True
+            detail = (
+                f"add_handler raised: {exc}. TG button clicks will NOT route "
+                f"to PAID this run; use slash commands instead."
+            )
+            _safe_log(f"[tg-callback] ⚠️  {detail}")
+            try:
+                _alert_owner(reason="paid_tg_callback_register", detail=detail)
+            except Exception:
+                pass
+
+
+def _parse_paid_callback_data(data: str) -> tuple[str, str] | None:
+    """Parse ``paid_<action>:<rid>`` callback_data. Returns (action, rid)
+    or None for malformed input.
+
+    Whitelisted actions only: approve / reject / reply / edit (legacy
+    alias for reply, accepted for cards rendered before v1.4 rename) /
+    opt. Anything else is treated as malformed so a future prefix
+    collision can't accidentally fire approval logic.
+    """
+    if not data or not data.startswith("paid_"):
+        return None
+    body = data[len("paid_"):]
+    if ":" not in body:
+        return None
+    action, rid = body.split(":", 1)
+    action = action.strip().lower()
+    rid = rid.strip()
+    if not action or not rid:
+        return None
+    if action not in {"approve", "reject", "reply", "edit", "opt"}:
+        return None
+    return action, rid
+
+
+async def _on_paid_telegram_callback(update, context) -> None:
+    """PTB CallbackQueryHandler for paid_* inline-keyboard buttons.
+
+    Owner-gates by ``query.from_user.id`` against owner.json identities —
+    independent of the env-var gating used for slash commands.
+
+    Acks the click immediately (``query.answer()``) so the TG spinner
+    clears, then runs the actual approve/reject dispatch off the event
+    loop via ``run_in_executor`` to avoid deadlocking on hermes_io.send_dm.
+    On completion, edits the original card to show the resolution and
+    removes the inline keyboard.
+    """
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    data = query.data
+    user_id = str(getattr(query.from_user, "id", ""))
+
+    # Owner check — independent from slash command env-var path.
+    if not identity.is_owner("telegram", user_id):
+        try:
+            await query.answer(text="⛔ Not authorized.")
+        except Exception:
+            pass
+        _safe_log(f"[tg-callback] unauthorized click data={data!r} tg_user={user_id}")
+        return
+
+    parsed = _parse_paid_callback_data(data)
+    if parsed is None:
+        _safe_log(f"[tg-callback] malformed data={data!r}")
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+    action, rid = parsed
+
+    # Ack first so the TG client spinner clears even on slow paths.
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    # Dispatch the sync handler off-loop to avoid deadlocking on
+    # hermes_io.send_dm, which uses run_coroutine_threadsafe + .result()
+    # on the same gateway loop we're running on.
+    loop = asyncio.get_event_loop()
+    try:
+        if action == "approve":
+            # Mirrors Lark _cmd_card: direct dispatch, with a language-
+            # matched default agreement when the classifier didn't ground
+            # a draft. ✏️ Reply is the path for custom answers.
+            req_obj = approval.get(rid)
+            override = ""
+            if req_obj is not None and not (req_obj.draft_answer or "").strip():
+                override = _default_approve_text(req_obj)
+            result_text = await loop.run_in_executor(
+                None, lambda: _do_approve(rid, override_text=override)
+            )
+        elif action == "reject":
+            result_text = await loop.run_in_executor(None, lambda: _do_reject(rid))
+        elif action in ("reply", "edit"):
+            # ✏️ Reply ("edit" still accepted as legacy alias for cards
+            # rendered before v1.4 rename). Arm awaiting_input scoped to
+            # this owner's TG chat; on_pre_gateway_dispatch consumes the
+            # next plain-text inbound from the same chat.
+            expected_chat_id = (
+                str(getattr(query.message, "chat_id", "") or "") or None
+            )
+            _record_awaiting_input(rid, expected_chat_id=expected_chat_id)
+            junior_label = "the requester"
+            req_obj = approval.get(rid)
+            if req_obj is not None:
+                junior_label = (
+                    req_obj.counterparty_display
+                    or req_obj.counterparty_user_id
+                    or junior_label
+                )
+            result_text = (
+                f"✏️ #{rid} 等你输入答复给 {junior_label}（30 分钟内有效）。\n"
+                f"接下来你在本聊天发的下一条普通文字会作为答复转给 ta。\n"
+                f"发 /paid-cancel-input 取消，或 /paid-reject {rid} 拒绝。"
+            )
+        else:
+            # _parse_paid_callback_data whitelists; this branch is defensive.
+            _safe_log(f"[tg-callback] unhandled action={action!r}")
+            return
+    except Exception as exc:
+        _safe_log(f"[tg-callback] dispatch EXC action={action} rid={rid}: {exc}")
+        result_text = f"PAID: #{rid} — internal error while handling {action}: {exc}"
+
+    _safe_log(f"[tg-callback] handled action={action} rid={rid} → {result_text[:120]!r}")
+
+    # Update the card to reflect resolution + remove keyboard. Fall back to
+    # a fresh message if edit fails (e.g. message > 48h old, original
+    # deleted).
+    original_text = ""
+    try:
+        original_text = (query.message.text or "")
+    except Exception:
+        pass
+    new_text = (
+        (original_text + "\n\n— — —\n" if original_text else "")
+        + result_text
+    )
+    try:
+        await query.edit_message_text(text=new_text, reply_markup=None)
+    except Exception as exc:
+        _safe_log(f"[tg-callback] edit_message_text failed: {exc}; sending fallback")
+        try:
+            chat_id = query.message.chat_id if query.message else user_id
+            await context.bot.send_message(chat_id=chat_id, text=result_text)
+        except Exception as exc2:
+            _safe_log(f"[tg-callback] fallback send_message also failed: {exc2}")
 
 
 def _cmd_card(raw_args: str) -> str:
