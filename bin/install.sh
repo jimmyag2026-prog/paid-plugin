@@ -38,3 +38,7 @@ echo "     (edit ~/.hermes/paid/persona.md and sop.md after this)"
 echo "  2. hermes plugins enable paid-v1"
 echo "  3. hermes gateway restart"
 echo "  4. tail -20 ~/.hermes/paid/plugin_runtime.log   # verify"
+echo
+echo "Optional (review skill — recommended for v0.1 dogfood):"
+echo "  5. $SRC/bin/install_review_cron.sh        # hourly TTL sweep (R6)"
+echo "  6. python3 $SRC/scripts/doctor.py         # health-check post-install"

@@ -17,3 +17,6 @@ echo "Done. Run 'hermes gateway restart' to drop hooks."
 echo
 echo "Your runtime state at ~/.hermes/paid/ is preserved."
 echo "If you want a clean slate: rm -rf ~/.hermes/paid"
+echo
+echo "If you installed the review-skill sweep cron, also run:"
+echo "  $(dirname "$0")/uninstall_review_cron.sh"
