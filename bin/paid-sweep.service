@@ -1,0 +1,10 @@
+[Unit]
+Description=PAID — sweep stale pending approvals (auto-defer >30 min)
+After=hermes-gateway.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.hermes/plugins/paid-v1
+ExecStart=/home/paid/.hermes/hermes-agent/venv/bin/python bin/sweep_pending.py
+StandardOutput=append:%h/.hermes/paid/sweep_pending.log
+StandardError=append:%h/.hermes/paid/sweep_pending.log
