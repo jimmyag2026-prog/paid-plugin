@@ -110,9 +110,11 @@ def test_register_good_ctx_registers_all_commands(paid_tmp, monkeypatch):
     assert "post_llm_call" in ctx.hooks_registered
     # v1.3.4: /review + /r moved to pre_gateway_dispatch (cp identity
     # requires event.source, which slash dispatcher doesn't pass).
-    # 5 owner commands remain.
+    # v1.4.0: + /paid-cancel-input (clears an armed awaiting_input slot
+    # after the owner clicked ✅/✏️ on a card but doesn't want to type).
     assert set(ctx.commands_registered) == {
-        "paid-pending", "paid-approve", "paid-reject", "paid-status", "card",
+        "paid-pending", "paid-approve", "paid-reject", "paid-status",
+        "paid-cancel-input", "card",
     }
 
 

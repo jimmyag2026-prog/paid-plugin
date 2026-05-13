@@ -5,14 +5,17 @@ platform-native payload. Centralising them here keeps __init__.py focused
 on hook glue and dispatch logic.
 
 Conventions:
-  - Buttons render on every platform. CLICK CALLBACK is NOT routed back
-    to PAID on TG / Slack (hermes does not expose a plugin callback API
-    — see design/08 §1). Buttons are visual; owner operates via slash
-    commands. Lark's button click DOES round-trip via hermes's internal
-    ``_handle_card_action_event`` → ``/card`` slash command.
-  - Every card includes a footer with the owner-facing instructions
-    (slash command syntax) — pilots discover the operation path even
-    when buttons don't respond.
+  - Buttons render on every platform.
+  - **Lark** (v1.4.0+): ✅/✏️/❌ clicks fully wired. ✅ with draft →
+    direct dispatch; ✅ / ✏️ without draft → owner gets inline
+    "please type your reply" prompt; ❌ → direct deflection. All
+    outcomes pushed via send_dm (not relying on hermes's synthetic-
+    command reply path, which empirically doesn't deliver to chat).
+  - **Telegram** click routing: see `feat/tg-button-callback` PR (M3.5.C).
+    Without that, TG buttons are visual-only and owner uses slash
+    commands.
+  - **Slack** click routing: planned v1.4.x (M3.5.C-slack), pending a
+    live Slack workspace for honest smoke.
 """
 
 from __future__ import annotations
@@ -30,7 +33,7 @@ from .card_spec import ApprovalCardSpec
 def format_lark(spec: ApprovalCardSpec) -> dict:
     """Build Lark interactive-card JSON.
 
-    Buttons embed ``paid_action="approve"/"edit"/"reject"`` inside ``value``
+    Buttons embed ``paid_action="approve"/"reply"/"reject"`` inside ``value``
     so we can detect "this is PAID's card, not hermes's tool-approval card"
     downstream. Hermes's adapter keys off the literal string
     ``hermes_action`` to mean "this is hermes's own approval", so we use a
@@ -47,13 +50,24 @@ def format_lark(spec: ApprovalCardSpec) -> dict:
     draft_for_display = (
         spec.draft if spec.has_draft
         else "_(none — PAID couldn't ground a draft from your SOP. "
-             f"Type your own reply: `/paid-approve {spec.request_id} &lt;your text&gt;`)_"
+             "Click ✅ Approve to send a default agreement, ✏️ Reply to "
+             "type your own, or ❌ Reject to deflect.)_"
     )
 
-    # All three buttons render every time. v0.1 doesn't route Lark button
-    # clicks back to this branch when there's no draft to send — the click
-    # would currently bounce with a 'no draft' error from the slash-command
-    # handler. The note block below tells the operator how to recover.
+    # All three buttons render every time and as of v1.4.0 every click
+    # routes end-to-end on Lark:
+    #   - ✅ Approve  has_draft=True   → dispatch the draft to junior
+    #   - ✅ Approve  has_draft=False  → dispatch a language-matched
+    #                                    default agreement ("可以的" /
+    #                                    "Approved") so the click is
+    #                                    always one-step
+    #   - ✏️ Reply                    → arm awaiting_input; owner's next
+    #                                    plain-text reply in this chat is
+    #                                    forwarded to junior (only path
+    #                                    that asks for owner input)
+    #   - ❌ Reject                   → direct deflection to junior
+    # See __init__.py::_cmd_card for the dispatch logic and
+    # _AWAITING_INPUT for the reply-capture state.
     buttons: list[dict] = [
         {
             "tag": "button",
@@ -63,8 +77,8 @@ def format_lark(spec: ApprovalCardSpec) -> dict:
         },
         {
             "tag": "button",
-            "text": {"tag": "plain_text", "content": "✏️ Edit"},
-            "value": {"paid_action": "edit", "request_id": spec.request_id},
+            "text": {"tag": "plain_text", "content": "✏️ Reply"},
+            "value": {"paid_action": "reply", "request_id": spec.request_id},
         },
         {
             "tag": "button",
@@ -75,13 +89,12 @@ def format_lark(spec: ApprovalCardSpec) -> dict:
     ]
 
     note_content = (
-        "Tip: to override the draft instead of sending it as-is, reply "
-        f"/paid-approve {spec.request_id} &lt;your text&gt;"
+        "✅ sends the draft to the junior. ✏️ Reply lets you type a "
+        "custom answer instead. ❌ Reject deflects to you directly."
         if spec.has_draft else
-        f"⚠️ No draft was generated (PAID couldn't ground a reply from your "
-        f"SOP). The ✅ button alone won't send anything — type your own "
-        f"reply with /paid-approve {spec.request_id} &lt;your text&gt;, or "
-        f"tap ❌ Reject to deflect to you."
+        "⚠️ PAID couldn't draft a reply from your SOP. ✅ Approve sends "
+        "a default agreement (e.g. \"可以的\"). ✏️ Reply lets you type "
+        "a custom answer. ❌ Reject deflects to you directly."
     )
 
     return {
@@ -203,8 +216,8 @@ def format_telegram(spec: ApprovalCardSpec) -> dict:
             "callback_data": f"paid_approve:{spec.request_id}",
         },
         {
-            "text": "✏️ Edit",
-            "callback_data": f"paid_edit:{spec.request_id}",
+            "text": "✏️ Reply",
+            "callback_data": f"paid_reply:{spec.request_id}",
         },
         {
             "text": "❌ Reject",
@@ -299,9 +312,9 @@ def format_slack(spec: ApprovalCardSpec) -> dict:
         },
         {
             "type": "button",
-            "text": {"type": "plain_text", "text": "✏️ Edit", "emoji": True},
+            "text": {"type": "plain_text", "text": "✏️ Reply", "emoji": True},
             "value": spec.request_id,
-            "action_id": "paid_edit",
+            "action_id": "paid_reply",
         },
         {
             "type": "button",
