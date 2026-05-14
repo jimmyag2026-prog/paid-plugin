@@ -148,9 +148,13 @@ class ImageBackend(IngestBackend):
                 backend=self.name,
                 source=source,
                 errors=[
-                    "tesseract extracted 0 chars — image may have no "
-                    "readable text or contrast too low. Try a Vision LLM "
-                    "(future v1.6 fallback)."
+                    f"tesseract extracted 0 chars (langs={_default_langs()}) — "
+                    "image may have no readable text, contrast too low, OR "
+                    "the language pack is wrong. Override via env: "
+                    "PAID_OCR_LANGS=eng (English only), jpn+eng, kor+eng, "
+                    "fra+eng, etc. Install lang packs with "
+                    "`apt install tesseract-ocr-<lang>`. "
+                    "(Vision-LLM fallback planned for v1.6.)"
                 ],
             )
 

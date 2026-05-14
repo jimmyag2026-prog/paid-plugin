@@ -273,14 +273,18 @@ def classify_routing(event: Any, text: str = "") -> str:
     """Return one of:
       ``"p2p"`` — DM; pre_gateway_dispatch should proceed as before.
       ``"group_disabled"`` — group not configured / disabled; drop.
-      ``"group_review"`` — group enabled in review-only mode; only
-            /review-prefixed messages and active-session replies are
-            allowed. Caller still has to check active-session.
-      ``"group_everyday"`` — enabled in everyday mode; let dispatch
-            proceed normally for now (Phase 6 reserves; Phase 6.x
-            wires the actual Claude flow).
-      ``"group_both"`` — enabled in both modes; treat as everyday but
-            still notice /review.
+      ``"group_review"`` — review-only group AND the message starts with
+            a recognized review/paid command. Caller can route directly.
+      ``"group_review_strict"`` — review-only group AND the message is
+            NOT a command. Caller MUST verify the sender has an active
+            review session before letting through; otherwise drop.
+            (v1.5.1 fix to audit Critical #5 — previously the routing
+            layer let every non-command group message fall through to
+            P2P logic, which made the bot reply to everyday chatter in
+            "review-only" groups.)
+      ``"group_everyday"`` — enabled in everyday mode (reserved v1.6+;
+            Phase 6 drops non-command chatter via caller-side gate).
+      ``"group_both"`` — enabled in both modes (also reserved).
     """
     if classify_chat(event) != "group":
         return "p2p"
@@ -295,12 +299,15 @@ def classify_routing(event: Any, text: str = "") -> str:
         return "group_disabled"
 
     if cfg.mode == "review-only":
-        # Only /review or active-session traffic should proceed. Active-session
-        # check happens in caller (needs counterparty lookup); here we only
-        # gate the prefix.
-        if text and _REVIEW_CMD_RE.match(text.lstrip()):
+        stripped = (text or "").lstrip()
+        if stripped and (
+            _REVIEW_CMD_RE.match(stripped) or stripped.startswith("/paid-")
+        ):
             return "group_review"
-        return "group_review"
+        # Non-command message in review-only group. Caller must verify
+        # the sender has an active review session (this layer can't —
+        # it has no counterparty context). See on_pre_gateway_dispatch.
+        return "group_review_strict"
     if cfg.mode == "everyday":
         return "group_everyday"
     if cfg.mode == "both":

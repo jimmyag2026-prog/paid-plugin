@@ -267,12 +267,12 @@ def test_routing_group_review_only_with_review_command():
     assert group_routing.classify_routing(e, text="/r quick check") == "group_review"
 
 
-def test_routing_group_review_only_drops_non_review_chatter():
-    """Phase 6 contract: in review-only mode, everyday chatter still returns
-    'group_review' as the routing decision, and caller is expected to check
-    whether the message belongs to an active session (otherwise drop).
-    classify_routing itself isn't responsible for the active-session check
-    — that lives in pre_gateway_dispatch."""
+def test_routing_group_review_only_returns_strict_for_chatter():
+    """v1.5.1 (audit Critical #5): in review-only mode, non-command messages
+    return 'group_review_strict' so the caller (pre_gateway_dispatch) MUST
+    verify the sender has an active review session before letting them
+    through. /review and /paid- prefix → 'group_review' (caller routes
+    directly)."""
     group_routing.save_group_config(group_routing.GroupConfig(
         group_key="feishu_oc_rev2",
         platform="feishu",
@@ -281,7 +281,9 @@ def test_routing_group_review_only_drops_non_review_chatter():
         mode="review-only",
     ))
     e = _make_event(chat_type="group", chat_id="oc_rev2")
-    assert group_routing.classify_routing(e, text="lunch?") == "group_review"
+    assert group_routing.classify_routing(e, text="lunch?") == "group_review_strict"
+    assert group_routing.classify_routing(e, text="/review draft") == "group_review"
+    assert group_routing.classify_routing(e, text="/paid-status") == "group_review"
 
 
 def test_routing_group_everyday_mode():
