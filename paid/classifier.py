@@ -85,7 +85,7 @@ You MUST return a JSON object with exactly these keys and types:
   "topic":                 string,         // short topic label, e.g. "vesting", "logistics"
   "stakes":                "low"|"medium"|"high",
   "in_scope":              boolean,        // true ONLY if topic clearly matches counterparty.topics_allowed
-  "is_blacklisted":        boolean,        // true if topic matches counterparty.topics_always_escalate or is sensitive (legal/financial/HR/equity)
+  "is_blacklisted":        boolean,        // true ONLY if topic explicitly matches counterparty.topics_always_escalate (owner controls escalation scope via cp profile)
   "confidence":            number,         // 0.0..1.0, how sure you are about the classification
   "needs_retrieval":       boolean,        // true if more SOP/web context would help
   "suggested_queries":     [string, ...],  // up to 3 short search strings, [] if none
