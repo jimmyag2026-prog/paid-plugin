@@ -83,7 +83,12 @@ def test_cancel_with_no_active_session_friendly_reject(paid_tmp):
     out = _plug._maybe_route_to_review_skill(cp, "/review cancel", {})
     assert out is not None
     ctx = out["context"]
-    assert "没有进行中的 review" in ctx
+    # v1.5.3 i18n: English-only input ("/review cancel") → en reply;
+    # accept either lang variant since reply lang now depends on input.
+    assert (
+        "没有进行中的 review" in ctx
+        or "have an active review session" in ctx
+    ), f"unexpected reply: {ctx!r}"
     # Must NOT touch identity (no active to clear)
     assert "active_review_session" not in dir(cp) or cp.active_review_session == ""
 
@@ -132,8 +137,14 @@ def test_review_with_active_session_refused(paid_tmp):
         cp, "/review another topic", {},
     )
     assert out is not None
-    assert "已有进行中的 review" in out["context"]
-    assert "sid_existing" in out["context"]
+    ctx = out["context"]
+    # v1.5.3 i18n: English input → English reply (or zh for CJK input);
+    # accept either since lang is auto-detected.
+    assert (
+        "已有进行中的 review" in ctx
+        or "already have an active review session" in ctx
+    ), f"unexpected reply: {ctx!r}"
+    assert "sid_existing" in ctx
 
 
 def test_bare_review_command_asks_for_subject(paid_tmp, monkeypatch):

@@ -521,12 +521,32 @@ def _maybe_route_to_review_skill(cp, user_message: str,
         or starts_just_r
     )
 
-    # ---- Path 1: /review cancel ----
-    if text_lower in ("/review cancel", "/r cancel"):
+    # v1.5.3 fix #5: accept common cancel synonyms — users typed close/stop/
+    # abort/end in live test and got new sessions opened with those as
+    # content. Also accept the "/r" short variants for consistency.
+    _CANCEL_VARIANTS = {
+        "/review cancel", "/review close", "/review stop",
+        "/review abort", "/review end", "/review exit", "/review quit",
+        "/r cancel", "/r close", "/r stop",
+        "/r abort", "/r end", "/r exit", "/r quit",
+    }
+
+    # v1.5.3: detect lang from inbound for cp-facing reply strings.
+    try:
+        from paid_review.i18n import detect_lang as _detect_lang
+        from paid_review.i18n import t as _t
+        _lang = _detect_lang(text)
+    except Exception:
+        _detect_lang = None
+        _t = None
+        _lang = "zh"
+
+    # ---- Path 1: /review cancel (+ synonyms) ----
+    if text_lower.strip() in _CANCEL_VARIANTS:
         if not has_active:
             return _wrap_reply_for_hermes(
-                "你目前没有进行中的 review session 可以取消。"
-                "发 /review <subject> 开新一轮。"
+                _t("cancel_no_active", _lang) if _t else
+                "你目前没有进行中的 review session 可以取消。发 /review <subject> 开新一轮。"
             )
         try:
             from paid_review import api as _review_api
@@ -544,23 +564,26 @@ def _maybe_route_to_review_skill(cp, user_message: str,
         except Exception:
             pass
         return _wrap_reply_for_hermes(
+            _t("cancel_done", _lang, detail=msg) if _t else
             f"已关闭，发 /review <subject> 开新一轮。\n\n{msg}"
         )
 
     # ---- Path 2: /review <subject> or /r <subject> ----
-    if is_review_cmd and not text_lower.startswith("/review cancel"):
+    if is_review_cmd and text_lower.strip() not in _CANCEL_VARIANTS:
         if has_active:
             return _wrap_reply_for_hermes(
-                f"你已有进行中的 review session: {cp.active_review_session}。"
-                "先 /review cancel 再开新的。"
+                _t("review_already_active", _lang, sid=cp.active_review_session) if _t else
+                f"你已有进行中的 review session: {cp.active_review_session}。先 /review cancel 再开新的。"
             )
-        # Strip command prefix
+        # Strip command prefix (v1.5.3 also tolerates CJK directly after,
+        # e.g. `/review看一下` → "看一下")
         if text_lower.startswith("/review"):
             initial = text[len("/review"):].lstrip(" :：")
         else:
             initial = text[len("/r"):].lstrip(" :：")
         if not initial and starts_just_r:
             return _wrap_reply_for_hermes(
+                _t("review_need_subject", _lang) if _t else
                 "请告诉我要 review 的 subject。例: /review Q3 OKR 草稿"
             )
         # Run intake
@@ -1231,12 +1254,18 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
         # match "/review" against injection patterns (it's our own
         # command syntax).
         stripped = text.lstrip()
+        # v1.5.3 fix #6: CJK-friendly review-command match. Accepts whitespace,
+        # EOL, OR any non-letter char (so `/review看一下` recognizes; `/reviewing`
+        # still does not).
+        def _is_review_prefix(s: str, n: int) -> bool:
+            return s.startswith(s[:n]) and (
+                len(s) == n
+                or s[n] in " \n\t"
+                or not s[n].isalpha()
+            )
         is_review_cmd = (
-            stripped.startswith("/review")
-            and (len(stripped) == 7 or stripped[7] in " \n\t")
-        ) or (
-            stripped.startswith("/r")
-            and (len(stripped) == 2 or stripped[2] in " \n\t")
+            (stripped.startswith("/review") and _is_review_prefix(stripped, 7))
+            or (stripped.startswith("/r") and _is_review_prefix(stripped, 2))
         )
 
         # Active review session: route ALL inbound (not just /review prefix)
@@ -1260,7 +1289,7 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
         if is_review_cmd or has_active_review:
             if platform and sender_id:
                 return _handle_review_in_pre_gateway(
-                    platform, sender_id, stripped,
+                    platform, sender_id, stripped, event=event,
                 )
 
         l1_hit, l1_labels = safety.detect_prompt_injection(text)
@@ -1672,6 +1701,7 @@ def _unwrap_hermes_context(ctx_str: str) -> str:
 
 def _handle_review_in_pre_gateway(
     platform: str, sender_id: str, text: str,
+    *, event=None,
 ) -> dict:
     """Intercept /review and /r from a counterparty in pre_gateway_dispatch.
 
@@ -1686,6 +1716,13 @@ def _handle_review_in_pre_gateway(
 
     Returns the action dict for pre_gateway_dispatch — always "skip"
     on this path, since the message is now fully handled.
+
+    v1.5.3 fix #7: when /review was sent in a group chat, the reply
+    routes back to the group chat (not the cp's DM with the bot). Per
+    Round 2 manual-test feedback — cp expects to see bot's response
+    where they typed. ``event`` (optional) is the inbound MessageEvent
+    we use to pull source.chat_id + chat_type. When chat_type indicates
+    group, send back to chat_id; otherwise keep DM behavior.
     """
     try:
         cp = identity.ensure_counterparty(platform, sender_id)
@@ -1709,12 +1746,29 @@ def _handle_review_in_pre_gateway(
         ctx_str = result.get("context", "") if isinstance(result, dict) else ""
         reply_text = _unwrap_hermes_context(ctx_str)
 
+    # v1.5.3 fix #7: pick reply target — group chat_id when in group, cp DM otherwise.
+    reply_target = sender_id
+    reply_dest = "dm"
+    if event is not None:
+        try:
+            src = getattr(event, "source", None)
+            ct = (getattr(src, "chat_type", "") or "").lower() if src else ""
+            chat_id = str(getattr(src, "chat_id", "") or "") if src else ""
+            if chat_id and ct in ("group", "supergroup"):
+                reply_target = chat_id
+                reply_dest = "group"
+        except Exception:
+            pass
+
     try:
-        hermes_io.send_dm(platform, sender_id, reply_text, fallback_to_queue=True)
+        hermes_io.send_dm(platform, reply_target, reply_text, fallback_to_queue=True)
     except Exception as exc:
         _safe_log(f"[review pre_gw] send_dm EXC cp={cp.cp_id}: {exc}")
 
-    _safe_log(f"[review pre_gw] handled /review for cp={cp.cp_id} reply_len={len(reply_text)}")
+    _safe_log(
+        f"[review pre_gw] handled /review for cp={cp.cp_id} "
+        f"reply_dest={reply_dest} target={reply_target[:30]} reply_len={len(reply_text)}"
+    )
     return {"action": "skip", "reason": "paid_review_routed"}
 
 

@@ -28,6 +28,7 @@ from paid_review.core.annotation import (
     open_count,
     update_status,
 )
+from paid_review.i18n import detect_lang, t as _i18n_t
 from paid_review.core.cursor import (
     Cursor,
     advance,
@@ -208,6 +209,12 @@ def _handle_intake(
         seed = text.strip()
         normalized.write_text(seed, encoding="utf-8")
 
+    # v1.5.3 — detect cp language from seed (or fall back to trigger text)
+    # for downstream i18n. Stored on state so SCAN / QA / cancel replies
+    # in this session keep using the same language as the cp typed in.
+    if not state.lang:
+        state.lang = detect_lang(seed or text or "")
+
     candidates = _build_subject_options(seed)
     if not candidates:
         candidates = [seed[:80] if seed else "(待补充)"]
@@ -229,15 +236,18 @@ def _handle_intake(
     # New UX: auto-select the top candidate as the assumed subject and ask
     # one yes/no — if "yes"/empty/affirm, proceed; else treat user's text
     # as the corrected subject. Other candidates surfaced as hints.
+    # v1.5.3: tone + i18n via paid_review.i18n.t. zh/en/ko supported.
     top = candidates[0]
     alt_hint = ""
     if len(candidates) > 1:
-        alt_hint = "\n\n_其它候选: " + " / ".join(candidates[1:5]) + "_"
+        alt_hint = _i18n_t(
+            "subject_ask_alt_hint", state.lang or "zh",
+            alts=" / ".join(candidates[1:5]),
+        )
     return ReviewReply(
-        text=(
-            f"收到。我把 review 的主题理解为：\n\n**{top}**\n\n"
-            f"对的话回 `yes` 我直接开始；要换主题就直接把正确的主题打过来。"
-            f"{alt_hint}"
+        text=_i18n_t(
+            "subject_ask", state.lang or "zh",
+            top=top, alt_hint=alt_hint,
         ),
         stage="SUBJECT",
         event_kind="subject_ask",
@@ -269,11 +279,12 @@ def _handle_subject(
 
     top = candidates[0] if candidates else ""
 
+    lang = state.lang or "zh"
     # 1) Affirm token → use the top candidate we proposed in subject_ask
     if t in _SUBJECT_AFFIRM_TOKENS:
         if not top:
             return ReviewReply(
-                text="还没有 subject 候选；请直接把要 review 的主题打出来。",
+                text=_i18n_t("subject_no_candidates", lang),
                 stage="SUBJECT",
                 event_kind="subject_ask",
             )
@@ -284,7 +295,7 @@ def _handle_subject(
     # 3) pass / custom is now redundant but tolerated (legacy)
     elif t in ("pass", "custom"):
         return ReviewReply(
-            text="把要 review 的主题直接打出来就行（不再需要 pass / custom）。",
+            text=_i18n_t("subject_pass_legacy", lang),
             stage="SUBJECT",
             event_kind="subject_ask",
         )
@@ -294,10 +305,7 @@ def _handle_subject(
     else:
         # Empty inbound (rare; user hit enter) — re-prompt with top
         return ReviewReply(
-            text=(
-                f"还在等你确认主题：**{top or '(待补充)'}**\n"
-                f"回 `yes` 开始，或打出正确的主题。"
-            ),
+            text=_i18n_t("subject_ask_reprompt", lang, top=top or "(待补充)"),
             stage="SUBJECT",
             event_kind="subject_ask",
         )
@@ -404,26 +412,22 @@ def _handle_qa(
     total = len(annotations)
 
     t = text.strip().lower()
+    lang = state.lang or "zh"
 
     # --- done command ---
     if t == "done":
         open_n = open_count(sid_dir)
         if open_n > 0:
             return ReviewReply(
-                text=(
-                    f"还有 {open_n} 条 finding 没回，继续\n"
-                    "(a) 接受 / (b) 保留异议 / (c) 标为无解 / (skip) 跳过"
-                ),
+                text=_i18n_t("qa_continue_pending", lang, n=open_n),
                 stage="QA",
                 event_kind="finding",
             )
         # All resolved and cursor exhausted → proceed
         if not is_exhausted(cursor):
+            n_left = len(cursor.pending) + (1 if cursor.current_id else 0)
             return ReviewReply(
-                text=(
-                    f"还有 {len(cursor.pending) + (1 if cursor.current_id else 0)} "
-                    "条 finding 未送达，请继续回复。"
-                ),
+                text=_i18n_t("qa_continue_pending", lang, n=n_left),
                 stage="QA",
                 event_kind="finding",
             )
@@ -457,7 +461,7 @@ def _handle_qa(
                 event_kind="finding",
             )
         return ReviewReply(
-            text="没有更多 deferred finding 了。回 done 完成 QA。",
+            text=_i18n_t("qa_no_more_deferred", lang),
             stage="QA",
             event_kind="finding",
         )
@@ -466,7 +470,7 @@ def _handle_qa(
     if cursor.current_id is None:
         # No active finding; prompt done
         return ReviewReply(
-            text="所有 finding 已处理完。回 done 进入下一步。",
+            text=_i18n_t("qa_done_prompt", lang),
             stage="QA",
             event_kind="finding",
         )
