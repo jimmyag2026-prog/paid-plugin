@@ -1134,6 +1134,21 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
             # interception + active-session handling apply as if it were P2P.
 
         if platform and sender_id and identity.is_owner(platform, sender_id):
+            # v1.5 Phase 7: owner-issued /paid-*-group commands. Intercept
+            # before the awaiting_input check so the slash text doesn't get
+            # eaten as a captured reply. Only fires for /paid-* prefixes
+            # the group-command handler knows about.
+            owner_text_peek = str(getattr(event, "text", "") or "").strip()
+            if owner_text_peek.startswith("/paid-"):
+                try:
+                    group_rv = _handle_group_command_in_pre_gateway(
+                        event, platform, sender_id, owner_text_peek,
+                    )
+                except Exception as exc:
+                    _safe_log(f"[group_cmd] handler EXC: {exc}")
+                    group_rv = None
+                if group_rv is not None:
+                    return group_rv
             # Owner-side messages normally pass through to hermes / Claude.
             # BUT: if the owner clicked ✅ / ✏️ on a card and we armed
             # awaiting_input, the next plain-text reply in the same chat
@@ -1660,6 +1675,189 @@ def _handle_review_in_pre_gateway(
 
     _safe_log(f"[review pre_gw] handled /review for cp={cp.cp_id} reply_len={len(reply_text)}")
     return {"action": "skip", "reason": "paid_review_routed"}
+
+
+# ---------------------------------------------------------------------------
+# Group self-service commands (v1.5 Phase 7)
+#
+# These commands are intercepted in pre_gateway_dispatch (NOT via
+# register_command) because they need to know which group the owner
+# is calling from — and only pre_gateway_dispatch sees event.source.chat_id.
+#
+# Recognized prefixes:
+#   /paid-enable-group [mode]   — enable current group (default review-only)
+#   /paid-disable-group          — disable current group
+#   /paid-set-group-mode <mode>  — change mode (review-only|everyday|both)
+#   /paid-set-group-name <name>  — set display name
+#   /paid-group-status           — show current group's config
+#   /paid-list-groups            — list all configured groups (works in DM)
+#
+# All commands require owner identity. Group-bound commands (everything
+# except /paid-list-groups) require being invoked from inside a group chat.
+# ---------------------------------------------------------------------------
+
+
+def _handle_group_command_in_pre_gateway(event, platform: str, sender_id: str,
+                                          text: str) -> dict | None:
+    """Parse and execute group self-service commands from inside the hook.
+
+    Returns a {"action": "skip", ...} dict when the command was handled
+    (so hermes doesn't double-respond), or None to fall through.
+    Replies to the owner go via hermes_io.send_dm to whatever chat the
+    command originated in (group or DM).
+    """
+    stripped = text.lstrip()
+    chat_id = ""
+    if event is not None and getattr(event, "source", None) is not None:
+        chat_id = str(getattr(event.source, "chat_id", "") or "")
+
+    parts = stripped.split(None, 1)
+    cmd = parts[0] if parts else ""
+    args = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd in ("/paid-enable-group", "/paid-disable-group",
+               "/paid-set-group-mode", "/paid-set-group-name",
+               "/paid-group-status"):
+        # These need group context — refuse in DM
+        if group_routing.classify_chat(event) != "group":
+            _send_group_reply(platform, sender_id, chat_id,
+                              "PAID: this command must be run inside a group chat.")
+            return {"action": "skip", "reason": "paid_group_cmd_not_in_group"}
+
+        group_key = group_routing.get_group_key(event)
+        if not group_key:
+            _send_group_reply(platform, sender_id, chat_id,
+                              "PAID: couldn't identify this group's chat_id.")
+            return {"action": "skip", "reason": "paid_group_cmd_no_key"}
+
+        group_id = chat_id  # group_id == platform-native chat_id
+
+        if cmd == "/paid-enable-group":
+            mode = (args.split(None, 1)[0] if args else "review-only").lower()
+            if mode not in ("review-only", "everyday", "both"):
+                _send_group_reply(platform, sender_id, chat_id,
+                                  f"PAID: unknown mode '{mode}'. "
+                                  "Use review-only | everyday | both.")
+                return {"action": "skip", "reason": "paid_group_bad_mode"}
+            existing = group_routing.load_group_config(group_key)
+            cfg = group_routing.GroupConfig(
+                group_key=group_key,
+                platform=platform,
+                group_id=group_id,
+                enabled=True,
+                mode=mode,
+                owner_user_id=sender_id,
+                display_name=existing.display_name if existing else "",
+                created_at=existing.created_at if existing else "",
+            )
+            group_routing.save_group_config(cfg)
+            _send_group_reply(
+                platform, sender_id, chat_id,
+                f"✅ PAID enabled in this group (mode={mode}).\n"
+                f"group_key={group_key}",
+            )
+            return {"action": "skip", "reason": "paid_group_enabled"}
+
+        if cmd == "/paid-disable-group":
+            cfg = group_routing.load_group_config(group_key)
+            if cfg is None or not cfg.enabled:
+                _send_group_reply(platform, sender_id, chat_id,
+                                  "PAID: this group is not currently enabled.")
+                return {"action": "skip", "reason": "paid_group_already_disabled"}
+            cfg.enabled = False
+            group_routing.save_group_config(cfg)
+            _send_group_reply(platform, sender_id, chat_id,
+                              "✅ PAID disabled in this group. Group config kept "
+                              "(re-enable any time with /paid-enable-group).")
+            return {"action": "skip", "reason": "paid_group_disabled"}
+
+        if cmd == "/paid-set-group-mode":
+            if not args:
+                _send_group_reply(platform, sender_id, chat_id,
+                                  "PAID: usage /paid-set-group-mode "
+                                  "<review-only|everyday|both>")
+                return {"action": "skip", "reason": "paid_group_set_mode_no_arg"}
+            new_mode = args.split(None, 1)[0].lower()
+            if new_mode not in ("review-only", "everyday", "both"):
+                _send_group_reply(platform, sender_id, chat_id,
+                                  f"PAID: unknown mode '{new_mode}'. "
+                                  "Use review-only | everyday | both.")
+                return {"action": "skip", "reason": "paid_group_bad_mode"}
+            cfg = group_routing.load_group_config(group_key)
+            if cfg is None:
+                _send_group_reply(platform, sender_id, chat_id,
+                                  "PAID: this group is not configured. "
+                                  "Run /paid-enable-group first.")
+                return {"action": "skip", "reason": "paid_group_not_configured"}
+            cfg.mode = new_mode
+            group_routing.save_group_config(cfg)
+            _send_group_reply(platform, sender_id, chat_id,
+                              f"✅ Mode updated to '{new_mode}'.")
+            return {"action": "skip", "reason": "paid_group_mode_set"}
+
+        if cmd == "/paid-set-group-name":
+            if not args:
+                _send_group_reply(platform, sender_id, chat_id,
+                                  "PAID: usage /paid-set-group-name <display name>")
+                return {"action": "skip", "reason": "paid_group_set_name_no_arg"}
+            cfg = group_routing.load_group_config(group_key)
+            if cfg is None:
+                _send_group_reply(platform, sender_id, chat_id,
+                                  "PAID: this group is not configured. "
+                                  "Run /paid-enable-group first.")
+                return {"action": "skip", "reason": "paid_group_not_configured"}
+            cfg.display_name = args[:120]
+            group_routing.save_group_config(cfg)
+            _send_group_reply(platform, sender_id, chat_id,
+                              f"✅ Group name set to: {cfg.display_name}")
+            return {"action": "skip", "reason": "paid_group_name_set"}
+
+        if cmd == "/paid-group-status":
+            cfg = group_routing.load_group_config(group_key)
+            if cfg is None:
+                _send_group_reply(platform, sender_id, chat_id,
+                                  "PAID: this group is not configured.")
+                return {"action": "skip", "reason": "paid_group_status_none"}
+            status = "enabled" if cfg.enabled else "disabled"
+            name_line = f"\nname: {cfg.display_name}" if cfg.display_name else ""
+            _send_group_reply(
+                platform, sender_id, chat_id,
+                f"PAID group status:\n"
+                f"key: {cfg.group_key}\n"
+                f"status: {status}\n"
+                f"mode: {cfg.mode}"
+                f"{name_line}\n"
+                f"updated_at: {cfg.updated_at or '(never)'}",
+            )
+            return {"action": "skip", "reason": "paid_group_status_reported"}
+
+    if cmd == "/paid-list-groups":
+        configs = group_routing.list_group_configs()
+        if not configs:
+            _send_group_reply(platform, sender_id, chat_id,
+                              "PAID: no groups configured.")
+            return {"action": "skip", "reason": "paid_group_list_empty"}
+        lines = ["PAID groups:"]
+        for c in configs:
+            badge = "ON " if c.enabled else "off"
+            label = c.display_name or c.group_id
+            lines.append(f"  [{badge}] {label} — mode={c.mode}  ({c.group_key})")
+        _send_group_reply(platform, sender_id, chat_id, "\n".join(lines))
+        return {"action": "skip", "reason": "paid_group_list_reported"}
+
+    return None
+
+
+def _send_group_reply(platform: str, sender_id: str, chat_id: str,
+                      text: str) -> None:
+    """Send a group-command reply. Lark/feishu group chats need
+    receive_id_type=chat_id, so prefer the chat_id when available; fall
+    back to direct user_id otherwise (DM-context list_groups)."""
+    target = chat_id or sender_id
+    try:
+        hermes_io.send_dm(platform, target, text, fallback_to_queue=True)
+    except Exception as exc:
+        _safe_log(f"[group_cmd] reply send EXC plat={platform} target={target}: {exc}")
 
 
 # ---------------------------------------------------------------------------

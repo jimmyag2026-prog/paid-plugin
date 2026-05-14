@@ -116,7 +116,13 @@ def test_owner_paid_command_in_disabled_group_is_let_through(
     paid_tmp_iso, monkeypatch,
 ):
     """Phase 7 self-service: owner must be able to run /paid-enable-group
-    inside a group even when that group is not yet enabled."""
+    inside a group even when that group is not yet enabled.
+
+    Phase 7 actually executes the command in pre_gateway_dispatch — so
+    rather than returning None (older Phase 6 contract), the hook returns
+    {action:skip, reason:paid_group_enabled} once the command runs. We
+    verify the group was actually persisted to confirm the bypass worked
+    end-to-end."""
     plugin = _fresh_plugin()
     _mock_owner(monkeypatch, plugin)
     _silence_outbound(monkeypatch, plugin)
@@ -132,9 +138,10 @@ def test_owner_paid_command_in_disabled_group_is_let_through(
         user_id="owner_lark",  # owner per _mock_owner above
     )
     rv = plugin.on_pre_gateway_dispatch(event=e)
-    # Owner messages return None after the awaiting_input check —
-    # let the slash dispatcher pick it up.
-    assert rv is None
+    assert rv == {"action": "skip", "reason": "paid_group_enabled"}
+    cfg = plugin.group_routing.load_group_config("feishu_oc_owner_added_group")
+    assert cfg is not None
+    assert cfg.enabled is True
 
 
 def test_non_owner_paid_command_in_disabled_group_is_still_dropped(
