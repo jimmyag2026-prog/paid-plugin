@@ -2476,6 +2476,53 @@ def _cmd_status(raw_args: str) -> str:
     )
 
 
+def _cmd_paid_doctor(raw_args: str) -> str:
+    """``/paid-doctor`` — run 7 health checks (v1.5.5 A1).
+
+    On Lark we push an interactive card to the owner's preferred channel
+    and return a one-line ack as the slash reply. On TG/Slack/CLI we
+    return the plain-text report directly.
+    """
+    if not _is_caller_owner_via_env():
+        return ""
+    from paid import doctor as _doctor
+    rows = _doctor.run_checks()
+    n_pass = _doctor.n_passed(rows)
+    n_total = len(rows)
+    summary = f"PAID doctor: {n_pass}/{n_total} checks passed"
+
+    plat = os.environ.get("HERMES_GATEWAY_PLATFORM", "").strip().lower()
+    if plat in ("feishu", "lark"):
+        # Push a Lark card; the slash reply becomes a short ack.
+        try:
+            owner = identity.load_owner()
+            pref = owner.preferred_identity() if owner else None
+            if pref is None:
+                target = _owner_primary_identity(owner)
+                if target is None:
+                    return _doctor.format_plain_text(rows)  # fall back to text
+                pref_plat, uid = target
+            else:
+                pref_plat = pref.platform
+                uid = pref.home_chat_id
+            if pref_plat in ("feishu", "lark"):
+                receive_target = _resolve_owner_send_target(pref_plat, uid)
+                card = card_formatters.format_doctor_card_lark(rows)
+                hermes_io.send_lark_card(
+                    pref_plat, receive_target, card, fallback_to_queue=True,
+                )
+                _safe_log(f"[doctor] pushed Lark card to {pref_plat}:{receive_target} ({summary})")
+                fail_ids = [r["id"] for r in rows if not r.get("ok")]
+                if fail_ids:
+                    return f"{summary} (failing: {', '.join(fail_ids)}) — see card."
+                return f"{summary} — see card."
+        except Exception as exc:
+            _safe_log(f"[doctor] Lark card path failed: {exc}; falling back to text")
+            # fall through to plain-text return
+
+    return _doctor.format_plain_text(rows)
+
+
 # ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
@@ -2572,6 +2619,10 @@ def register(ctx) -> None:
             "paid-cancel-input", _cmd_paid_cancel_input,
             description="Cancel a pending inline-input slot (after clicking ✅/✏️ on a card).",
         )
+        ctx.register_command(
+            "paid-doctor", _cmd_paid_doctor,
+            description="Run PAID health checks (7 items: config, owner, hermes, timers, files, settings, errors).",
+        )
         # `/card` intercepts hermes feishu adapter's synthetic command for
         # interactive-card button clicks. Lark sends button click events as
         # ``/card button {json}``; we parse and route to approve/reject.
@@ -2594,7 +2645,7 @@ def register(ctx) -> None:
         # don't actually exist in hermes — caught in second dogfood.)
 
         _safe_log("hooks: pre_llm_call, post_llm_call, pre_gateway_dispatch")
-        _safe_log("commands: /paid-pending /paid-approve /paid-reject /paid-status /paid-cancel-input /card")
+        _safe_log("commands: /paid-pending /paid-approve /paid-reject /paid-status /paid-cancel-input /paid-doctor /card")
         _safe_log("pre_gateway_dispatch routes: /review /r (paid_review skill, cp-side)")
     else:
         _safe_log("hooks: pre_llm_call, post_llm_call (commands skipped — hermes < 0.11)")
