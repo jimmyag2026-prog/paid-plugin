@@ -213,6 +213,50 @@ From your owner account:
 
 ---
 
+## 7. Install systemd timers (Linux + `systemd --user`, recommended)
+
+PAID ships three background timer units:
+
+| Unit | Cadence | Job |
+|---|---|---|
+| `paid-sweep.timer` | every 5 min | Auto-defer pending approvals older than the configured timeout (default 30 min) so the counterparty isn't left hanging |
+| `paid-review-sweep.timer` | hourly | Close inactive review sessions (no inbound > 24h) |
+| `paid-daily-snapshot.timer` | 00:30 UTC | Roll today's activity into `daily/<date>.md` |
+
+Install:
+
+```bash
+# In the plugin checkout, NOT the install destination:
+~/src/paid-plugin/bin/install_timers.sh
+```
+
+The script:
+
+1. Copies the 3 `.timer` + 3 `.service` units to `~/.config/systemd/user/`
+2. `systemctl --user daemon-reload`
+3. `systemctl --user enable --now` on each timer
+4. Warns if `loginctl` linger is OFF (timers won't fire when you're logged out)
+
+Verify:
+
+```bash
+systemctl --user list-timers | grep paid-
+# expect 3 entries with NEXT-fire timestamps
+
+# Logs:
+tail ~/.hermes/paid/sweep_pending.log
+tail ~/.hermes/paid/sweep_review.log
+tail ~/.hermes/paid/daily_snapshot.log
+```
+
+The unit files use `%h` (systemd home expansion) for paths, so the same
+service files work for any user — operator-name no longer hardcoded.
+
+(macOS users: timers are systemd-only. The equivalent on macOS is launchd;
+not bundled — file an issue if needed.)
+
+---
+
 ## Uninstall
 
 ```bash

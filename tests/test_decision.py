@@ -253,10 +253,13 @@ def test_shape_context_request_english_warm_copy():
         owner_name="Jimmy", lang="en",
     )
     assert "IGNORE" in out
-    # Key UX elements: greeting, owner name, ETA hint, signoff
-    assert "Jimmy's AI assistant" in out
-    assert "30 min" in out
-    assert "Jimmy's PAID" in out
+    # v1.4.4: Format B wrap escapes apostrophes for the LLM prompt; the
+    # delivered text (post-LLM-unwrap) is plain. Tests assert on the
+    # logical content, allowing for escape characters in the wrapped form.
+    out_logical = out.replace("\\'", "'")
+    assert "Jimmy's AI assistant" in out_logical
+    assert "30 min" in out_logical
+    assert "Jimmy's PAID" in out_logical
 
 
 def test_shape_context_request_chinese_warm_copy():
@@ -267,9 +270,10 @@ def test_shape_context_request_chinese_warm_copy():
         owner_name="Jimmy", lang="zh",
     )
     assert "IGNORE" in out
-    assert "Jimmy 的 AI 助理" in out
-    assert "30 分钟" in out
-    assert "Jimmy's PAID" in out
+    out_logical = out.replace("\\'", "'")
+    assert "Jimmy 的 AI 助理" in out_logical
+    assert "30 分钟" in out_logical
+    assert "Jimmy's PAID" in out_logical
 
 
 def test_shape_context_decline_english():
@@ -280,9 +284,10 @@ def test_shape_context_decline_english():
         owner_name="Jimmy", lang="en",
     )
     assert "IGNORE" in out
-    assert "Jimmy's AI assistant" in out
-    assert "@ Jimmy" in out
-    assert "Jimmy's PAID" in out
+    out_logical = out.replace("\\'", "'")
+    assert "Jimmy's AI assistant" in out_logical
+    assert "@ Jimmy" in out_logical
+    assert "Jimmy's PAID" in out_logical
 
 
 def test_shape_context_decline_chinese():
@@ -293,8 +298,9 @@ def test_shape_context_decline_chinese():
         owner_name="Jimmy", lang="zh",
     )
     assert "IGNORE" in out
-    assert "@ Jimmy" in out
-    assert "Jimmy's PAID" in out
+    out_logical = out.replace("\\'", "'")
+    assert "@ Jimmy" in out_logical
+    assert "Jimmy's PAID" in out_logical
 
 
 def test_shape_context_uses_owner_name_param():
@@ -335,3 +341,51 @@ def test_direct_context_includes_length_rule(monkeypatch):
     )
     # The compiled context must carry the length rule downstream
     assert "1-3 句" in ctx or "1-3" in ctx
+
+
+# ---------------------------------------------------------------------------
+# v1.4.4: wrap_exact_reply canonical helper (backlog v1.4.2)
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_exact_reply_produces_format_b():
+    """v1.4.4 canonical wrap uses Format B wording (line-break-preserving)."""
+    from paid.decision import wrap_exact_reply
+    out = wrap_exact_reply("Hello world.")
+    assert "preserving all line breaks" in out
+    assert "Hello world." in out
+
+
+def test_wrap_exact_reply_escapes_apostrophes():
+    """Apostrophes inside the exact text must be escaped so they don't
+    terminate the single-quoted instruction prematurely."""
+    from paid.decision import wrap_exact_reply
+    out = wrap_exact_reply("It's a test.")
+    assert "It\\'s a test." in out  # escaped form in the prompt
+    assert "It's a test." not in out  # raw form would break the wrap
+
+
+def test_wrap_exact_reply_escapes_backslashes():
+    from paid.decision import wrap_exact_reply
+    out = wrap_exact_reply(r"path\to\file")
+    # Backslashes are doubled so the LLM sees one backslash each
+    assert r"path\\to\\file" in out
+
+
+def test_init_wrap_reply_for_hermes_uses_unified_helper():
+    """v1.4.4: __init__._wrap_reply_for_hermes delegates to wrap_exact_reply,
+    no longer duplicating the IGNORE-prefix string."""
+    from pathlib import Path as _Path
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "paid_init_for_test",
+        _Path(__file__).resolve().parent.parent / "__init__.py",
+    )
+    _init = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(_init)
+
+    out = _init._wrap_reply_for_hermes("Hi there.")
+    assert isinstance(out, dict)
+    assert "context" in out
+    assert "preserving all line breaks" in out["context"]
+    assert "Hi there." in out["context"]

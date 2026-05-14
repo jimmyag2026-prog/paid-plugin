@@ -400,13 +400,41 @@ def shape_context(
         return _direct_context(persona, sop_excerpt, draft, owner_name, lang)
 
     if state == "request":
-        exact = _request_line(owner_name, topic, lang)
-        return f"IGNORE the user question. Reply EXACTLY with: '{exact}' Nothing else."
+        return wrap_exact_reply(_request_line(owner_name, topic, lang))
 
     if state == "decline":
-        exact = _decline_line(owner_name, topic, lang)
-        return f"IGNORE the user question. Reply EXACTLY with: '{exact}' Nothing else."
+        return wrap_exact_reply(_decline_line(owner_name, topic, lang))
 
     # Unknown state — defensive fallback to request.
-    exact = _request_line(owner_name, topic, lang)
-    return f"IGNORE the user question. Reply EXACTLY with: '{exact}' Nothing else."
+    return wrap_exact_reply(_request_line(owner_name, topic, lang))
+
+
+def wrap_exact_reply(text: str) -> str:
+    """Build the hermes context string that forces the LLM to emit ``text`` verbatim.
+
+    v1.4.4 (backlog v1.4.2): canonical wrap helper for all PAID code paths.
+    Pre-v1.4.4 we had two parallel formats:
+
+      Format A (decision.py inline):
+        ``IGNORE the user question. Reply EXACTLY with: '...' Nothing else.``
+
+      Format B (__init__.py:_wrap_reply_for_hermes):
+        ``IGNORE the user message. Reply EXACTLY with the following text
+        and nothing else, preserving all line breaks: '...'``
+
+    The duplication caused a real bug in v1.3.7: when a new state branch
+    was added, the corresponding ``_unwrap_hermes_context`` branch was
+    forgotten and the IGNORE-prefix text leaked verbatim to the
+    counterparty. v1.4.4 keeps only Format B as the producer; the unwrap
+    function still recognises both formats defensively in case any stored
+    state still carries Format A wraps.
+
+    Format B's "preserving all line breaks" wording is the chosen one
+    because it's strictly more accurate: empirically the LLM is less
+    likely to collapse a multi-line reply when explicitly told not to.
+    """
+    safe = text.replace("\\", "\\\\").replace("'", "\\'")
+    return (
+        f"IGNORE the user message. Reply EXACTLY with the following "
+        f"text and nothing else, preserving all line breaks: '{safe}'"
+    )
