@@ -710,3 +710,76 @@ def test_send_dm_strips_markdown_only_for_lark(monkeypatch):
     stripped = hermes_io._strip_markdown_for_lark(md_in)
     assert "**" not in stripped
     assert "https://jelabs.top" in stripped
+
+
+# ---------------------------------------------------------------------------
+# v1.4.4: chat_id-type Lark sends use standalone fallback when no adapter
+# (backlog v1.4.10)
+# ---------------------------------------------------------------------------
+
+
+def test_send_dm_feishu_chat_id_no_adapter_uses_standalone(monkeypatch, tmp_path):
+    """chat_id-type Lark + no live adapter → standalone path (not 'no
+    standalone client' error). JELabs pilot 2026-05-13 root cause for
+    cron sweep timers failing to notify owner."""
+    # No live gateway adapter
+    def _no_adapter(_):
+        raise hermes_io.SendDmError("no live GatewayRunner")
+    monkeypatch.setattr(hermes_io, "_get_gateway_adapter", _no_adapter)
+    # chat_id type for "oc_..." prefix
+    monkeypatch.setattr(hermes_io, "_detect_lark_receive_id_type", lambda u: "chat_id")
+    # Standalone returns ok
+    monkeypatch.setattr(
+        hermes_io, "_send_lark_standalone",
+        lambda rid, msg: {"ok": True, "msg_id": "om_STANDALONE_CHATID",
+                          "platform": "feishu", "receive_id_type": "chat_id"},
+    )
+    # Queue should NOT be touched
+    monkeypatch.setattr(hermes_io, "_enqueue_outbound_fallback",
+                        lambda *a, **kw: pytest.fail("should not queue"))
+
+    out = hermes_io.send_dm("feishu", "oc_abc123", "hi via chat_id")
+    assert out["ok"] is True
+    assert out["msg_id"] == "om_STANDALONE_CHATID"
+
+
+def test_send_dm_feishu_chat_id_no_adapter_no_standalone_queues(monkeypatch):
+    """Both adapter and standalone unavailable → outbound queue (was the
+    correct pre-v1.4.4 behavior for non-chat_id; now also for chat_id)."""
+    def _no_adapter(_):
+        raise hermes_io.SendDmError("no live GatewayRunner")
+    monkeypatch.setattr(hermes_io, "_get_gateway_adapter", _no_adapter)
+    monkeypatch.setattr(hermes_io, "_detect_lark_receive_id_type", lambda u: "chat_id")
+
+    def _standalone_fails(rid, msg):
+        raise hermes_io.SendDmError("FEISHU_APP_ID not in .env")
+    monkeypatch.setattr(hermes_io, "_send_lark_standalone", _standalone_fails)
+
+    queued = []
+    monkeypatch.setattr(hermes_io, "_enqueue_outbound_fallback",
+                        lambda p, u, m: queued.append((p, u, m)) or "/tmp/q")
+
+    out = hermes_io.send_dm("feishu", "oc_abc123", "hi")
+    assert out["ok"] is False
+    assert "FEISHU_APP_ID" in out["error"]
+    assert len(queued) == 1
+
+
+def test_send_dm_feishu_user_id_still_uses_standalone(monkeypatch):
+    """v1.4.4 didn't regress the existing user_id / open_id branch."""
+    def _no_adapter(_):
+        raise hermes_io.SendDmError("no live GatewayRunner")
+    monkeypatch.setattr(hermes_io, "_get_gateway_adapter", _no_adapter)
+    # user_id type for short hex
+    monkeypatch.setattr(hermes_io, "_detect_lark_receive_id_type", lambda u: "user_id")
+    monkeypatch.setattr(
+        hermes_io, "_send_lark_standalone",
+        lambda rid, msg: {"ok": True, "msg_id": "om_OUID",
+                          "platform": "feishu", "receive_id_type": "user_id"},
+    )
+    monkeypatch.setattr(hermes_io, "_enqueue_outbound_fallback",
+                        lambda *a, **kw: pytest.fail("should not queue"))
+
+    out = hermes_io.send_dm("feishu", "a5361ea1", "hi")
+    assert out["ok"] is True
+    assert out["msg_id"] == "om_OUID"

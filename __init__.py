@@ -485,16 +485,13 @@ def _notify_owner_about_unknown_sender(
 
 def _wrap_reply_for_hermes(text: str) -> dict:
     """ReviewReply.text → hermes context override that forces an exact reply.
-    Same pattern as PAID's other 'IGNORE the user, reply EXACTLY with' paths
-    (verified in v1.0.0 dogfood). Single-quoted to keep Hermes from
-    splitting on apostrophes inside `text` — strip + escape conservatively."""
-    safe = text.replace("\\", "\\\\").replace("'", "\\'")
-    return {
-        "context": (
-            f"IGNORE the user message. Reply EXACTLY with the following "
-            f"text and nothing else, preserving all line breaks: '{safe}'"
-        )
-    }
+
+    v1.4.4 (backlog v1.4.2): now delegates to the canonical wrap helper
+    in ``paid.decision.wrap_exact_reply`` so we don't keep two parallel
+    formats. Same external behavior as pre-v1.4.4 Format B.
+    """
+    from paid.decision import wrap_exact_reply
+    return {"context": wrap_exact_reply(text)}
 
 
 def _maybe_route_to_review_skill(cp, user_message: str,

@@ -1277,6 +1277,28 @@ def send_dm(
                 result["queued"] = str(qp)
             return result
 
+        # v1.4.4 (backlog v1.4.10): chat_id-type Lark send with NO live
+        # gateway adapter — pre-v1.4.4 this fell through to the "no
+        # standalone client" branch even though _send_lark_standalone
+        # handles chat_id receives correctly. Result: cron-driven sweep
+        # timers couldn't notify owners; messages silently queued. Fix:
+        # standalone path covers all rid_types for Lark / feishu.
+        if adapter is None:
+            try:
+                result = _send_lark_standalone(user_id, message)
+            except Exception as exc:
+                if fallback_to_queue:
+                    qp = _enqueue_outbound_fallback(platform, user_id, message)
+                    return {"ok": False, "queued": str(qp),
+                            "error": f"lark standalone (chat_id) send raised: {exc}"}
+                raise SendDmError(
+                    f"lark standalone (chat_id) send raised: {exc}"
+                ) from exc
+            if not result.get("ok") and fallback_to_queue:
+                qp = _enqueue_outbound_fallback(platform, user_id, message)
+                result["queued"] = str(qp)
+            return result
+
     # Non-Lark platforms below this point — adapter must exist.
     if adapter is None:
         # Should be unreachable because we returned/raised above.
