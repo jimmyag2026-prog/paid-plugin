@@ -499,3 +499,130 @@ def test_send_dm_falls_back_to_standalone_when_no_gateway(tmp_path, monkeypatch)
     out = hermes_io.send_dm("feishu", "4ed67983", "hi")
     assert out["ok"] is True
     assert out["msg_id"] == "om_STANDALONE"
+
+
+# ---------------------------------------------------------------------------
+# v1.4.2: api_key fallback chain tests (yaml → provider env var → .env file).
+# ---------------------------------------------------------------------------
+
+
+def _reset_dotenv_guard(monkeypatch):
+    """Test fixture: reset the module-level dotenv-loaded flag so each test
+    starts with a clean slate (otherwise tests leak state across each other)."""
+    monkeypatch.setattr(hermes_io, "_DOTENV_LOADED", False)
+
+
+def test_env_var_name_table_covers_common_providers():
+    """Sanity: well-known providers map to their canonical key name."""
+    assert hermes_io._env_var_name_for("deepseek") == "DEEPSEEK_API_KEY"
+    assert hermes_io._env_var_name_for("openai") == "OPENAI_API_KEY"
+    assert hermes_io._env_var_name_for("openrouter") == "OPENROUTER_API_KEY"
+    assert hermes_io._env_var_name_for("anthropic") == "ANTHROPIC_API_KEY"
+    assert hermes_io._env_var_name_for("gemini") == "GEMINI_API_KEY"
+    # unknown provider → uppercase _API_KEY default
+    assert hermes_io._env_var_name_for("custom-thing") == "CUSTOM-THING_API_KEY"
+
+
+def test_resolve_model_section_falls_back_to_provider_env_var(monkeypatch):
+    """JELabs-pilot scenario: operator set DEEPSEEK_API_KEY in env but
+    NOT in config.yaml. Pre-v1.4.2 this raised; now it resolves."""
+    _reset_dotenv_guard(monkeypatch)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek-from-env")
+    # No .env file in the path we point at — pure env var test
+    monkeypatch.setattr(hermes_io, "HERMES_CONFIG_PATH",
+                        Path("/nonexistent/.hermes/config.yaml"))
+
+    cfg = {"model": {
+        "provider": "deepseek",
+        "default": "deepseek-v4-pro",
+        "base_url": "https://api.deepseek.com",
+        # api_key intentionally omitted
+    }}
+    resolved = hermes_io._resolve_model_section(cfg)
+    assert resolved["api_key"] == "sk-deepseek-from-env"
+    assert resolved["provider"] == "deepseek"
+
+
+def test_resolve_model_section_yaml_overrides_env(monkeypatch):
+    """Explicit yaml value beats env var (explicit > implicit)."""
+    _reset_dotenv_guard(monkeypatch)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-from-env-loser")
+    monkeypatch.setattr(hermes_io, "HERMES_CONFIG_PATH",
+                        Path("/nonexistent/.hermes/config.yaml"))
+    cfg = {"model": {
+        "provider": "deepseek",
+        "default": "deepseek-v4-pro",
+        "base_url": "https://api.deepseek.com",
+        "api_key": "sk-explicit-wins",
+    }}
+    resolved = hermes_io._resolve_model_section(cfg)
+    assert resolved["api_key"] == "sk-explicit-wins"
+
+
+def test_resolve_model_section_loads_dotenv_when_env_missing(tmp_path, monkeypatch):
+    """If shell env doesn't have the key but ~/.hermes/.env does → loaded."""
+    _reset_dotenv_guard(monkeypatch)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    # Point HERMES_CONFIG_PATH at tmp so .env lookup resolves to tmp/.env
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("model:\n  default: x\n  base_url: y\n  api_key: from-yaml\n",
+                        encoding="utf-8")
+    monkeypatch.setattr(hermes_io, "HERMES_CONFIG_PATH", cfg_path)
+    (tmp_path / ".env").write_text(
+        "# comment\nDEEPSEEK_API_KEY=sk-from-dotenv\n", encoding="utf-8")
+
+    cfg = {"model": {
+        "provider": "deepseek",
+        "default": "deepseek-v4-pro",
+        "base_url": "https://api.deepseek.com",
+    }}
+    resolved = hermes_io._resolve_model_section(cfg)
+    assert resolved["api_key"] == "sk-from-dotenv"
+
+
+def test_resolve_model_section_error_mentions_provider_env_var(monkeypatch):
+    """When neither yaml nor env has api_key, the error must name the
+    provider-specific env var operators need to set."""
+    _reset_dotenv_guard(monkeypatch)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setattr(hermes_io, "HERMES_CONFIG_PATH",
+                        Path("/nonexistent/.hermes/config.yaml"))
+    cfg = {"model": {
+        "provider": "deepseek",
+        "default": "deepseek-v4-pro",
+        "base_url": "https://api.deepseek.com",
+    }}
+    with pytest.raises(hermes_io.HermesConfigError) as exc:
+        hermes_io._resolve_model_section(cfg)
+    assert "DEEPSEEK_API_KEY" in str(exc.value)
+    assert "hermes auth add" in str(exc.value)  # hint about the trap
+
+
+def test_dotenv_strips_quotes_and_skips_comments(tmp_path, monkeypatch):
+    """Robustness: comments, blank lines, surrounding quotes — all handled."""
+    _reset_dotenv_guard(monkeypatch)
+    monkeypatch.delenv("FOO_API_KEY", raising=False)
+    monkeypatch.delenv("BAR_API_KEY", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "# a comment\n"
+        '\nFOO_API_KEY="sk-foo-quoted"\n'
+        "BAR_API_KEY='sk-bar-single'\n"
+        "# another\n",
+        encoding="utf-8",
+    )
+    hermes_io._load_dotenv_if_present(env_file)
+    import os as _os
+    assert _os.environ.get("FOO_API_KEY") == "sk-foo-quoted"
+    assert _os.environ.get("BAR_API_KEY") == "sk-bar-single"
+
+
+def test_dotenv_does_not_override_preset_env(tmp_path, monkeypatch):
+    """If FOO_API_KEY is already set in shell env, .env must NOT clobber it."""
+    _reset_dotenv_guard(monkeypatch)
+    monkeypatch.setenv("FOO_API_KEY", "sk-preset-wins")
+    env_file = tmp_path / ".env"
+    env_file.write_text("FOO_API_KEY=sk-dotenv-loser\n", encoding="utf-8")
+    hermes_io._load_dotenv_if_present(env_file)
+    import os as _os
+    assert _os.environ.get("FOO_API_KEY") == "sk-preset-wins"
