@@ -429,3 +429,110 @@ def test_normalize_preserves_clean_text():
     clean = "what's the office address?"
     hit, _ = safety.detect_prompt_injection(clean)
     assert hit is False
+
+
+# ---------------------------------------------------------------------------
+# v1.4.3: L4 whitelist via sop.md "## 公开材料 / Public materials" section
+# (backlog v1.4.11)
+# ---------------------------------------------------------------------------
+
+
+def _write_sop(paid_dir, content):
+    sop = paid_dir / "sop.md"
+    sop.write_text(content, encoding="utf-8")
+
+
+def test_load_public_whitelist_extracts_section(tmp_path, monkeypatch):
+    from paid import safety, storage
+    monkeypatch.setattr(storage, "PAID_DIR", tmp_path)
+    _write_sop(tmp_path,
+        "# SOP\n\n"
+        "## scheduling\n\nblah\n\n"
+        "## 公开材料 / Public materials\n\n"
+        "- Website: https://jelabs.top\n"
+        "- Email: evie@jelabs.xyz\n\n"
+        "## NEVER say\n\nrunway, valuation, ...\n"
+    )
+    wl = safety._load_public_whitelist()
+    assert "jelabs.top" in wl
+    assert "evie@jelabs.xyz" in wl
+    # Content from OTHER sections should NOT be in whitelist
+    assert "runway" not in wl
+    assert "blah" not in wl
+
+
+def test_load_public_whitelist_recognises_alternate_headings(tmp_path, monkeypatch):
+    from paid import safety, storage
+    monkeypatch.setattr(storage, "PAID_DIR", tmp_path)
+    _write_sop(tmp_path,
+        "## Whitelist for L4\n\nopen-info-1\n\n"
+        "## Other\n\nx\n"
+    )
+    assert "open-info-1" in safety._load_public_whitelist()
+
+
+def test_load_public_whitelist_empty_when_no_section(tmp_path, monkeypatch):
+    from paid import safety, storage
+    monkeypatch.setattr(storage, "PAID_DIR", tmp_path)
+    _write_sop(tmp_path, "## scheduling\n\nblah\n")
+    assert safety._load_public_whitelist() == ""
+
+
+def test_load_public_whitelist_empty_when_sop_missing(tmp_path, monkeypatch):
+    from paid import safety, storage
+    monkeypatch.setattr(storage, "PAID_DIR", tmp_path)
+    # No sop.md written
+    assert safety._load_public_whitelist() == ""
+
+
+def test_detect_pii_whitelist_filters_known_email(monkeypatch):
+    from paid import safety
+    wl = "Owner email: evie@jelabs.xyz (public).\n"
+    hit, hits = safety.detect_pii(
+        "Contact via evie@jelabs.xyz for follow-up.",
+        whitelist=wl,
+    )
+    assert hit is False
+    assert "email" not in hits
+
+
+def test_detect_pii_whitelist_does_not_mask_unwhitelisted(monkeypatch):
+    from paid import safety
+    wl = "Owner email: evie@jelabs.xyz (public).\n"
+    # Different email — NOT in whitelist — must still flag.
+    hit, hits = safety.detect_pii(
+        "Contact secret@private.com please.",
+        whitelist=wl,
+    )
+    assert hit is True
+    assert "email" in hits
+
+
+def test_detect_cross_cp_name_whitelist_skips_declared_public(tmp_path, monkeypatch):
+    """When sop.md whitelist contains a name that's ALSO a cp display_name
+    (e.g. owner's own org), L4 must not flag it."""
+    from paid import safety, storage
+    monkeypatch.setattr(storage, "PAID_DIR", tmp_path)
+    # Set up: one cp with display_name "JE Labs"
+    cp_dir = tmp_path / "counterparties" / "feishu_other"
+    cp_dir.mkdir(parents=True)
+    (cp_dir / "profile.json").write_text(
+        '{"cp_id": "feishu_other", "display_name": "JE Labs"}',
+        encoding="utf-8",
+    )
+    # Whitelist declares "JE Labs" public
+    wl = "Company: JE Labs is the org we work at.\n"
+    hit, hits = safety.detect_cross_cp_name_leakage(
+        "Welcome to JE Labs! We serve frontier tech.",
+        current_cp_id="feishu_current",  # different cp
+        whitelist=wl,
+    )
+    assert hit is False
+    assert "JE Labs" not in hits
+
+
+def test_detect_pii_whitelist_none_means_no_filter(monkeypatch):
+    """Default (whitelist=None) preserves pre-v1.4.3 behavior."""
+    from paid import safety
+    hit, hits = safety.detect_pii("Email me at evie@jelabs.xyz", whitelist=None)
+    assert hit is True
