@@ -36,6 +36,7 @@ from typing import Any
 
 from .ingest_backends import (
     BackendResult,
+    ImageBackend,
     IngestBackend,
     LarkDocBackend,
     PdfBackend,
@@ -86,6 +87,10 @@ def _default_backends(lark_client: Any | None = None) -> list[IngestBackend]:
     # PDF backend always added — graceful-degrades when pdftotext/pdfminer
     # not installed (returns placeholder + advisory error).
     backends.append(PdfBackend())
+    # Image OCR backend — same graceful-degrade contract (tesseract
+    # CLI + pytesseract + pillow must all be present at runtime, else
+    # backend returns placeholder + missing-piece advisory).
+    backends.append(ImageBackend())
     return backends
 
 
