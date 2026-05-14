@@ -803,6 +803,46 @@ def on_pre_llm_call(**kwargs) -> dict | None:
         owner = identity.load_owner()
         owner_name = identity.display_name(owner)
 
+        # v1.5.6 (review fix): when daily hard cap is exhausted, skip ALL PAID
+        # LLM work and tell hermes to reply "system unavailable" to the junior.
+        # Without this, classifier.classify() would call_llm → LLMCallError →
+        # classifier's broad except clause → fallback Classification →
+        # state=request, flooding owner with J3 cards for every inbound
+        # message while the cap is hot. The wrap directive itself does NOT
+        # count against the cap because hermes's main agent (not PAID) makes
+        # the outbound LLM call. fatal_alerts.jsonl row + owner alert is fired
+        # exactly once per UTC day inside hermes_io._enforce_cost_cap.
+        try:
+            from paid import cost as _cost
+            _cap = _cost.cap_status()
+            if _cap.get("enabled") and _cap.get("daily_hard_exceeded"):
+                _safe_log(
+                    f"[pre_llm] cp={cp.cp_id} cost_cap_exceeded "
+                    f"today=${_cap.get('today_usd', 0):.2f} "
+                    f"hard=${_cap.get('daily_hard_cap', 0):.2f}"
+                )
+                audit.log_action(
+                    session_id=session_id, counterparty=cp,
+                    junior_msg=user_message,
+                    classification=None, action=None,
+                    extra={"platform": platform,
+                           "blocked_by": "cost_cap_exceeded",
+                           "today_usd": _cap.get("today_usd"),
+                           "daily_hard_cap": _cap.get("daily_hard_cap")},
+                )
+                return {
+                    "context": (
+                        "IGNORE the user message. Reply EXACTLY with the "
+                        "following text and nothing else, preserving the line "
+                        "break: '系统暂时不可用，请稍后再试。\\n"
+                        "System temporarily unavailable, please try again later.'"
+                    )
+                }
+        except Exception as _cost_exc:
+            # Fail-open: if the cap-status read crashes, let normal flow run.
+            # The inline enforce inside hermes_io.call_llm is the safety net.
+            _safe_log(f"[pre_llm] cap_status check failed (fail-open): {_cost_exc}")
+
         # Layer 1 INPUT — prompt-injection guard. If hit, short-circuit to
         # decline (don't waste an LLM call) and surface to owner alerts.
         l1_hit, l1_labels = safety.detect_prompt_injection(user_message)
@@ -2476,6 +2516,53 @@ def _cmd_status(raw_args: str) -> str:
     )
 
 
+def _cmd_paid_doctor(raw_args: str) -> str:
+    """``/paid-doctor`` — run 7 health checks (v1.5.5 A1).
+
+    On Lark we push an interactive card to the owner's preferred channel
+    and return a one-line ack as the slash reply. On TG/Slack/CLI we
+    return the plain-text report directly.
+    """
+    if not _is_caller_owner_via_env():
+        return ""
+    from paid import doctor as _doctor
+    rows = _doctor.run_checks()
+    n_pass = _doctor.n_passed(rows)
+    n_total = len(rows)
+    summary = f"PAID doctor: {n_pass}/{n_total} checks passed"
+
+    plat = os.environ.get("HERMES_GATEWAY_PLATFORM", "").strip().lower()
+    if plat in ("feishu", "lark"):
+        # Push a Lark card; the slash reply becomes a short ack.
+        try:
+            owner = identity.load_owner()
+            pref = owner.preferred_identity() if owner else None
+            if pref is None:
+                target = _owner_primary_identity(owner)
+                if target is None:
+                    return _doctor.format_plain_text(rows)  # fall back to text
+                pref_plat, uid = target
+            else:
+                pref_plat = pref.platform
+                uid = pref.home_chat_id
+            if pref_plat in ("feishu", "lark"):
+                receive_target = _resolve_owner_send_target(pref_plat, uid)
+                card = card_formatters.format_doctor_card_lark(rows)
+                hermes_io.send_lark_card(
+                    pref_plat, receive_target, card, fallback_to_queue=True,
+                )
+                _safe_log(f"[doctor] pushed Lark card to {pref_plat}:{receive_target} ({summary})")
+                fail_ids = [r["id"] for r in rows if not r.get("ok")]
+                if fail_ids:
+                    return f"{summary} (failing: {', '.join(fail_ids)}) — see card."
+                return f"{summary} — see card."
+        except Exception as exc:
+            _safe_log(f"[doctor] Lark card path failed: {exc}; falling back to text")
+            # fall through to plain-text return
+
+    return _doctor.format_plain_text(rows)
+
+
 # ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
@@ -2572,6 +2659,10 @@ def register(ctx) -> None:
             "paid-cancel-input", _cmd_paid_cancel_input,
             description="Cancel a pending inline-input slot (after clicking ✅/✏️ on a card).",
         )
+        ctx.register_command(
+            "paid-doctor", _cmd_paid_doctor,
+            description="Run PAID health checks (7 items: config, owner, hermes, timers, files, settings, errors).",
+        )
         # `/card` intercepts hermes feishu adapter's synthetic command for
         # interactive-card button clicks. Lark sends button click events as
         # ``/card button {json}``; we parse and route to approve/reject.
@@ -2594,7 +2685,7 @@ def register(ctx) -> None:
         # don't actually exist in hermes — caught in second dogfood.)
 
         _safe_log("hooks: pre_llm_call, post_llm_call, pre_gateway_dispatch")
-        _safe_log("commands: /paid-pending /paid-approve /paid-reject /paid-status /paid-cancel-input /card")
+        _safe_log("commands: /paid-pending /paid-approve /paid-reject /paid-status /paid-cancel-input /paid-doctor /card")
         _safe_log("pre_gateway_dispatch routes: /review /r (paid_review skill, cp-side)")
     else:
         _safe_log("hooks: pre_llm_call, post_llm_call (commands skipped — hermes < 0.11)")

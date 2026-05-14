@@ -115,9 +115,10 @@ def test_register_good_ctx_registers_all_commands(paid_tmp, monkeypatch):
     # requires event.source, which slash dispatcher doesn't pass).
     # v1.4.0: + /paid-cancel-input (clears an armed awaiting_input slot
     # after the owner clicked ✅/✏️ on a card but doesn't want to type).
+    # v1.5.5 A1: + /paid-doctor (7 health checks; Lark card or plain text)
     assert set(ctx.commands_registered) == {
         "paid-pending", "paid-approve", "paid-reject", "paid-status",
-        "paid-cancel-input", "card",
+        "paid-cancel-input", "paid-doctor", "card",
     }
 
 

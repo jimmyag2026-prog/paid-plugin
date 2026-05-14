@@ -386,3 +386,58 @@ def format_plain(spec: ApprovalCardSpec) -> str:
         f"\n"
         f"⏱️ Auto-defer in {spec.timeout_min} min"
     )
+
+
+# ============================================================================
+# Doctor card (v1.5.5 A1) — Lark interactive card for /paid-doctor
+# ============================================================================
+
+
+def format_doctor_card_lark(rows: list[dict]) -> dict:
+    """Render doctor.run_checks() output as a Lark interactive card.
+
+    Pass rows: list of {'id', 'ok', 'detail', 'fix_hint'}.
+    Header is green if all pass, red otherwise. Each check is one div
+    showing ✓/✗ + id + detail. Failed checks render fix_hint below.
+    """
+    n_pass = sum(1 for r in rows if r.get("ok"))
+    n_total = len(rows)
+    all_pass = n_pass == n_total
+
+    title = f"PAID doctor — {n_pass}/{n_total} checks passed"
+
+    elements: list[dict] = []
+    for r in rows:
+        mark = "✅" if r.get("ok") else "❌"
+        detail = str(r.get("detail", "") or "")
+        # Lark lark_md content has implicit limit; keep detail < 300 chars
+        if len(detail) > 280:
+            detail = detail[:277] + "..."
+        body = f"{mark} **{r.get('id', '?')}** — {detail}"
+        if not r.get("ok") and r.get("fix_hint"):
+            fix = str(r["fix_hint"])
+            if len(fix) > 200:
+                fix = fix[:197] + "..."
+            body += f"\n  _fix: {fix}_"
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": body},
+        })
+
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "note",
+        "elements": [
+            {"tag": "plain_text",
+             "content": "Re-run: /paid-doctor  ·  CLI: python -m bin.paid_doctor"},
+        ],
+    })
+
+    return {
+        "config": {"wide_screen_mode": True, "enable_forward": False},
+        "header": {
+            "title": {"tag": "plain_text", "content": title},
+            "template": "green" if all_pass else "red",
+        },
+        "elements": elements,
+    }

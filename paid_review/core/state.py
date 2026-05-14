@@ -9,6 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
+# Cross-module contract (v1.5.6 review fix #4): the paid dashboard
+# (paid/dashboard.py::_derive_review_next_action) maps each stage value to
+# an owner-facing "next action" string. When adding/renaming a stage here,
+# update that mapping too — otherwise the dashboard will silently fall back
+# to the lowercased raw stage name (correct but less helpful UX).
 Stage = Literal["INTAKE", "SUBJECT", "SCAN", "QA", "MERGE", "GATE", "CLOSED"]
 Verdict = Literal["READY", "READY_WITH_OPEN_ITEMS", "FORCED_PARTIAL", "FAIL", "PENDING"]
 

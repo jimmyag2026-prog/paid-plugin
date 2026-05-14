@@ -44,6 +44,143 @@ class LLMCallError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# v1.5.5 A2: cost ceiling — hard budget enforcement at call_llm entry
+# ---------------------------------------------------------------------------
+#
+# The cost ledger (paid/cost.py) tracked per-call tokens since v1.0 but only
+# observed: cap_status() was read by `bin/check_cost_cap.py` cron at a coarse
+# interval, so a runaway prompt could blow well past the hard cap before the
+# cron fired. v1.5.5 moves the gate inline: every call_llm checks
+# cap_status() first, raises LLMCallError if daily_hard_exceeded, and fires
+# one _alert_owner per day (dedup via flag file).
+#
+# Why here (not in pre_tool_call hook): see design/05_backlog.md M2.9 2026-
+# 05-14 重审 — PAID's hermes_io.call_llm is direct POST /v1/chat/completions,
+# bypassing hermes agent-tool-loop entirely. pre_tool_call never fires for
+# PAID's LLM spend. This inline check is the only point that covers 100% of
+# PAID-attributable cost.
+
+
+_COST_CAP_FLAG_PREFIX = "cost_cap_alerted_"
+
+
+def _cost_cap_flag_path(today_iso: str):
+    """Per-day flag file used to dedupe owner alerts."""
+    from . import storage  # lazy: avoid import-time cycle on test stubs
+    return storage.PAID_DIR / f"{_COST_CAP_FLAG_PREFIX}{today_iso}.flag"
+
+
+def _enforce_cost_cap() -> None:
+    """Check cost ledger; raise LLMCallError if daily hard cap reached.
+
+    No-op when settings.cost.enabled = False. Alerts owner once per UTC
+    day. Idempotent on repeated invocations within the same day.
+    """
+    from . import cost as _cost  # lazy: avoid import-time cycle
+    try:
+        status = _cost.cap_status()
+    except Exception:
+        # If cap_status itself errors, fail-open: don't block PAID over a
+        # ledger read bug. The cron alert path is the safety net.
+        return
+    if not status.get("enabled", False):
+        return
+    if not status.get("daily_hard_exceeded", False):
+        return
+    _maybe_alert_cost_cap_once(status)
+    raise LLMCallError(
+        f"PAID daily LLM budget exhausted "
+        f"(${status['today_usd']:.2f} >= ${status['daily_hard_cap']:.2f}); "
+        f"resets 00:00 UTC"
+    )
+
+
+_COST_CAP_FLAG_RETENTION_DAYS = 30
+
+
+def _sweep_old_cost_cap_flags(retention_days: int = _COST_CAP_FLAG_RETENTION_DAYS) -> None:
+    """v1.5.6 review fix #1: delete cost_cap_alerted_*.flag older than N days.
+
+    Lazy sweep — called from _maybe_alert_cost_cap_once on each new-day write.
+    Retention default 30 days so forensic question 'when did we last hit cap'
+    is still answerable from disk for the last month. Older flags accumulate
+    forever otherwise (~365/year of empty files).
+
+    Best-effort: any error here MUST NOT prevent the cap raise upstream.
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    from . import storage as _storage
+    try:
+        cutoff = _dt.now(_tz.utc).date() - _td(days=max(0, int(retention_days)))
+        for flag in _storage.PAID_DIR.glob(f"{_COST_CAP_FLAG_PREFIX}*.flag"):
+            # name format: cost_cap_alerted_YYYY-MM-DD.flag — pull the date
+            date_str = flag.name[len(_COST_CAP_FLAG_PREFIX):-len(".flag")]
+            try:
+                flag_date = _dt.strptime(date_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue  # unknown filename pattern — leave alone
+            if flag_date < cutoff:
+                try:
+                    flag.unlink()
+                except OSError:
+                    pass
+    except Exception:
+        # Sweep is opportunistic; never let it raise.
+        pass
+
+
+def _maybe_alert_cost_cap_once(status: dict) -> None:
+    """On first cap-exceed of the UTC day, write a fatal_alerts.jsonl row.
+
+    Two channels:
+      1. ``fatal_alerts.jsonl`` — durable; the existing tail watchers /
+         ``bin/check_cost_cap.py`` cron pick it up and IM the owner.
+      2. Per-UTC-day flag file — dedupes our writes within a day; cron has
+         its own IM debounce window for the IM-channel side.
+
+    v1.5.6 review fix #1: when we write today's flag we opportunistically
+    sweep flags >30 days old so PAID_DIR doesn't accumulate ~365 empty
+    flag files/year.
+
+    Failure to write MUST NOT prevent the raise upstream — that would let
+    cost climb further. Swallow all errors.
+    """
+    import json as _json
+    from datetime import datetime as _dt, timezone as _tz
+    from . import storage as _storage
+    today = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+    flag = _cost_cap_flag_path(today)
+    if flag.exists():
+        return
+    try:
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        flag.touch()
+    except Exception:
+        return
+    # Cleanup old flags (best-effort; internal try/except + outer guard so a
+    # future refactor that breaks sweep can't break the alert path).
+    try:
+        _sweep_old_cost_cap_flags()
+    except Exception:
+        pass
+    try:
+        _storage.append_jsonl(
+            _storage.PAID_DIR / "fatal_alerts.jsonl",
+            {
+                "ts": _dt.now(_tz.utc).isoformat(),
+                "reason": "cost_cap_exceeded",
+                "detail": _json.dumps({
+                    "today_usd": status.get("today_usd"),
+                    "daily_hard_cap": status.get("daily_hard_cap"),
+                }),
+            },
+        )
+    except Exception:
+        # Best-effort: alert is nice-to-have, raise is must-have.
+        pass
+
+
+# ---------------------------------------------------------------------------
 # v1.4.2: api_key resolution helpers
 #
 # Why: JELabs pilot 2026-05-13 surfaced a silent-failure mode. Operator had
@@ -354,8 +491,16 @@ def call_llm(
 
     Raises:
         HermesConfigError: ``~/.hermes/config.yaml`` is missing or malformed.
-        LLMCallError: HTTP error or unexpected response shape.
+        LLMCallError: HTTP error or unexpected response shape. Also raised
+            up front when ``cost.cap_status()['daily_hard_exceeded']`` is True
+            (v1.5.5 A2 — hard budget enforcement before any HTTP call).
     """
+    # v1.5.5 A2: cost ceiling — hard short-circuit at entry to call_llm so
+    # classifier / safety / review never burn another cent once the day's
+    # hard cap is reached. Owner gets one alert per day; callers' existing
+    # try/except LLMCallError gracefully degrades.
+    _enforce_cost_cap()
+
     config = _load_hermes_config()
     model_cfg = _resolve_model_section(config)
 
