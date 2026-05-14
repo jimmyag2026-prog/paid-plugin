@@ -260,3 +260,94 @@ def test_everyday_mode_allows_paid_commands(paid_tmp_iso, monkeypatch):
     rv = plugin.on_pre_gateway_dispatch(event=e)
     # Owner /paid-* → falls through; returns None so slash dispatcher handles it.
     assert rv is None
+
+
+# ---------------------------------------------------------------------------
+# v1.5.2 regression test: card synthetic commands bypass group routing
+# ---------------------------------------------------------------------------
+
+
+def test_card_synthetic_command_bypasses_group_routing(paid_tmp_iso, monkeypatch):
+    """Hermes feishu adapter synthesizes button-click events as
+    ``/card button {json}`` MessageEvent with chat_type='group' HARDCODED
+    (see hermes/gateway/platforms/feishu.py::_handle_card_action_event).
+    On a P2P bot↔owner DM this collides with Phase 6 group routing and
+    drops the click as 'paid_group_not_enabled'.
+
+    Regression introduced in v1.5.0; fixed in v1.5.2 by short-circuiting
+    /card synthetic commands through the routing gate as if they were
+    plain P2P traffic. The slash dispatcher will then route them to
+    _cmd_card.
+
+    Latent because:
+      - paid uid 1002 + paid-jelabs uid 1004 VPS gateway logs show
+        ``_handle_card_action_event`` firing on every Lark click;
+      - the synthetic ``/card button ...`` then hit Phase 6 ``classify_routing``,
+        which saw chat_type=='group' + unconfigured group_key →
+        ``paid_group_not_enabled`` → drop.
+    """
+    plugin = _fresh_plugin()
+    _mock_owner(monkeypatch, plugin)
+    _silence_outbound(monkeypatch, plugin)
+
+    # Simulate what hermes adapter actually delivers: synthetic /card command
+    # with chat_type='group' even though the click came from owner's DM with bot.
+    e = _make_event(
+        text='/card button {"paid_action": "approve", "request_id": "abc12345"}',
+        chat_id="oc_owner_dm_chat",
+        chat_type="group",                       # ← hermes hardcodes this
+        user_id="owner_lark",                    # owner clicked
+    )
+
+    captured = {}
+
+    def fake_cmd_card(raw_args):
+        captured["called"] = raw_args
+        return "PAID: handled card click"
+
+    monkeypatch.setattr(plugin, "_cmd_card", fake_cmd_card)
+
+    rv = plugin.on_pre_gateway_dispatch(event=e)
+
+    # Must NOT be dropped by Phase 6 group routing.
+    assert rv != {"action": "skip", "reason": "paid_group_not_enabled"}, \
+        "v1.5.2 regression: /card synthetic command got dropped by group routing"
+    # Must fall through to hermes slash dispatcher (which routes to _cmd_card).
+    # pre_gateway_dispatch returns None on fall-through.
+    assert rv is None
+
+
+def test_card_synthetic_command_bypasses_review_only_strict(paid_tmp_iso, monkeypatch):
+    """Same fix applies to review-only group strict mode — a card click
+    on an approval card from inside (or appearing to be inside) a
+    review-only group must not be gated by the group_review_strict
+    active-session check."""
+    plugin = _fresh_plugin()
+    _mock_owner(monkeypatch, plugin)
+    _silence_outbound(monkeypatch, plugin)
+
+    # Enable a group in review-only mode; the chat_id matches the synthetic
+    # event's chat_id, so classify_routing would normally hit group_review_strict.
+    plugin.group_routing.save_group_config(plugin.group_routing.GroupConfig(
+        group_key="feishu_oc_some_review_group",
+        platform="feishu",
+        group_id="oc_some_review_group",
+        enabled=True,
+        mode="review-only",
+        owner_user_id="owner_lark",
+    ))
+
+    e = _make_event(
+        text='/card button {"paid_action": "approve", "request_id": "xyz789"}',
+        chat_id="oc_some_review_group",
+        chat_type="group",
+        user_id="owner_lark",
+    )
+
+    monkeypatch.setattr(plugin, "_cmd_card", lambda *a, **kw: "ok")
+
+    rv = plugin.on_pre_gateway_dispatch(event=e)
+    assert rv != {
+        "action": "skip", "reason": "paid_group_review_only_non_review_message",
+    }, "/card click in review-only group must not be drop-gated"
+    assert rv is None  # falls through to slash dispatcher
