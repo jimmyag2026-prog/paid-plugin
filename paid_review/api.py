@@ -1026,3 +1026,93 @@ def force_close(sid: str, *, reason: str = "owner_force") -> str:
     state.last_event_kind = "cancelled"
     save_state(state)
     return f"Session {sid!r} force-closed (reason={reason!r}, verdict={state.verdict!r})."
+
+
+def add_attachments_to_session(
+    sid: str, attachments: list[dict],
+) -> dict:
+    """v1.5.4 — append additional attachments to an active review session.
+
+    Called from ``__init__.py::on_pre_gateway_dispatch`` when a cp with an
+    active session sends a media-only inbound (Lark splits ``/review`` text
+    and image into two events — the second event lands here).
+
+    Behavior:
+      - Re-runs ``paid_review.ingest.ingest`` on the new attachments only,
+        with ``initial_message=""``. New normalized text is APPENDED to
+        the session's ``normalized.md`` (with a ``---`` separator if there
+        was existing content).
+      - Extends ``state.ingest_sources`` and ``state.ingest_errors``.
+      - Updates ``state.last_inbound_at`` so TTL pruning sees fresh activity.
+      - Stamps ``state.updated_at``.
+
+    Refuses (returns ok=False) when session is CLOSED or missing — caller
+    can fall back to ``buffer.add()`` to await the next ``/review``.
+
+    Returns dict::
+
+        {
+          "ok": True/False,
+          "added_sources": int,   # new ingest_sources entries
+          "added_errors": int,    # new ingest_errors entries
+          "appended_chars": int,  # how much normalized.md grew
+          "reason": str,          # set when ok=False
+        }
+    """
+    if not attachments:
+        return {"ok": False, "reason": "no attachments to add"}
+    state = load_state(sid)
+    if state is None:
+        return {"ok": False, "reason": "session not found"}
+    if state.stage == "CLOSED":
+        return {"ok": False, "reason": "session already closed"}
+
+    sid_dir = session_dir(sid)
+
+    # Try to import the LarkClient singleton; tolerate absence (tests, no
+    # FEISHU env). LarkDocBackend is the only attachment-backend that
+    # needs it, and current callers only pass image/PDF paths so absence
+    # is non-fatal.
+    lark_client = None
+    try:
+        from paid.lark_client import get_lark_client
+        lark_client = get_lark_client()
+    except Exception:
+        lark_client = None
+
+    from paid_review import ingest as _ingest
+
+    try:
+        result = _ingest.ingest(
+            initial_message="",
+            attachments=attachments,
+            sid_dir=sid_dir,
+            lark_client=lark_client,
+        )
+    except Exception as exc:
+        logger.warning("add_attachments_to_session: ingest crashed sid=%s: %s", sid, exc)
+        return {"ok": False, "reason": f"ingest crashed: {exc}"}
+
+    # Append to normalized.md
+    norm = sid_dir / "normalized.md"
+    appended_chars = 0
+    if result.normalized_text and result.normalized_text.strip():
+        existing = norm.read_text(encoding="utf-8") if norm.exists() else ""
+        sep = "\n\n---\n\n" if existing.strip() else ""
+        new_content = existing + sep + result.normalized_text
+        norm.write_text(new_content, encoding="utf-8")
+        appended_chars = len(new_content) - len(existing)
+
+    # Extend state audit
+    state.ingest_sources.extend(result.sources)
+    state.ingest_errors.extend(result.errors)
+    state.last_inbound_at = _now_iso()
+    state.updated_at = _now_iso()
+    save_state(state)
+
+    return {
+        "ok": True,
+        "added_sources": len(result.sources),
+        "added_errors": len(result.errors),
+        "appended_chars": appended_chars,
+    }

@@ -586,12 +586,29 @@ def _maybe_route_to_review_skill(cp, user_message: str,
                 _t("review_need_subject", _lang) if _t else
                 "请告诉我要 review 的 subject。例: /review Q3 OKR 草稿"
             )
+        # v1.5.4: drain any media buffered for this cp (sent before
+        # /review). Combine with whatever attachments hermes already
+        # gave us in hook_kwargs.
+        explicit_attachments = list(hook_kwargs.get("attachments", []) or [])
+        buffered_attachments: list[dict] = []
+        try:
+            from paid_review import attachment_buffer as _buf
+            buffered_attachments = _buf.drain(cp.platform, cp.user_id)
+            if buffered_attachments:
+                _safe_log(
+                    f"[review attach] drained {len(buffered_attachments)} "
+                    f"buffered media for cp={cp.cp_id} at /review intake"
+                )
+        except Exception as exc:
+            _safe_log(f"[review attach] drain EXC cp={cp.cp_id}: {exc}")
+        all_attachments = explicit_attachments + buffered_attachments
+
         # Run intake
         try:
             from paid_review import api as _review_api
             sid = _review_api.intake(
                 cp=cp, initial_message=initial or text,
-                attachments=hook_kwargs.get("attachments", []),
+                attachments=all_attachments,
             )
             identity.set_active_review_session(cp, sid)
         except Exception as exc:
@@ -1119,6 +1136,104 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
         # the first call does real work.
         if platform == "telegram":
             _ensure_telegram_callback_registered()
+
+        # v1.5.4: attachment-binding for two-event Lark delivery.
+        # Lark splits "/review <text>" + image attachment into two
+        # separate inbound events (4-10 sec apart). We bind the media
+        # back to the cp's review session in two ways:
+        #
+        #  (a) Active session: when cp has an open review session, this
+        #      event has media but no /review prefix → call
+        #      paid_review.api.add_attachments_to_session() directly to
+        #      append the media into the session's ingest pipeline.
+        #      Returns {action:skip,reason:paid_review_attachment_bound}.
+        #
+        #  (b) No active session: passively buffer the media path in
+        #      ``paid_review.attachment_buffer`` (90s TTL, per-cp).
+        #      A subsequent /review intake call drains the buffer and
+        #      includes the buffered attachments. Do NOT skip here —
+        #      let hermes' main agent continue normal handling, since
+        #      we don't know yet whether a /review is coming.
+        #
+        # Owner-side media is ignored — owners can DM the bot images and
+        # we want hermes' vision flow to handle them normally (J0 path).
+        _event_media_urls = list(getattr(event, "media_urls", []) or [])
+        _event_media_types = list(getattr(event, "media_types", []) or [])
+        _event_text_for_media = str(getattr(event, "text", "") or "").strip()
+        _has_media = bool(_event_media_urls)
+        _is_owner_now = bool(
+            platform and sender_id
+            and identity.is_owner(platform, sender_id)
+        )
+        # Only handle media-only messages (no /review|/r prefix). Messages
+        # that bundle text + media (e.g., a Lark caption with an image)
+        # flow through the normal /review handler with attachments=[]
+        # in hook_kwargs — fix in _maybe_route_to_review_skill (Path 2)
+        # drains the buffer there.
+        _is_media_only = (
+            _has_media
+            and not _event_text_for_media.startswith("/review")
+            and not _event_text_for_media.startswith("/r ")
+            and _event_text_for_media not in ("/r", "/review")
+        )
+        if _is_media_only and platform and sender_id and not _is_owner_now:
+            _attachments_from_event = [
+                {
+                    "path": p,
+                    "mimetype": (_event_media_types[i] if i < len(_event_media_types) else ""),
+                    "name": os.path.basename(p) if p else f"media_{i}",
+                }
+                for i, p in enumerate(_event_media_urls)
+                if p
+            ]
+            _active_sid = ""
+            try:
+                _cp_quick = identity.load_counterparty(platform, sender_id)
+                if _cp_quick and _cp_quick.active_review_session:
+                    _active_sid = _cp_quick.active_review_session
+            except Exception:
+                pass
+
+            if _active_sid:
+                # (a) bind to active session
+                try:
+                    from paid_review import api as _review_api
+                    _bind_res = _review_api.add_attachments_to_session(
+                        _active_sid, _attachments_from_event,
+                    )
+                    _safe_log(
+                        f"[review attach] bound {len(_attachments_from_event)} "
+                        f"to active sid={_active_sid[:8]}: {_bind_res}"
+                    )
+                    return {
+                        "action": "skip",
+                        "reason": "paid_review_attachment_bound",
+                    }
+                except Exception as exc:
+                    _safe_log(
+                        f"[review attach] bind to active sid={_active_sid[:8]} "
+                        f"EXC: {exc}"
+                    )
+                    # fall through — don't block hermes' own media handling
+            else:
+                # (b) buffer for upcoming /review (passive)
+                try:
+                    from paid_review import attachment_buffer as _buf
+                    for a in _attachments_from_event:
+                        _buf.add(
+                            platform, sender_id,
+                            path=a["path"], mime=a["mimetype"], name=a["name"],
+                        )
+                    _safe_log(
+                        f"[review attach] buffered {len(_attachments_from_event)} "
+                        f"media for cp={platform}:{sender_id[:8]} "
+                        f"(awaiting /review within TTL)"
+                    )
+                except Exception as exc:
+                    _safe_log(f"[review attach] buffer add EXC: {exc}")
+                # Do NOT return skip — let hermes continue its routing.
+                # The buffer is a passive memo; hermes can still vision-
+                # analyze the image normally if cp never /reviews.
 
         # v1.5 Phase 6: group routing gate. By default group chats are
         # NOT enabled — owner must opt in per group via /paid-enable-group
