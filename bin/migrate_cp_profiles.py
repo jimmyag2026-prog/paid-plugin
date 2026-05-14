@@ -51,6 +51,9 @@ _V2_DEFAULTS: dict[str, object] = {
     "discovery_notified_at": "",
     "active_review_session": "",
     "review_history": [],
+    # v1.4.5 (backlog v1.4.7): added field for per-cp blacklist routing.
+    # Default "decline" preserves pre-v1.4.5 behavior on existing profiles.
+    "blacklist_action": "decline",
 }
 
 

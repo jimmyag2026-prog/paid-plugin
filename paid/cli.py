@@ -162,6 +162,18 @@ def _cmd_add_counterparty(args: argparse.Namespace) -> int:
         cp.topics_always_escalate = list(args.topic_escalate)
     if args.notes:
         cp.notes = args.notes
+    # v1.4.5 (backlog v1.4.7): owner picks what happens when classifier
+    # flags a topic as blacklisted for this cp — decline-to-cp or request
+    # (approval card). Default "decline" preserves pre-v1.4.5 behavior.
+    if getattr(args, "blacklist_action", None):
+        if args.blacklist_action not in ("decline", "request"):
+            print(
+                f"ERROR: --blacklist-action must be 'decline' or 'request' "
+                f"(got {args.blacklist_action!r})",
+                file=sys.stderr,
+            )
+            return 2
+        cp.blacklist_action = args.blacklist_action
 
     profile_path = storage.PAID_DIR / "counterparties" / cp.cp_id / "profile.json"
     storage.write_json(profile_path, asdict(cp))
@@ -431,6 +443,16 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--topic-allow", action="append", default=[])
     a.add_argument("--topic-escalate", action="append", default=[])
     a.add_argument("--notes", default="")
+    a.add_argument(
+        "--blacklist-action",
+        choices=["decline", "request"],
+        default=None,
+        help=(
+            "How to route classifier-flagged blacklist topics: 'decline' "
+            "(default, tell cp to ping owner directly) or 'request' "
+            "(escalate to owner via approval card)."
+        ),
+    )
     a.set_defaults(func=_cmd_add_counterparty)
 
     ig = sub.add_parser(

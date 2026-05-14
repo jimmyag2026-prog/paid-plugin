@@ -168,7 +168,8 @@ def decide_action(
 
     Order:
       0. Hard global blacklist on user_message     -> request (escalate)
-      1. is_blacklisted=True                       -> decline
+      1. is_blacklisted=True                       -> decline OR request
+                                                      (per cp.blacklist_action)
       1.5 needs_review=True AND stakes >= min      -> review (hand off)
       2. in_scope=False                            -> request
       3. stakes=="high"                            -> request
@@ -179,7 +180,21 @@ def decide_action(
     check: a draft / proposal that needs structured review is worth opening
     a session for even if the topic isn't on the counterparty's allow-list,
     since the review session itself involves the owner. is_blacklisted still
-    wins so a "review my equity grant" ask still declines on rule 1.
+    wins so a "review my equity grant" ask still hits rule 1.
+
+    v1.4.5 (backlog v1.4.7): rule 1's destination is per-cp configurable
+    via ``counterparty.blacklist_action``:
+      - ``"decline"`` (default, pre-v1.4.5 behavior): tell cp to contact
+        owner directly; owner DM is NOT notified.
+      - ``"request"``: escalate to owner via approval card; cp gets the
+        "I'll forward this" placeholder.
+    Different pilots want different things — JELabs (2026-05-13) wanted
+    EVERY high-risk inbound buffered in the owner's queue. Pre-v1.4.5 the
+    only knob was emptying ``topics_always_escalate`` and we shipped a
+    surgical patch in v1.4.1 to suppress the classifier's "or sensitive"
+    LLM fallback. v1.4.5 restores that fallback (so owners who DON'T set
+    a `topics_always_escalate` list still get safety-net guardrails) and
+    moves the "what happens on blacklist" choice to explicit cp config.
 
     `classification` and `counterparty` are duck-typed; we only read attrs.
     """
@@ -199,6 +214,15 @@ def decide_action(
     needs_review = bool(getattr(classification, "needs_review", False))
 
     if is_blacklisted:
+        # v1.4.5: route per cp config. Default "decline" preserves
+        # backwards-compatibility — existing profiles without the field
+        # behave exactly as pre-v1.4.5.
+        action_pref = str(getattr(counterparty, "blacklist_action", "decline") or "decline").lower()
+        if action_pref == "request":
+            return Action(
+                state="request",
+                reason="blacklisted topic, escalating to owner per cp.blacklist_action=request",
+            )
         return Action(state="decline", reason="counterparty blacklisted topic")
 
     # 1.5 review hand-off (only if review subsystem is enabled).

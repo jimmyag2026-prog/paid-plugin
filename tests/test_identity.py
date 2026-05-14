@@ -191,3 +191,71 @@ def test_resolve_lark_target_only_lark_identities_count(paid_tmp, monkeypatch):
     monkeypatch.setenv("FEISHU_HOME_CHANNEL", "oc_correct_fallback")
     # No routable feishu identity → env fallback.
     assert identity.resolve_owner_lark_target("8ea86e3b") == "oc_correct_fallback"
+
+
+# ---------------------------------------------------------------------------
+# v1.4.5: blacklist_action field on Counterparty (backlog v1.4.7)
+# ---------------------------------------------------------------------------
+
+
+def test_counterparty_dataclass_blacklist_action_default():
+    """New Counterparty defaults blacklist_action='decline' (pre-v1.4.5
+    behavior preserved when field not specified)."""
+    from paid.identity import Counterparty
+    cp = Counterparty(
+        cp_id="x_y", platform="x", user_id="y", display_name="d",
+        role="junior", topics_allowed=[], topics_always_escalate=[],
+        web_search_allowed=True, notes="",
+    )
+    assert cp.blacklist_action == "decline"
+
+
+def test_load_counterparty_missing_field_defaults_decline(tmp_path, monkeypatch):
+    """Existing v1.4.4 profile.json without blacklist_action key loads
+    with the default. Backwards compatibility for pre-v1.4.5 installs."""
+    from paid import identity, storage
+    monkeypatch.setattr(storage, "PAID_DIR", tmp_path)
+    cp_dir = tmp_path / "counterparties" / "telegram_legacy"
+    cp_dir.mkdir(parents=True)
+    (cp_dir / "profile.json").write_text(
+        '{"cp_id": "telegram_legacy", "platform": "telegram", "user_id": "legacy", '
+        '"display_name": "L", "role": "junior", "topics_allowed": [], '
+        '"topics_always_escalate": [], "web_search_allowed": true, "notes": ""}',
+        encoding="utf-8",
+    )
+    cp = identity.load_counterparty("telegram", "legacy")
+    assert cp is not None
+    assert cp.blacklist_action == "decline"
+
+
+def test_load_counterparty_with_blacklist_action_request(tmp_path, monkeypatch):
+    """v1.4.5 profile with blacklist_action='request' loads cleanly."""
+    from paid import identity, storage
+    monkeypatch.setattr(storage, "PAID_DIR", tmp_path)
+    cp_dir = tmp_path / "counterparties" / "feishu_xiaevie"
+    cp_dir.mkdir(parents=True)
+    (cp_dir / "profile.json").write_text(
+        '{"cp_id": "feishu_xiaevie", "platform": "feishu", "user_id": "xiaevie", '
+        '"display_name": "XiaEvie", "role": "junior", "topics_allowed": [], '
+        '"topics_always_escalate": [], "web_search_allowed": true, "notes": "", '
+        '"blacklist_action": "request"}',
+        encoding="utf-8",
+    )
+    cp = identity.load_counterparty("feishu", "xiaevie")
+    assert cp.blacklist_action == "request"
+
+
+def test_save_load_round_trip_preserves_blacklist_action(tmp_path, monkeypatch):
+    from paid import identity, storage
+    from dataclasses import asdict
+    monkeypatch.setattr(storage, "PAID_DIR", tmp_path)
+    (tmp_path / "counterparties").mkdir(parents=True, exist_ok=True)
+    cp = identity.Counterparty(
+        cp_id="x_y", platform="x", user_id="y", display_name="d",
+        role="junior", topics_allowed=[], topics_always_escalate=["hiring"],
+        web_search_allowed=True, notes="",
+        blacklist_action="request",
+    )
+    identity.save_counterparty(cp)
+    loaded = identity.load_counterparty("x", "y")
+    assert loaded.blacklist_action == "request"

@@ -217,6 +217,19 @@ class Counterparty:
     # counterparty doesn't blow up the profile json. The dashboard pulls
     # full session bodies from sessions/_closed/ on demand.
     review_history: list[dict] = field(default_factory=list)
+    # v1.4.5 (backlog v1.4.7): how to handle a classifier-flagged
+    # blacklisted topic for THIS counterparty. Two options:
+    #   "decline" — tell the cp "I'm not authorized; please contact owner
+    #               directly" (default, matches pre-v1.4.5 behavior).
+    #               Owner DM is NOT notified; cp must follow up.
+    #   "request" — escalate to owner via approval card; cp gets the
+    #               standard "I'll forward this" placeholder. Owner sees
+    #               the question in their DM and can dispatch.
+    # Different owners want different things — pilots like JELabs
+    # (XiaEvie 2026-05-13) want every high-risk inbound buffered in their
+    # approval queue; other owners prefer counterparties to ping them
+    # directly. This setting makes the choice explicit per cp.
+    blacklist_action: str = "decline"
 
 
 def _owner_path() -> Path:
@@ -314,6 +327,9 @@ def load_counterparty(platform: str, sender_id: str) -> Counterparty | None:
         discovery_notified_at=data.get("discovery_notified_at", ""),
         active_review_session=data.get("active_review_session", "") or "",
         review_history=[h for h in raw_history if isinstance(h, dict)],
+        # v1.4.5 (backlog v1.4.7): default "decline" preserves pre-v1.4.5
+        # behavior for existing cp profiles that don't have this field.
+        blacklist_action=str(data.get("blacklist_action", "decline") or "decline"),
     )
 
 
