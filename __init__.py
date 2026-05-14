@@ -43,6 +43,7 @@ from paid import (
     card_spec,
     classifier,
     decision,
+    group_routing,
     hermes_io,
     identity,
     retrieval,
@@ -1095,6 +1096,42 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
         # the first call does real work.
         if platform == "telegram":
             _ensure_telegram_callback_registered()
+
+        # v1.5 Phase 6: group routing gate. By default group chats are
+        # NOT enabled — owner must opt in per group via /paid-enable-group
+        # (Phase 7). Until then, any group message is silently dropped to
+        # prevent the bot from auto-replying in groups it was added to.
+        # Owner-issued /paid-* commands inside groups are always allowed
+        # through so Phase 7 self-service can run from the group itself.
+        try:
+            event_text_peek = str(getattr(event, "text", "") or "")
+            _routing = group_routing.classify_routing(event, text=event_text_peek)
+        except Exception:
+            _routing = "p2p"  # fail-open
+        if _routing != "p2p":
+            owner_in_group_command = (
+                platform and sender_id
+                and identity.is_owner(platform, sender_id)
+                and event_text_peek.lstrip().startswith("/paid-")
+            )
+            if _routing == "group_disabled" and not owner_in_group_command:
+                return {"action": "skip", "reason": "paid_group_not_enabled"}
+            if _routing in ("group_everyday", "group_both"):
+                # Phase 6 reserves these modes — drop until Phase 6.x wires
+                # the everyday Claude flow. /paid-* and /review continue to
+                # work via the explicit allowances below.
+                allowed_prefixes = ("/paid-", "/review", "/r ")
+                stripped_peek = event_text_peek.lstrip()
+                if not any(
+                    stripped_peek.startswith(p) or stripped_peek == p.rstrip()
+                    for p in allowed_prefixes
+                ):
+                    return {
+                        "action": "skip",
+                        "reason": f"paid_group_mode_reserved_{_routing}",
+                    }
+            # _routing == "group_review" falls through — existing /review
+            # interception + active-session handling apply as if it were P2P.
 
         if platform and sender_id and identity.is_owner(platform, sender_id):
             # Owner-side messages normally pass through to hermes / Claude.
