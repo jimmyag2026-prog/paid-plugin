@@ -61,12 +61,16 @@ def test_upgrade_preserves_existing_v2_fields():
         "discovery_notified_at": "",
         "active_review_session": "sess-abc",
         "review_history": [{"sid": "old", "verdict": "READY"}],
+        # v1.4.5: blacklist_action added; include here so the test is
+        # "all v2-incl-1.4.5 fields present" and remains a true no-op.
+        "blacklist_action": "decline",
     }
     new, changes = _mig.upgrade_cp_payload(data)
     assert changes == []  # already v2 + all fields present
     assert new["ignore_reason"] == "spam"
     assert new["active_review_session"] == "sess-abc"
     assert len(new["review_history"]) == 1
+    assert new["blacklist_action"] == "decline"
 
 
 def test_upgrade_preserves_existing_some_v2_fields_partial():
@@ -89,10 +93,30 @@ def test_upgrade_v2_record_is_noop():
         "ignore_reason": "", "ignore_set_at": "",
         "discovery_notified_at": "",
         "active_review_session": "", "review_history": [],
+        # v1.4.5: include the new field so the record is "fully v1.4.5";
+        # without it the migration would non-trivially add the field.
+        "blacklist_action": "decline",
     }
     new, changes = _mig.upgrade_cp_payload(data)
     assert changes == []
     assert new == data
+
+
+def test_upgrade_v1_4_4_record_gets_blacklist_action_backfilled():
+    """A profile written by pre-v1.4.5 (schema_version=2 but missing
+    blacklist_action) gets the new field added with default 'decline'.
+    This is the canonical v1.4.4 → v1.4.5 migration path."""
+    data = {
+        "schema_version": 2,
+        "cp_id": "x", "platform": "tg", "user_id": "1",
+        "ignore_reason": "", "ignore_set_at": "",
+        "discovery_notified_at": "",
+        "active_review_session": "", "review_history": [],
+        # No blacklist_action — pre-v1.4.5
+    }
+    new, changes = _mig.upgrade_cp_payload(data)
+    assert new["blacklist_action"] == "decline"
+    assert any("blacklist_action" in c for c in changes)
 
 
 def test_upgrade_review_history_uses_fresh_list_per_record():
@@ -159,6 +183,8 @@ def test_migrate_one_v2_file_is_noop(paid_tmp):
         ignore_reason="", ignore_set_at="",
         discovery_notified_at="",
         active_review_session="", review_history=[],
+        # v1.4.5: must include for true no-op
+        blacklist_action="decline",
     )
     before = profile.read_text()
     changed, log = _mig.migrate_one(profile, dry_run=False)
@@ -182,7 +208,7 @@ def test_migrate_one_invalid_json_raises(paid_tmp):
 
 
 def test_migrate_all_walks_counterparties_dir(paid_tmp, capsys):
-    # 2 v1 profiles, 1 already-v2, 1 broken
+    # 2 v1 profiles, 1 already-v1.4.5, 1 broken
     _write_v1_profile(paid_tmp, "telegram_1")
     _write_v1_profile(paid_tmp, "lark_2")
     _write_v1_profile(
@@ -190,6 +216,8 @@ def test_migrate_all_walks_counterparties_dir(paid_tmp, capsys):
         ignore_reason="", ignore_set_at="",
         discovery_notified_at="",
         active_review_session="", review_history=[],
+        # v1.4.5: must include for true skip
+        blacklist_action="decline",
     )
     bad_dir = paid_tmp / "counterparties" / "broken"
     bad_dir.mkdir()

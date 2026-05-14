@@ -389,3 +389,68 @@ def test_init_wrap_reply_for_hermes_uses_unified_helper():
     assert "context" in out
     assert "preserving all line breaks" in out["context"]
     assert "Hi there." in out["context"]
+
+
+# ---------------------------------------------------------------------------
+# v1.4.5: per-cp blacklist_action routing (backlog v1.4.7)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FakeCounterpartyWithBlacklist:
+    cp_id: str = "telegram_xyz"
+    platform: str = "telegram"
+    user_id: str = "xyz"
+    display_name: str = "Test"
+    role: str = "junior"
+    topics_allowed: list[str] = None  # type: ignore[assignment]
+    topics_always_escalate: list[str] = None  # type: ignore[assignment]
+    web_search_allowed: bool = True
+    notes: str = ""
+    blacklist_action: str = "decline"
+
+
+def test_blacklist_action_decline_routes_to_decline():
+    """Default 'decline' preserves pre-v1.4.5 behavior."""
+    cls = FakeClassification(is_blacklisted=True, in_scope=False, stakes="high", confidence=1.0)
+    cp = FakeCounterpartyWithBlacklist(blacklist_action="decline")
+    a = decide_action(cls, cp)
+    assert a.state == "decline"
+    assert "blacklisted" in a.reason.lower()
+
+
+def test_blacklist_action_request_routes_to_approval_card():
+    """'request' setting sends blacklisted topics to owner's approval queue."""
+    cls = FakeClassification(is_blacklisted=True, in_scope=False, stakes="high", confidence=1.0)
+    cp = FakeCounterpartyWithBlacklist(blacklist_action="request")
+    a = decide_action(cls, cp)
+    assert a.state == "request"
+    assert "escalat" in a.reason.lower()  # "escalating to owner"
+    assert "blacklist_action=request" in a.reason
+
+
+def test_blacklist_action_missing_defaults_to_decline():
+    """Counterparty without the field (e.g. pre-v1.4.5 profile) defaults
+    to 'decline' for backwards compatibility."""
+    # FakeCounterparty (no blacklist_action attribute) — the original fixture
+    cls = FakeClassification(is_blacklisted=True, in_scope=False, stakes="high", confidence=1.0)
+    cp = FakeCounterparty()  # no blacklist_action attribute
+    a = decide_action(cls, cp)
+    assert a.state == "decline"
+
+
+def test_blacklist_action_invalid_value_falls_back_to_decline():
+    """Defensive: a malformed value (string typo, None) shouldn't crash —
+    fall back to 'decline'."""
+    cls = FakeClassification(is_blacklisted=True, in_scope=False, stakes="high", confidence=1.0)
+    cp = FakeCounterpartyWithBlacklist(blacklist_action="bogus")
+    a = decide_action(cls, cp)
+    assert a.state == "decline"
+
+
+def test_blacklist_action_case_insensitive():
+    """'REQUEST' / 'Request' should work like 'request'."""
+    cls = FakeClassification(is_blacklisted=True, in_scope=False, stakes="high", confidence=1.0)
+    cp = FakeCounterpartyWithBlacklist(blacklist_action="REQUEST")
+    a = decide_action(cls, cp)
+    assert a.state == "request"
