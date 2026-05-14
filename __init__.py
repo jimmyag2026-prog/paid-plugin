@@ -50,6 +50,7 @@ from paid import (
     safety,
     storage,
 )
+from paid import setup_wizard as _setup_wizard
 
 
 # ---------------------------------------------------------------------------
@@ -1368,6 +1369,47 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
                     group_rv = None
                 if group_rv is not None:
                     return group_rv
+
+            # v1.6.0: /paid-setup wizard. Owner DMs the bot to configure
+            # profile via 5-question state machine (or edit-mode menu when
+            # profile already exists). Subsequent plain-text replies from
+            # the owner WHILE the wizard is active are captured as answers
+            # — see the "owner in wizard" branch below.
+            try:
+                wiz_rv = _handle_setup_command_in_pre_gateway(
+                    event, platform, sender_id, owner_text_peek,
+                )
+            except Exception as exc:
+                _safe_log(f"[setup_wizard] handler EXC: {exc}")
+                wiz_rv = None
+            if wiz_rv is not None:
+                return wiz_rv
+
+            # v1.6.0: owner in wizard → capture next plain text as answer
+            if (
+                owner_text_peek
+                and not owner_text_peek.startswith("/")
+                and _setup_wizard.is_active(platform, sender_id)
+            ):
+                _chat_id_for_send = ""
+                if source is not None:
+                    _cid_w = getattr(source, "chat_id", None)
+                    _chat_id_for_send = str(_cid_w) if _cid_w else ""
+                try:
+                    reply_text, _wiz_done = _setup_wizard.consume(
+                        platform, sender_id, owner_text_peek,
+                    )
+                except Exception as exc:
+                    _safe_log(f"[setup_wizard] consume EXC: {exc}")
+                    reply_text, _wiz_done = (
+                        f"PAID setup: 出错了 — {exc}。发 /paid-setup cancel 退出。",
+                        False,
+                    )
+                _send_setup_wizard_reply(platform, sender_id, _chat_id_for_send, reply_text)
+                return {
+                    "action": "skip",
+                    "reason": ("paid_setup_done" if _wiz_done else "paid_setup_step"),
+                }
             # Owner-side messages normally pass through to hermes / Claude.
             # BUT: if the owner clicked ✅ / ✏️ on a card and we armed
             # awaiting_input, the next plain-text reply in the same chat
@@ -2108,6 +2150,63 @@ def _send_group_reply(platform: str, sender_id: str, chat_id: str,
         hermes_io.send_dm(platform, target, text, fallback_to_queue=True)
     except Exception as exc:
         _safe_log(f"[group_cmd] reply send EXC plat={platform} target={target}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# v1.6.0 setup wizard intercept
+# ---------------------------------------------------------------------------
+
+
+def _handle_setup_command_in_pre_gateway(
+    event, platform: str, sender_id: str, text: str,
+) -> dict | None:
+    """Handle ``/paid-setup`` and ``/paid-resync`` slash commands from owner.
+
+    Returns a ``{"action": "skip", ...}`` dict when handled, else None
+    (let other handlers continue). Replies go directly via send_dm so
+    hermes' slash dispatcher doesn't also try to handle them.
+    """
+    stripped = text.lstrip()
+    chat_id = ""
+    if event is not None and getattr(event, "source", None) is not None:
+        chat_id = str(getattr(event.source, "chat_id", "") or "")
+
+    parts = stripped.split(None, 1)
+    cmd = parts[0] if parts else ""
+
+    if cmd == "/paid-setup":
+        # Two sub-forms: "/paid-setup cancel" or just "/paid-setup"
+        sub = (parts[1].strip().lower() if len(parts) > 1 else "")
+        if sub in ("cancel", "exit", "quit", "abort"):
+            reply = _setup_wizard.cancel(platform, sender_id)
+            _send_setup_wizard_reply(platform, sender_id, chat_id, reply)
+            return {"action": "skip", "reason": "paid_setup_cancelled"}
+        # Start wizard (first-time or edit mode)
+        reply = _setup_wizard.start(platform, sender_id)
+        _send_setup_wizard_reply(platform, sender_id, chat_id, reply)
+        return {"action": "skip", "reason": "paid_setup_started"}
+
+    if cmd == "/paid-resync":
+        reply = _setup_wizard.resync()
+        _send_setup_wizard_reply(platform, sender_id, chat_id, reply)
+        return {"action": "skip", "reason": "paid_resync_done"}
+
+    return None
+
+
+def _send_setup_wizard_reply(
+    platform: str, sender_id: str, chat_id: str, text: str,
+) -> None:
+    """Send wizard reply. Owner DM (not group) is the primary path.
+    chat_id used when platform routes via chat_id (Lark)."""
+    target = chat_id or sender_id
+    try:
+        hermes_io.send_dm(platform, target, text, fallback_to_queue=True)
+    except Exception as exc:
+        _safe_log(
+            f"[setup_wizard] reply send EXC plat={platform} "
+            f"target={target}: {exc}"
+        )
 
 
 # ---------------------------------------------------------------------------
