@@ -41,6 +41,7 @@ from .ingest_backends import (
     LarkDocBackend,
     PdfBackend,
     TextBackend,
+    WebScrapeBackend,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,12 @@ def _default_backends(lark_client: Any | None = None) -> list[IngestBackend]:
     # CLI + pytesseract + pillow must all be present at runtime, else
     # backend returns placeholder + missing-piece advisory).
     backends.append(ImageBackend())
+    # Web scrape backend — generic HTTP(S) URLs that no earlier URL
+    # backend claimed. Lark URLs are routed to LarkDocBackend first
+    # (registered above when lark_client present); WebScrapeBackend
+    # explicitly refuses *.feishu.cn / *.larksuite.com hosts even when
+    # LarkDocBackend isn't in the list.
+    backends.append(WebScrapeBackend())
     return backends
 
 
