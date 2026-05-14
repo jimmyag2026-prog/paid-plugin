@@ -2156,3 +2156,61 @@ def register(ctx) -> None:
         _safe_log("pre_gateway_dispatch routes: /review /r (paid_review skill, cp-side)")
     else:
         _safe_log("hooks: pre_llm_call, post_llm_call (commands skipped — hermes < 0.11)")
+
+    # v1.4.2: dry-run the classifier LLM path at startup so silent-failure
+    # mode (yaml missing model.api_key, env var missing) is surfaced
+    # immediately as a fatal_alert + owner DM, instead of every cp message
+    # falling through to fallback `request` while owner wonders why
+    # auto-answer isn't firing. JELabs pilot 2026-05-13 root cause.
+    _classifier_health_check()
+
+
+def _classifier_health_check() -> None:
+    """Best-effort one-shot LLM ping; failure → loud fatal_alert + owner DM.
+
+    Why: PAID classifier reads ``config.yaml model.api_key`` (now also env
+    vars per v1.4.2). If neither is set, every cp message lands in the
+    ``[fallback]`` branch — owner sees no auto-answer, no error in any
+    UI, just silent degradation. Detect it at register-time, surface
+    once, let operator fix before pilot suffers.
+
+    All paths wrapped in try/except: the health-check MUST NOT raise into
+    plugin registration. Failure is informational, not fatal to startup.
+    """
+    try:
+        from paid.hermes_io import call_llm, HermesConfigError
+    except Exception as exc:
+        _safe_log(
+            f"[health-check] cannot import hermes_io ({exc}); classifier ping skipped"
+        )
+        return
+    try:
+        reply = call_llm("ping", system="Reply with the single word: ok")
+        _safe_log(
+            f"[health-check] classifier dry-run OK (reply preview: {reply[:60]!r})"
+        )
+    except HermesConfigError as exc:
+        msg = (
+            "PAID classifier dry-run FAILED — all cp messages will fall through "
+            "to fallback `request` (every inbound becomes an approval card). "
+            f"Root cause: {exc}"
+        )
+        _safe_log(f"[health-check] {msg}")
+        try:
+            _alert_owner(reason="classifier_config_invalid", detail=str(exc))
+        except Exception as alert_exc:
+            _safe_log(
+                f"[health-check] _alert_owner also failed: {alert_exc}"
+            )
+    except Exception as exc:
+        # LLM call itself failed (network, 4xx from provider, etc.).
+        msg = f"PAID classifier dry-run FAILED at LLM call: {exc}"
+        _safe_log(f"[health-check] {msg}")
+        try:
+            _alert_owner(
+                reason="classifier_llm_unreachable", detail=str(exc)[:500]
+            )
+        except Exception as alert_exc:
+            _safe_log(
+                f"[health-check] _alert_owner also failed: {alert_exc}"
+            )

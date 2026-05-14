@@ -17,6 +17,7 @@ completion request and returns the assistant's text reply.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,9 @@ import yaml
 
 HERMES_CONFIG_PATH: Path = Path.home() / ".hermes" / "config.yaml"
 DEFAULT_TIMEOUT: float = 60.0
+
+# Module-level guard for one-shot dotenv load (idempotent).
+_DOTENV_LOADED: bool = False
 
 # Providers whose base_url is the API root (no /v1 implied) → endpoint /v1/chat/completions
 # Providers whose base_url already includes /v1 (e.g. openrouter) → /chat/completions
@@ -37,6 +41,82 @@ class HermesConfigError(Exception):
 
 class LLMCallError(Exception):
     """Raised when the chat-completion HTTP call fails or returns junk."""
+
+
+# ---------------------------------------------------------------------------
+# v1.4.2: api_key resolution helpers
+#
+# Why: JELabs pilot 2026-05-13 surfaced a silent-failure mode. Operator had
+# set api_key only via ``hermes auth add`` (PAID doesn't read that pool) or
+# only in ``~/.hermes/.env`` (systemd ``--user`` gateway unit doesn't load
+# it). PAID classifier fell through to fallback on every cp message ⇒ owner
+# saw approval cards for everything supposedly auto-answerable, with no
+# clear indication that the LLM call had failed.
+#
+# v1.4.2 resolves api_key by chain: yaml → provider env var → clear error.
+# ---------------------------------------------------------------------------
+
+_PROVIDER_ENV_VAR: dict[str, str] = {
+    "deepseek":    "DEEPSEEK_API_KEY",
+    "openai":      "OPENAI_API_KEY",
+    "openrouter":  "OPENROUTER_API_KEY",
+    "anthropic":   "ANTHROPIC_API_KEY",
+    "gemini":      "GEMINI_API_KEY",
+    "google":      "GOOGLE_API_KEY",
+    "kimi":        "KIMI_API_KEY",
+    "kimi-coding": "KIMI_API_KEY",
+    "moonshot":    "KIMI_API_KEY",
+    "zai":         "GLM_API_KEY",
+    "minimax":     "MINIMAX_API_KEY",
+    "nvidia":      "NVIDIA_API_KEY",
+}
+
+
+def _env_var_name_for(provider: str) -> str:
+    """Map provider → expected env var name. Falls back to ``<UPPER>_API_KEY``."""
+    return _PROVIDER_ENV_VAR.get(provider, f"{provider.upper()}_API_KEY")
+
+
+def _load_dotenv_if_present(env_path: Path | None = None) -> None:
+    """Best-effort one-shot load of ``~/.hermes/.env`` into ``os.environ``.
+
+    Why: systemd ``--user`` gateway units don't ``EnvironmentFile=`` it,
+    so PAID classifier never sees the operator's ``DEEPSEEK_API_KEY`` etc.
+    Idempotent (guarded by ``_DOTENV_LOADED``); doesn't override pre-set
+    vars (``setdefault``).
+    """
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    if env_path is None:
+        env_path = HERMES_CONFIG_PATH.parent / ".env"
+    if not env_path.exists():
+        _DOTENV_LOADED = True
+        return
+    try:
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                val = val[1:-1]
+            os.environ.setdefault(key, val)
+    except OSError:
+        pass
+    _DOTENV_LOADED = True
+
+
+def _api_key_from_env(provider: str) -> str:
+    """Return api_key for ``provider`` from env, '' if unset.
+
+    Triggers a lazy ``~/.hermes/.env`` load so systemd-launched gateways
+    see operator-set keys.
+    """
+    _load_dotenv_if_present()
+    return os.environ.get(_env_var_name_for(provider), "").strip()
 
 
 def _load_hermes_config(path: Path | None = None) -> dict[str, Any]:
@@ -60,21 +140,41 @@ def _load_hermes_config(path: Path | None = None) -> dict[str, Any]:
 
 
 def _resolve_model_section(config: dict[str, Any]) -> dict[str, Any]:
-    """Extract the top-level 'model' mapping with required keys."""
+    """Extract the top-level 'model' mapping with required keys.
+
+    api_key resolution order (v1.4.2):
+
+      1. ``config.yaml`` ``model.api_key`` (explicit, takes precedence)
+      2. provider-derived env var (e.g. ``DEEPSEEK_API_KEY`` for
+         ``provider: deepseek``); also loads ``~/.hermes/.env`` on demand
+      3. raise ``HermesConfigError`` with a hint pointing at both paths
+
+    Pre-v1.4.2: api_key was read only from yaml. Operators who set the key
+    via ``hermes auth add ...`` or ``.env`` saw the classifier silently fall
+    back on every cp message. See backlog v1.4.4 / v1.4.6.
+    """
     model = config.get("model")
     if not isinstance(model, dict):
         raise HermesConfigError("config.yaml has no top-level 'model:' mapping")
     base_url = model.get("base_url")
-    api_key = model.get("api_key")
     default_model = model.get("default")
+    provider = (model.get("provider") or "openai").strip().lower()
+
+    api_key = model.get("api_key") or _api_key_from_env(provider)
+
     if not base_url or not api_key or not default_model:
+        env_var = _env_var_name_for(provider)
         raise HermesConfigError(
             "model section missing one of base_url / api_key / default "
             f"(got base_url={bool(base_url)}, api_key={bool(api_key)}, "
-            f"default={bool(default_model)})"
+            f"default={bool(default_model)}). To fix: set "
+            "~/.hermes/config.yaml `model.api_key:` OR export "
+            f"{env_var} (also picked up from ~/.hermes/.env). "
+            "Note: `hermes auth add` is NOT read by PAID — yaml or env var "
+            "is required."
         )
     return {
-        "provider": model.get("provider") or "openai",
+        "provider": provider,
         "model": default_model,
         "base_url": str(base_url).rstrip("/"),
         "api_key": api_key,
