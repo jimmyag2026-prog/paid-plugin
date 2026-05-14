@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -46,7 +46,9 @@ class SessionState:
     """Per-session state machine record. Stored at sessions/<sid>/meta.json."""
 
     sid: str
-    schema_version: int = 1
+    # v1.5: bumped 1 → 2 with addition of ingest_sources + ingest_errors.
+    # load_state tolerates missing fields → old v1 sessions still load.
+    schema_version: int = 2
     created_at: str = ""
     updated_at: str = ""
     last_inbound_at: str = ""      # TTL anchor; stamped by handle_inbound
@@ -70,6 +72,16 @@ class SessionState:
     # Plugin glue surfaces this to the owner alert path so the brief
     # isn't silently lost. Junior gets a degraded-but-honest message.
     delivery_failed: bool = False
+    # v1.5: multimedia ingest audit. Populated by paid_review.ingest
+    # dispatcher when backends successfully extract content from URLs
+    # or files. Each entry: {backend, source, note}. Used by
+    # build_summary brief to show "# Sources" section with origin
+    # info per attached / linked piece of material.
+    ingest_sources: list[dict] = field(default_factory=list)
+    # v1.5: per-source ingest failures (Lark API 403, pdftotext crash,
+    # tesseract no-text, etc.) — surfaced in brief's ⚠️ Ingest errors
+    # block per doc 09 §5.5 partial-failure UX.
+    ingest_errors: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +179,7 @@ def load_state(sid: str) -> SessionState | None:
         return None
     return SessionState(
         sid=data.get("sid", sid),
-        schema_version=int(data.get("schema_version", 1)),
+        schema_version=int(data.get("schema_version", 2)),
         created_at=data.get("created_at", ""),
         updated_at=data.get("updated_at", ""),
         last_inbound_at=data.get("last_inbound_at", ""),
@@ -187,6 +199,10 @@ def load_state(sid: str) -> SessionState | None:
         llm_cost_usd=float(data.get("llm_cost_usd", 0.0)),
         trace_id=data.get("trace_id"),
         delivery_failed=bool(data.get("delivery_failed", False)),
+        # v1.5 fields default to [] for backward-compat with pre-v1.5
+        # session jsons that don't include them.
+        ingest_sources=list(data.get("ingest_sources", []) or []),
+        ingest_errors=list(data.get("ingest_errors", []) or []),
     )
 
 
