@@ -1103,11 +1103,30 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
         # prevent the bot from auto-replying in groups it was added to.
         # Owner-issued /paid-* commands inside groups are always allowed
         # through so Phase 7 self-service can run from the group itself.
-        try:
-            event_text_peek = str(getattr(event, "text", "") or "")
-            _routing = group_routing.classify_routing(event, text=event_text_peek)
-        except Exception:
-            _routing = "p2p"  # fail-open
+        #
+        # v1.5.2 fix: hermes feishu adapter synthesizes card-action button
+        # clicks into `/card button {json}` MessageEvents with
+        # event_chat_type="group" HARDCODED (gateway/platforms/feishu.py
+        # ``_handle_card_action_event``). On a Lark bot↔owner DM this is
+        # technically still oc_*-prefixed chat_id, and the synthetic
+        # chat_type="group" made Phase 6 misclassify the click as a group
+        # message and drop it with `paid_group_not_enabled`. The whole
+        # /card slash command path is owner-tools-only and routes to
+        # ``_cmd_card`` regardless of chat type — let it bypass the
+        # routing gate entirely. (Regression introduced in v1.5.0 when
+        # Phase 6 wiring landed; latent because lark card clicks weren't
+        # tested live until v1.5.1 manual smoke. Both paid uid 1002 and
+        # paid-jelabs uid 1004 logs show `_handle_card_action_event`
+        # firing correctly but PAID dropping the synthetic command at
+        # the routing gate.)
+        event_text_peek = str(getattr(event, "text", "") or "")
+        if event_text_peek.lstrip().startswith("/card "):
+            _routing = "p2p"
+        else:
+            try:
+                _routing = group_routing.classify_routing(event, text=event_text_peek)
+            except Exception:
+                _routing = "p2p"  # fail-open
         if _routing != "p2p":
             owner_in_group_command = (
                 platform and sender_id
