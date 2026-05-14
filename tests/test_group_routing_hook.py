@@ -189,7 +189,7 @@ def test_review_only_group_lets_review_command_through(paid_tmp_iso, monkeypatch
     # branch will handle it. We just need to confirm the group gate didn't drop it.
     captured = {}
 
-    def fake_handler(platform, sender_id, stripped):
+    def fake_handler(platform, sender_id, stripped, *, event=None):
         captured["called"] = (platform, sender_id, stripped)
         return {"action": "skip", "reason": "paid_review_handled"}
 

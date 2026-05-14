@@ -82,6 +82,10 @@ class SessionState:
     # tesseract no-text, etc.) — surfaced in brief's ⚠️ Ingest errors
     # block per doc 09 §5.5 partial-failure UX.
     ingest_errors: list[str] = field(default_factory=list)
+    # v1.5.3: reply language ("zh" | "en" | "ko"; default empty → "zh").
+    # Set at INTAKE from the cp's first message via paid_review.i18n
+    # ``detect_lang``. Used by every cp-facing reply template thereafter.
+    lang: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +207,8 @@ def load_state(sid: str) -> SessionState | None:
         # session jsons that don't include them.
         ingest_sources=list(data.get("ingest_sources", []) or []),
         ingest_errors=list(data.get("ingest_errors", []) or []),
+        # v1.5.3 — defaults to empty (treated as zh downstream)
+        lang=str(data.get("lang", "") or ""),
     )
 
 

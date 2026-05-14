@@ -118,7 +118,7 @@ def test_review_only_allows_chatter_from_cp_with_active_session(
 
     captured = {}
 
-    def fake_handler(platform, sender_id, stripped):
+    def fake_handler(platform, sender_id, stripped, *, event=None):
         captured["called"] = (platform, sender_id, stripped)
         return {"action": "skip", "reason": "paid_review_handled"}
 
@@ -152,7 +152,7 @@ def test_review_only_lets_review_command_through(
 
     captured = {}
 
-    def fake_handler(platform, sender_id, stripped):
+    def fake_handler(platform, sender_id, stripped, *, event=None):
         captured["called"] = (platform, sender_id, stripped)
         return {"action": "skip", "reason": "paid_review_handled"}
 

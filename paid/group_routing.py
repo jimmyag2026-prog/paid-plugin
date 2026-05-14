@@ -266,7 +266,12 @@ def delete_group_config(group_key: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-_REVIEW_CMD_RE = re.compile(r"^/r(?:eview)?(?:\s|$)", re.IGNORECASE)
+# v1.5.3 fix #6: accept CJK (and other non-letter) chars immediately after
+# /review prefix. Previously required whitespace/EOL — Chinese-speaking
+# juniors typed `/review看一下` (no space) and got routed as chatter.
+# Pattern: `/r` or `/review`, then EITHER end-of-string OR any non-letter
+# character (so `/reviewing` is still NOT a /review command).
+_REVIEW_CMD_RE = re.compile(r"^/r(?:eview)?(?:$|[^a-zA-Z])", re.IGNORECASE)
 
 
 def classify_routing(event: Any, text: str = "") -> str:
