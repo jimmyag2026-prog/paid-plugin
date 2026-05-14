@@ -549,6 +549,8 @@ def _do_force_close(
             junior_platform=state.platform,
             rounds=state.rounds, verdict=state.verdict,
             document=document, forced_reason=reason,
+            ingest_sources=state.ingest_sources,
+            ingest_errors=state.ingest_errors,
         )
     except Exception:
         # Force-close path must never raise; missing artifacts is a soft fail.
@@ -647,6 +649,8 @@ def _do_gate_and_close(
                     rounds=state.rounds, verdict=state.verdict,
                     document=document,
                     forced_reason=f"rounds_exhausted (gate rationale: {rationale})",
+                    ingest_sources=state.ingest_sources,
+                    ingest_errors=state.ingest_errors,
                 )
                 brief_text = delivered["summary"]
             except Exception as exc:
@@ -710,6 +714,8 @@ def _do_gate_and_close(
             junior_platform=state.platform,
             rounds=state.rounds, verdict=state.verdict,
             document=document,
+            ingest_sources=state.ingest_sources,
+            ingest_errors=state.ingest_errors,
         )
         brief_text = delivered["summary"]
     except Exception as exc:
@@ -822,7 +828,25 @@ def intake(
         from paid_review import ingest as _ingest_mod
         sid_dir = session_dir(sid)
         sid_dir.mkdir(parents=True, exist_ok=True)
-        result = _ingest_mod.ingest(initial_message, attachments or [], sid_dir)
+        # v1.5: pass lark_client singleton so URL-driven backends can
+        # fetch Lark Doc/Wiki content. Singleton fails gracefully when
+        # FEISHU_APP_ID/SECRET aren't set — ingest still runs text-only.
+        lark_client_obj = None
+        try:
+            from paid.lark_client import get_lark_client
+            lark_client_obj = get_lark_client()
+        except Exception as lc_exc:
+            logger.warning(
+                "[review] sid=%s no LarkClient (Lark URL ingest disabled): %s",
+                sid, lc_exc,
+            )
+
+        result = _ingest_mod.ingest(
+            initial_message,
+            attachments or [],
+            sid_dir,
+            lark_client=lark_client_obj,
+        )
         (sid_dir / "normalized.md").write_text(
             result.normalized_text or (initial_message or ""),
             encoding="utf-8",
@@ -830,6 +854,18 @@ def intake(
         if result.errors:
             logger.warning(
                 "[review] sid=%s ingest had %d errors", sid, len(result.errors)
+            )
+        # v1.5: persist ingest audit to SessionState so build_summary
+        # can render Sources footer + ⚠️ ingest_errors header in brief.
+        try:
+            st = load_state(sid)
+            if st is not None:
+                st.ingest_sources = list(result.sources or [])
+                st.ingest_errors = list(result.errors or [])
+                save_state(st)
+        except Exception as exc:
+            logger.warning(
+                "[review] sid=%s persisting ingest audit failed: %s", sid, exc,
             )
     except Exception as exc:
         logger.warning("[review] sid=%s ingest crashed: %s", sid, exc)

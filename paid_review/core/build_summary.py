@@ -91,8 +91,15 @@ def _heuristic_fallback_brief(*, subject: str, junior_name: str,
 def build_summary(*, subject: str, junior_name: str, junior_platform: str,
                   rounds: int, verdict: str,
                   document: str,
-                  annotations: list[Annotation]) -> str:
+                  annotations: list[Annotation],
+                  ingest_sources: list[dict] | None = None,
+                  ingest_errors: list[str] | None = None) -> str:
     """Return the 6-section markdown brief.
+
+    v1.5 additions:
+      - ingest_sources / ingest_errors prepend a "⚠️ Ingest errors" block
+        and a "Sources" footer so owner can audit what PAID actually
+        read (vs. what junior pasted as URL).
 
     Falls back to deterministic skeleton on LLM failure (caller still
     writes summary.md so owner sees something).
@@ -115,19 +122,53 @@ def build_summary(*, subject: str, junior_name: str, junior_platform: str,
         raw = _call_llm(prompt)
     except Exception as exc:
         logger.warning("build_summary: LLM call failed: %s", exc)
-        return _heuristic_fallback_brief(
+        body = _heuristic_fallback_brief(
             subject=subject, junior_name=junior_name,
             rounds=rounds, verdict=verdict, annotations=annotations,
         )
+        return _attach_ingest_audit(body, ingest_sources, ingest_errors)
 
     text = raw.strip()
     # If LLM didn't even start with the expected header, treat as garbage
     if not text.startswith("#"):
         logger.warning("build_summary: LLM output didn't start with markdown header; "
                        "raw=%r", text[:200])
-        return _heuristic_fallback_brief(
+        body = _heuristic_fallback_brief(
             subject=subject, junior_name=junior_name,
             rounds=rounds, verdict=verdict, annotations=annotations,
         )
+        return _attach_ingest_audit(body, ingest_sources, ingest_errors)
 
-    return text
+    return _attach_ingest_audit(text, ingest_sources, ingest_errors)
+
+
+def _attach_ingest_audit(
+    brief: str,
+    sources: list[dict] | None,
+    errors: list[str] | None,
+) -> str:
+    """Prepend ⚠️ Ingest errors block + append Sources footer (v1.5).
+
+    Per doc 09 §5.5 partial-failure UX: owner sees at top of brief what
+    PAID couldn't read; at bottom what PAID did read with backend/source
+    audit.
+    """
+    head = ""
+    if errors:
+        bullets = "\n".join(f"- {e}" for e in errors)
+        head = (
+            f"⚠️ **Ingest errors ({len(errors)})** — PAID couldn't read "
+            f"some of the material:\n{bullets}\n\n"
+        )
+    tail = ""
+    real_sources = [s for s in (sources or []) if s.get("source")]
+    if real_sources:
+        lines = []
+        for s in real_sources:
+            backend = s.get("backend", "?")
+            source = s.get("source", "?")
+            note = s.get("note", "")
+            note_str = f" ({note})" if note else ""
+            lines.append(f"- `{source}` via `{backend}`{note_str}")
+        tail = "\n\n## Sources\n\n" + "\n".join(lines) + "\n"
+    return head + brief + tail

@@ -35,7 +35,11 @@ def test_ingest_text_file_attachment_inlined(tmp_path):
         sid_dir,
     )
     assert "subject ask" in out.normalized_text
-    assert "### Attachment: src.txt" in out.normalized_text
+    # v1.5: backend system renders "# Source: <path>" headers for file
+    # backends (text backend on the "message" source keeps the v1.4
+    # bare-text rendering).
+    assert "# Source:" in out.normalized_text
+    assert "src.txt" in out.normalized_text
     assert "file body content" in out.normalized_text
     assert (sid_dir / "input" / "src.txt").exists()
     assert out.saved_inputs and out.saved_inputs[0].name == "src.txt"
@@ -74,7 +78,9 @@ def test_ingest_inline_text_attachment_no_path(tmp_path):
         sid_dir,
     )
     assert "main" in out.normalized_text
-    assert "### Attachment: memo" in out.normalized_text
+    # v1.5: inline text attachment routed through TextBackend.ingest_string
+    # → rendered with "# Source: memo" header (not the legacy ### header).
+    assert "memo" in out.normalized_text
     assert "an inline note" in out.normalized_text
     # No file copied (no path given)
     assert not (sid_dir / "input").exists() or list((sid_dir / "input").iterdir()) == []
@@ -109,8 +115,12 @@ def test_ingest_truncates_large_textfile(tmp_path):
     src.write_bytes(b"x" * (300 * 1024))  # 300 KiB > 256 KiB cap
     sid_dir = tmp_path / "sid_h"
     out = ingest_mod.ingest("", [{"path": str(src), "name": "huge.txt"}], sid_dir)
-    assert "[…truncated…]" in out.normalized_text
-    # Original copy kept full
+    # v1.5: truncation marker is human-readable "(truncated to 256.0KB
+    # from 300.0KB)" appearing as a markdown italic line next to the
+    # source header. Old "[…truncated…]" sentinel is gone.
+    assert "truncated to" in out.normalized_text
+    assert "300.0KB" in out.normalized_text  # original size shown
+    # Original copy kept full (v1.5 unchanged)
     assert (sid_dir / "input" / "huge.txt").stat().st_size == 300 * 1024
 
 
@@ -136,17 +146,20 @@ def test_ingest_collision_avoided_in_input_dir(tmp_path):
 
 
 def test_ingest_one_backend_failure_doesnt_kill_others(tmp_path, monkeypatch):
+    """v1.5 rename: _process_attachment → _route_attachment. Same
+    contract: one attachment's failure must not kill others; failed
+    one shows up in IngestResult.errors."""
     src_ok = tmp_path / "ok.txt"
     src_ok.write_text("survivor", encoding="utf-8")
 
-    real = ingest_mod._process_attachment
+    real = ingest_mod._route_attachment
 
-    def flaky(att, idx, input_dir):
+    def flaky(att, idx, input_dir, backends):
         if att.get("name") == "boom":
             raise RuntimeError("disk read error")
-        return real(att, idx, input_dir)
+        return real(att, idx, input_dir, backends)
 
-    monkeypatch.setattr(ingest_mod, "_process_attachment", flaky)
+    monkeypatch.setattr(ingest_mod, "_route_attachment", flaky)
     sid_dir = tmp_path / "sid_j"
     out = ingest_mod.ingest(
         "main",

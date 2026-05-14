@@ -36,8 +36,14 @@ def write_artifacts(sid_dir: Path, *,
                     subject: str, junior_name: str, junior_platform: str,
                     rounds: int, verdict: str,
                     document: str,
-                    forced_reason: str = "") -> dict[str, str]:
+                    forced_reason: str = "",
+                    ingest_sources: list[dict] | None = None,
+                    ingest_errors: list[str] | None = None) -> dict[str, str]:
     """Write summary.md + summary_audit.md inside sid_dir.
+
+    v1.5: optional ingest_sources / ingest_errors are propagated into the
+    brief — caller (api.py) reads them off SessionState and passes here.
+    Defaults preserve pre-v1.5 callers that don't know about ingest audit.
 
     Returns the textual contents (for caller to put in ReviewReply.text
     so owner gets the brief in IM).
@@ -49,6 +55,8 @@ def write_artifacts(sid_dir: Path, *,
         junior_platform=junior_platform,
         rounds=rounds, verdict=verdict,
         document=document, annotations=annotations,
+        ingest_sources=ingest_sources,
+        ingest_errors=ingest_errors,
     )
     audit_text = build_audit(
         subject=subject, junior_name=junior_name,
@@ -85,7 +93,9 @@ def deliver(sid_dir: Path, sessions_root: Path, *,
             rounds: int, verdict: str,
             document: str,
             forced_reason: str = "",
-            do_archive: bool = True) -> dict[str, object]:
+            do_archive: bool = True,
+            ingest_sources: list[dict] | None = None,
+            ingest_errors: list[str] | None = None) -> dict[str, object]:
     """Write artifacts + (optionally) archive.
 
     Returns:
@@ -98,6 +108,9 @@ def deliver(sid_dir: Path, sessions_root: Path, *,
     `do_archive=False` is for tests + force_close paths that want the
     files written but skip the move (e.g. if archiving is risky in test
     fixtures).
+
+    v1.5: ingest_sources / ingest_errors propagate to the brief via
+    write_artifacts → build_summary.
     """
     artifacts = write_artifacts(
         sid_dir,
@@ -105,6 +118,8 @@ def deliver(sid_dir: Path, sessions_root: Path, *,
         junior_platform=junior_platform,
         rounds=rounds, verdict=verdict,
         document=document, forced_reason=forced_reason,
+        ingest_sources=ingest_sources,
+        ingest_errors=ingest_errors,
     )
 
     archived_at: Path | None = None
