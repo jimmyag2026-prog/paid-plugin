@@ -393,17 +393,23 @@ def test_dispatcher_truncation_note_renders_in_normalized(tmp_path):
 
 
 def test_dispatcher_unsupported_attachment_still_breadcrumbed(tmp_path):
-    """Binary file with no backend → placeholder, file still archived."""
-    pdf = tmp_path / "x.pdf"
-    pdf.write_bytes(b"%PDF-binary")
-    sid_dir = tmp_path / "sid_pdf"
+    """Binary file with no backend → placeholder, file still archived.
+
+    Use .docx (not in any Phase 3 backend) to test the placeholder
+    fallback path. PDF is now handled by PdfBackend (Phase 3) so it
+    wouldn't trigger the placeholder branch.
+    """
+    docx = tmp_path / "x.docx"
+    docx.write_bytes(b"PK\x03\x04 docx-zip-header")
+    sid_dir = tmp_path / "sid_docx"
     out = ingest_mod.ingest(
         "ask",
-        [{"path": str(pdf), "name": "x.pdf", "mimetype": "application/pdf"}],
+        [{"path": str(docx), "name": "x.docx",
+          "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}],
         sid_dir,
     )
-    assert "[attachment: x.pdf]" in out.normalized_text
+    assert "[attachment: x.docx]" in out.normalized_text
     # File saved despite no backend
-    assert (sid_dir / "input" / "x.pdf").exists()
+    assert (sid_dir / "input" / "x.docx").exists()
     # Source audit has a placeholder entry
     assert any(s["backend"] == "placeholder" for s in out.sources)
