@@ -177,21 +177,79 @@ def _read_other_cp_names(current_cp_id: str) -> list[str]:
     return names
 
 
+_PUBLIC_WHITELIST_HEADINGS = (
+    "公开材料", "public materials", "whitelist",
+    "whitelist for l4", "public info", "public data",
+)
+
+
+def _load_public_whitelist() -> str:
+    """Read sop.md and extract content under an owner-declared public section.
+
+    Recognises section headings (case-insensitive, allow ``##``+ depth):
+
+        ## 公开材料 / Whitelist
+        ## Public materials
+        ## Whitelist for L4
+        ## Public info
+
+    Returns the section's content (everything until the next ``##`` heading)
+    as a single string. Empty string when no such section exists, or when
+    sop.md is missing — both mean "no whitelist", which is the v1.4.2 default
+    behavior (no false-positive filtering).
+
+    (backlog v1.4.11 — JELabs pilot saw L4 flag the owner's own marketing
+    copy as a leak because the heuristic wasn't aware sop.md had already
+    declared the metrics public.)
+    """
+    sop_path = storage.PAID_DIR / "sop.md"
+    try:
+        text = sop_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+    section_re = re.compile(
+        r"^##\s+(?P<title>.+?)\s*$\n(?P<body>.*?)(?=^##\s+|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    parts: list[str] = []
+    for m in section_re.finditer(text):
+        title = m.group("title").strip().lower()
+        # Whitelist heading may be like "公开材料 / Public materials" — match
+        # if ANY recognised phrase appears in the title line.
+        if any(phrase in title for phrase in _PUBLIC_WHITELIST_HEADINGS):
+            parts.append(m.group("body"))
+    return "\n".join(parts).strip()
+
+
 def detect_cross_cp_name_leakage(
     response: str,
     current_cp_id: str,
+    *,
+    whitelist: str | None = None,
 ) -> tuple[bool, list[str]]:
     """True if *response* mentions another known counterparty's display name.
 
     Word-boundary match (case-insensitive) so substring noise is filtered
     (matches "Alice" but not "alphabetical" / "calibration"). Pure-CJK names
     fall through ``\\b`` so we use a lookaround that still works.
+
+    v1.4.3 (backlog v1.4.11): optional ``whitelist`` is sop.md content the
+    owner has marked as public via a recognised ``## 公开材料 / Public
+    materials / Whitelist`` section. Names appearing verbatim in the
+    whitelist are NOT flagged — when the owner has explicitly declared a
+    partner / customer name public, mentioning it isn't a leak.
     """
     if not response:
         return False, []
     other_names = _read_other_cp_names(current_cp_id)
+    wl = whitelist or ""
     hits: list[str] = []
     for name in other_names:
+        # Whitelist short-circuit: if the owner has declared this name
+        # public in sop.md's whitelist section, skip flagging.
+        if wl and name in wl:
+            continue
         # Use a CJK-tolerant substring search: ASCII names get word-boundary,
         # CJK names get plain substring (re-tokenizing CJK is out of scope).
         if any(ord(c) > 0x2E80 for c in name):
@@ -257,19 +315,37 @@ _PII_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 
-def detect_pii(response: str) -> tuple[bool, list[str]]:
+def detect_pii(
+    response: str,
+    *,
+    whitelist: str | None = None,
+) -> tuple[bool, list[str]]:
     """Return (hit, labels) for any matched PII patterns in *response*.
 
     Labels list is order-preserving; duplicates are collapsed.
+
+    v1.4.3 (backlog v1.4.11): if ``whitelist`` is provided (sop.md's
+    ``## 公开材料 / Public materials`` section), a PII match is suppressed
+    only when the **exact matching text** also appears in the whitelist —
+    e.g. the owner has declared ``evie@jelabs.xyz`` as a public contact.
+    Pattern that matches an unwhitelisted variant still flags.
     """
     if not response:
         return False, []
+    wl = whitelist or ""
     seen: set[str] = set()
     hits: list[str] = []
     for label, pat in _PII_PATTERNS:
-        if pat.search(response) and label not in seen:
-            seen.add(label)
-            hits.append(label)
+        if label in seen:
+            continue
+        m = pat.search(response)
+        if not m:
+            continue
+        if wl and m.group(0) in wl:
+            # Owner has declared this specific value public — don't flag.
+            continue
+        seen.add(label)
+        hits.append(label)
     return (bool(hits), hits)
 
 
@@ -488,9 +564,18 @@ def check_output(
     (use settings).
 
     L4d is on by default (regex, free); set ``run_l4d=False`` to skip.
+
+    v1.4.3 (backlog v1.4.11): loads sop.md's ``## 公开材料 / Public
+    materials / Whitelist`` section once per call and passes it to L4a/L4b
+    detectors so owner-declared public material (company metrics, public
+    contact emails, etc.) is not flagged as a leak.
     """
-    name_hit, names = detect_cross_cp_name_leakage(response, current_cp_id)
-    pii_hit, pii = detect_pii(response)
+    whitelist = _load_public_whitelist()
+
+    name_hit, names = detect_cross_cp_name_leakage(
+        response, current_cp_id, whitelist=whitelist
+    )
+    pii_hit, pii = detect_pii(response, whitelist=whitelist)
 
     out: dict = {
         "ok": True,

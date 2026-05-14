@@ -305,3 +305,33 @@ def test_shape_context_uses_owner_name_param():
     )
     assert "Alice" in out
     assert "Jimmy" not in out
+
+
+# ---------------------------------------------------------------------------
+# v1.4.3: length-cap rule in _DIRECT_HARD_RULES (backlog v1.4.9)
+# ---------------------------------------------------------------------------
+
+
+def test_direct_hard_rules_zh_contains_length_cap():
+    from paid import decision
+    rules = decision._DIRECT_HARD_RULES_ZH
+    # The new rule mentions sentence count + markdown ban
+    assert "1-3" in rules or "1 句" in rules
+    assert "markdown" in rules.lower()
+
+
+def test_direct_hard_rules_en_contains_length_cap():
+    from paid import decision
+    rules = decision._DIRECT_HARD_RULES_EN
+    assert "1-3 sentences" in rules
+    assert "markdown" in rules.lower()
+
+
+def test_direct_context_includes_length_rule(monkeypatch):
+    from paid import decision
+    ctx = decision._direct_context(
+        persona="brief", sop_excerpt="x", draft="d",
+        owner_name="X", lang="zh",
+    )
+    # The compiled context must carry the length rule downstream
+    assert "1-3 句" in ctx or "1-3" in ctx

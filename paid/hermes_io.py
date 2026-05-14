@@ -119,6 +119,60 @@ def _api_key_from_env(provider: str) -> str:
     return os.environ.get(_env_var_name_for(provider), "").strip()
 
 
+# ---------------------------------------------------------------------------
+# v1.4.3: Lark/Feishu markdown sanitisation
+#
+# Lark Suite's ``text`` msg_type doesn't render markdown — bold ``**X**``,
+# bullets ``- item``, and ``[link](url)`` show as literal characters. The
+# LLM happily emits markdown because nothing in persona disallows it.
+# Strip on outbound so counterparties see clean prose.
+#
+# Other platforms (Telegram, Slack) render markdown fine; only feishu/lark
+# triggers this path. (backlog v1.4.8)
+# ---------------------------------------------------------------------------
+
+import re as _re_md
+
+_MD_BOLD = _re_md.compile(r"\*\*([^\s*][^*]*?)\*\*")
+_MD_BOLD_UNDERSCORE = _re_md.compile(r"__([^\s_][^_]*?)__")
+_MD_ITALIC_STAR = _re_md.compile(r"(?<![*\w])\*([^\s*][^*]*?)\*(?![*\w])")
+_MD_ITALIC_UNDERSCORE = _re_md.compile(r"(?<![_\w])_([^\s_][^_]*?)_(?![_\w])")
+_MD_STRIKE = _re_md.compile(r"~~([^~]+?)~~")
+_MD_INLINE_CODE = _re_md.compile(r"`([^`\n]+)`")
+_MD_HEADING = _re_md.compile(r"^#{1,6}\s+", _re_md.MULTILINE)
+_MD_LINK = _re_md.compile(r"\[([^\]]+?)\]\(([^)]+?)\)")
+_MD_BULLET_LINE = _re_md.compile(r"^(\s*)[-*+]\s+", _re_md.MULTILINE)
+
+
+def _strip_markdown_for_lark(text: str) -> str:
+    """Strip markdown formatting so Lark text msg_type renders cleanly.
+
+    Order matters: handle bold (``**X**``) before italic (``*X*``) so a
+    bold marker isn't half-eaten by italic. Links keep visible text + URL
+    in parens. Bullets become Unicode ``•`` for consistent rendering.
+    """
+    if not text:
+        return text
+    out = text
+    # Bold first (longer markers) — preserve content
+    out = _MD_BOLD.sub(r"\1", out)
+    out = _MD_BOLD_UNDERSCORE.sub(r"\1", out)
+    # Strikethrough
+    out = _MD_STRIKE.sub(r"\1", out)
+    # Italic — both flavours
+    out = _MD_ITALIC_STAR.sub(r"\1", out)
+    out = _MD_ITALIC_UNDERSCORE.sub(r"\1", out)
+    # Inline code
+    out = _MD_INLINE_CODE.sub(r"\1", out)
+    # Headings — drop leading hashes (keep heading text on same line)
+    out = _MD_HEADING.sub("", out)
+    # Links → visible text + url in parens (preserves discoverability)
+    out = _MD_LINK.sub(r"\1 (\2)", out)
+    # Bullet list markers — Unicode bullet for consistent list rendering
+    out = _MD_BULLET_LINE.sub(r"\1• ", out)
+    return out
+
+
 def _load_hermes_config(path: Path | None = None) -> dict[str, Any]:
     """Load the Hermes YAML config and return the full dict.
 
@@ -1123,6 +1177,12 @@ def send_dm(
         path with bullets appended (unchanged from v1.0.0).
     """
     import asyncio
+
+    # v1.4.3: Lark/Feishu doesn't render markdown in `text` msg_type — strip
+    # bold/italic/bullet/links to avoid literal `**X**` in the recipient's
+    # chat. Only feishu/lark; Telegram and Slack render markdown natively.
+    if platform in ("feishu", "lark"):
+        message = _strip_markdown_for_lark(message)
 
     # Platform-specific options_block dispatch BEFORE plain-text path.
     # Failure here is non-fatal — we fall through to the plain-text path so
