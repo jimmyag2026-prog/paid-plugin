@@ -19,10 +19,12 @@ Phase 2+ planned:
 from .base import BackendResult, IngestBackend
 from .text import TextBackend
 from .lark_doc import LarkDocBackend
+from .pdf import PdfBackend
 
 __all__ = [
     "BackendResult",
     "IngestBackend",
     "TextBackend",
     "LarkDocBackend",
+    "PdfBackend",
 ]

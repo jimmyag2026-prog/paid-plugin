@@ -38,6 +38,7 @@ from .ingest_backends import (
     BackendResult,
     IngestBackend,
     LarkDocBackend,
+    PdfBackend,
     TextBackend,
 )
 
@@ -82,6 +83,9 @@ def _default_backends(lark_client: Any | None = None) -> list[IngestBackend]:
     backends: list[IngestBackend] = [TextBackend()]
     if lark_client is not None:
         backends.append(LarkDocBackend(lark_client))
+    # PDF backend always added — graceful-degrades when pdftotext/pdfminer
+    # not installed (returns placeholder + advisory error).
+    backends.append(PdfBackend())
     return backends
 
 
