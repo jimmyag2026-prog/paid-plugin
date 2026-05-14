@@ -137,6 +137,11 @@ def collect_summary() -> dict[str, Any]:
             "weekly_soft_cap": 25.0, "enabled": False,
         }
 
+    # v1.5.5 A7: platform_breakdown (schema only, no UI). Aggregates today's
+    # decisions + total cp_count + pending count per platform. Surfaces in
+    # /api/summary.json so external tools / future multi-pilot UI can read it.
+    platform_breakdown = _compute_platform_breakdown(today_rows)
+
     return {
         "owner_name": (owner.name or owner.owner_id) if owner else None,
         "owner_identities": len(owner.identities) if owner else 0,
@@ -158,7 +163,64 @@ def collect_summary() -> dict[str, Any]:
         "cost_soft_cap_usd": float(cost_status.get("daily_soft_cap", 0.0)),
         "cost_hard_cap_usd": float(cost_status.get("daily_hard_cap", 0.0)),
         "cost_cap_enabled": bool(cost_status.get("enabled", False)),
+        # v1.5.5 A7 platform breakdown (schema only, no UI yet)
+        "platform_breakdown": platform_breakdown,
     }
+
+
+def _compute_platform_breakdown(today_audit_rows: list[dict]) -> dict[str, dict[str, int]]:
+    """v1.5.5 A7: per-platform aggregate (cp_count + decisions_today + pending_count).
+
+    Iterates owner identities + all counterparties to learn the platform set,
+    then counts:
+      - cp_count: cps registered on that platform (any role except "ignored"/"blocked")
+      - decisions_today: audit rows whose row.platform (or derived cp.platform)
+        match. We tolerate older audit rows that lack the platform field by
+        falling back to a cp_id → platform lookup.
+      - pending_count: pending approvals for cps on that platform.
+
+    Output shape is platform → {cp_count, decisions_today, pending_count, active_role_counts}.
+    Empty for platforms with no counterparties.
+    """
+    cps = identity.list_all_counterparties()
+    # cp_id → platform lookup for older audit-row fallback
+    cpid_to_plat = {c.cp_id: c.platform for c in cps}
+
+    out: dict[str, dict[str, Any]] = {}
+
+    def _slot(p: str) -> dict[str, Any]:
+        if p not in out:
+            out[p] = {"cp_count": 0, "decisions_today": 0,
+                      "pending_count": 0,
+                      "role_counts": {}}
+        return out[p]
+
+    for c in cps:
+        if not c.platform:
+            continue
+        slot = _slot(c.platform)
+        slot["cp_count"] += 1
+        slot["role_counts"][c.role] = slot["role_counts"].get(c.role, 0) + 1
+
+    # Today's decisions
+    for r in today_audit_rows:
+        plat = r.get("platform") or ""
+        if not plat:
+            cp_id = r.get("counterparty") or ""
+            plat = cpid_to_plat.get(cp_id, "")
+        if plat:
+            _slot(plat)["decisions_today"] += 1
+
+    # Pending approvals (J3)
+    try:
+        for req in approval.list_pending():
+            plat = req.counterparty_platform or ""
+            if plat:
+                _slot(plat)["pending_count"] += 1
+    except Exception:
+        pass
+
+    return out
 
 
 def _safe_truncate(text: str, n: int) -> str:
@@ -269,6 +331,97 @@ def collect_review_sessions(
     if limit is not None:
         rows = rows[: max(0, limit)]
     return rows
+
+
+def collect_trend(days: int = 7) -> dict[str, Any]:
+    """v1.5.5 A5: aggregate per UTC-day series for the last `days` days.
+
+    Output:
+        {
+            "days": int,
+            "labels":  ["YYYY-MM-DD", ...],   # ordered oldest → newest
+            "direct":  [int, ...],
+            "request": [int, ...],
+            "decline": [int, ...],
+            "cost_usd": [float, ...],
+            "totals": {"direct": int, ..., "cost_usd": float},
+        }
+
+    Days with no data render as 0 (so Chart.js gets a continuous series).
+    Robust against bad rows in audit_log / cost_ledger (skip silently).
+    """
+    days = max(1, int(days))
+    today_utc = datetime.now(timezone.utc).date()
+
+    # Pre-build the date axis oldest → newest
+    date_axis = [today_utc - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    date_to_idx = {d.isoformat(): i for i, d in enumerate(date_axis)}
+
+    direct = [0] * days
+    request = [0] * days
+    decline = [0] * days
+    cost_usd = [0.0] * days
+
+    # Audit: bucket by UTC date of row.ts
+    audit_rows = _read_jsonl(storage.PAID_DIR / "audit_log.jsonl")
+    for r in audit_rows:
+        ts = r.get("ts", "")
+        try:
+            row_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        day_key = row_dt.astimezone(timezone.utc).date().isoformat()
+        idx = date_to_idx.get(day_key)
+        if idx is None:
+            continue
+        act = r.get("action") or {}
+        if not isinstance(act, dict):
+            continue
+        state = act.get("state")
+        if state == "direct":
+            direct[idx] += 1
+        elif state == "request":
+            request[idx] += 1
+        elif state == "decline":
+            decline[idx] += 1
+
+    # Cost ledger: prefer entry["date"] (UTC date string already there)
+    ledger_rows = _read_jsonl(storage.PAID_DIR / "cost_ledger.jsonl")
+    for r in ledger_rows:
+        day_key = r.get("date") or ""
+        if not day_key:
+            # Fallback to ts
+            ts = r.get("ts", "")
+            try:
+                day_key = datetime.fromisoformat(
+                    ts.replace("Z", "+00:00")
+                ).astimezone(timezone.utc).date().isoformat()
+            except Exception:
+                continue
+        idx = date_to_idx.get(day_key)
+        if idx is None:
+            continue
+        try:
+            cost_usd[idx] += float(r.get("cost_usd", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+
+    cost_usd = [round(v, 4) for v in cost_usd]
+
+    return {
+        "days": days,
+        "labels": [d.isoformat() for d in date_axis],
+        "direct": direct,
+        "request": request,
+        "decline": decline,
+        "cost_usd": cost_usd,
+        "totals": {
+            "direct": sum(direct),
+            "request": sum(request),
+            "decline": sum(decline),
+            "cost_usd": round(sum(cost_usd), 4),
+        },
+    }
 
 
 def collect_recent_activity(limit: int = 10) -> list[dict[str, Any]]:
@@ -389,9 +542,14 @@ def build_app():
         ]
         recent = collect_recent_activity(limit=10)
         reviews_active = collect_review_sessions(include_closed=False, limit=10)
+        trend7 = collect_trend(days=7)
+        from . import metrics_progress as _mp
+        mp_rows = _mp.collect()
+        mp_done = _mp.n_done(mp_rows)
         return render_template_string(
             _HOME_TEMPLATE, s=s, cps=cps[:10], pending=pending, recent=recent,
-            reviews_active=reviews_active,
+            reviews_active=reviews_active, trend7=trend7,
+            mp_done=mp_done, mp_total=len(mp_rows),
         )
 
     @app.route("/counterparties")
@@ -414,6 +572,28 @@ def build_app():
         return render_template_string(
             _CP_DETAIL_TEMPLATE, cp=cp, rows=rows[:50], reviews=cp_reviews,
         )
+
+    @app.route("/metrics-progress")
+    def metrics_progress_view():
+        from . import metrics_progress as _mp
+        rows = _mp.collect()
+        return render_template_string(
+            _METRICS_PROGRESS_TEMPLATE,
+            rows=rows, n_done=_mp.n_done(rows), n_total=len(rows),
+        )
+
+    @app.route("/trends")
+    def trends_view():
+        t7 = collect_trend(days=7)
+        t30 = collect_trend(days=30)
+        return render_template_string(_TRENDS_TEMPLATE, t7=t7, t30=t30)
+
+    @app.route("/api/trends.json")
+    def api_trends():
+        return jsonify({
+            "7": collect_trend(days=7),
+            "30": collect_trend(days=30),
+        })
 
     @app.route("/reviews")
     def reviews_view():
@@ -504,13 +684,27 @@ _BASE_HEAD = """\
     .bar .marker { position: absolute; top: -2px; width: 2px; height: 14px;
                    background: #888; }
     .muted { color: #888; font-size: 11px; margin-top: 4px; }
+    /* v1.5.5 A5 — chart containers */
+    .chartwrap { background: #fff; padding: 12px 14px; border: 1px solid #e3e3e3;
+                 border-radius: 6px; margin-bottom: 14px; }
+    .chartwrap h3 { font-size: 14px; margin: 0 0 8px; color: #444; font-weight: 600; }
+    .chart-fallback { color: #c33; padding: 12px; font-size: 12px;
+                      background: #fdf6f6; border-radius: 4px; }
+    canvas.chart { max-width: 100%; height: 180px !important; }
+    canvas.chart-lg { max-width: 100%; height: 280px !important; }
   </style>
+  <!-- v1.5.5 A5: Chart.js v4 via jsdelivr CDN. If CDN is unreachable, the
+       <canvas> elements stay empty and inline JS shows the fallback notice. -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"
+          crossorigin="anonymous"></script>
 </head><body>
 <nav>
   <a href="/">Summary</a>
   <a href="/counterparties">Counterparties</a>
   <a href="/pending">Pending</a>
   <a href="/reviews">Reviews</a>
+  <a href="/trends">Trends</a>
+  <a href="/metrics-progress">Progress</a>
   <a href="/audit">Audit</a>
   <a href="/fatal">Fatal alerts</a>
   <a href="/api/summary.json">JSON</a>
@@ -572,6 +766,50 @@ _HOME_TEMPLATE = _BASE_HEAD + """\
 <div class="barwrap"><div class="label"><span>LLM cost today</span>
   <span class="muted">cap disabled — see settings.cost.enabled</span></div></div>
 {% endif %}
+
+{# v1.5.5 A6 — six-indicator progress mini-badge #}
+<div class="barwrap" style="display:flex; justify-content:space-between; align-items:center;">
+  <div>
+    <span style="font-size: 13px; color: #555;">Master-design §6 progress</span>
+    &nbsp;<b>{{ mp_done }}/{{ mp_total }}</b> indicators done
+  </div>
+  <a class="stamp" href="/metrics-progress">details →</a>
+</div>
+
+{# v1.5.5 A5 — compact 7-day trends on home #}
+<div class="chartwrap">
+  <h3>7-day trends <a class="stamp" href="/trends" style="font-weight: normal; margin-left: 8px;">view 30-day →</a></h3>
+  <canvas id="homeTrend7" class="chart"></canvas>
+  <noscript><div class="chart-fallback">Charts require JavaScript. See <a href="/api/trends.json">raw JSON</a>.</div></noscript>
+  <div id="homeTrendFallback" class="chart-fallback" style="display:none">
+    Chart library failed to load — see <a href="/api/trends.json">/api/trends.json</a> for raw data.
+  </div>
+</div>
+<script>
+(function() {
+  if (typeof Chart === "undefined") {
+    document.getElementById("homeTrendFallback").style.display = "block";
+    return;
+  }
+  var ctx = document.getElementById("homeTrend7");
+  new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: {{ trend7.labels | tojson }},
+      datasets: [
+        {label: "direct",  data: {{ trend7.direct  | tojson }}, borderColor: "#1b8a3a", backgroundColor: "rgba(27,138,58,0.1)", tension: 0.2, fill: false},
+        {label: "request", data: {{ trend7.request | tojson }}, borderColor: "#e0a020", backgroundColor: "rgba(224,160,32,0.1)", tension: 0.2, fill: false},
+        {label: "decline", data: {{ trend7.decline | tojson }}, borderColor: "#c33",    backgroundColor: "rgba(204,51,51,0.1)",  tension: 0.2, fill: false}
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {legend: {position: "bottom", labels: {boxWidth: 12, font: {size: 11}}}},
+      scales: {y: {beginAtZero: true, ticks: {precision: 0}}}
+    }
+  });
+})();
+</script>
 
 <h2>Pending approvals</h2>
 {% if not pending %}<p>(none)</p>{% else %}
@@ -721,6 +959,127 @@ _REVIEWS_TEMPLATE = _BASE_HEAD + """\
   <td class="stamp">{{ (r.closed_at or "")[:19] or "—" }}</td>
 </tr>{% endfor %}</table>
 {% endif %}
+</body></html>
+"""
+
+_METRICS_PROGRESS_TEMPLATE = _BASE_HEAD + """\
+<h1>Master-design §6 — progress ({{ n_done }}/{{ n_total }})</h1>
+<p class="stamp">Six hard indicators. ✓ = done. Manual rows toggle via <code>settings.metrics_progress.*</code>; derived rows auto-update from PAID state.</p>
+
+<div class="grid" style="grid-template-columns: repeat(2, 1fr); gap: 14px;">
+{% for r in rows %}
+  <div class="card" style="border-left: 4px solid {% if r.status == 'done' %}#1b8a3a{% else %}#bbb{% endif %};">
+    <div class="lbl">#{{ r.id }} · <span class="pill">{{ r.source }}</span></div>
+    <div style="margin-top: 4px; font-size: 14px; font-weight: 600;">
+      {% if r.status == 'done' %}✓{% else %}○{% endif %} {{ r.title }}
+    </div>
+    <div class="muted" style="margin-top: 6px;">{{ r.detail }}</div>
+  </div>
+{% endfor %}
+</div>
+
+<h2>How to update manual flags</h2>
+<p>Edit <code>~/.hermes/paid/settings.json</code>:</p>
+<pre style="background:#fff; padding:10px; border:1px solid #e3e3e3; border-radius:6px; font-size:12px;">
+{
+  "metrics_progress": {
+    "cross_org_demo_done": true,
+    "twitter_long_post_done": false,
+    "deep_chats_count": 3,
+    "readme_for_strangers_done": false
+  }
+}
+</pre>
+<p class="stamp">Then refresh this page.</p>
+</body></html>
+"""
+
+_TRENDS_TEMPLATE = _BASE_HEAD + """\
+<h1>Trends</h1>
+<p class="stamp">Aggregated per UTC day from audit_log.jsonl + cost_ledger.jsonl.</p>
+
+<div class="chartwrap">
+  <h3>7-day decisions
+    <span class="stamp" style="font-weight: normal; margin-left: 8px;">
+      total: {{ t7.totals.direct }} direct / {{ t7.totals.request }} request / {{ t7.totals.decline }} decline
+    </span>
+  </h3>
+  <canvas id="trend7Decisions" class="chart-lg"></canvas>
+  <div id="trend7Fallback" class="chart-fallback" style="display:none">
+    Chart library failed to load — see <a href="/api/trends.json">/api/trends.json</a>.
+  </div>
+</div>
+
+<div class="chartwrap">
+  <h3>7-day LLM cost (USD)
+    <span class="stamp" style="font-weight: normal; margin-left: 8px;">
+      week total: ${{ "%.2f" | format(t7.totals.cost_usd) }}
+    </span>
+  </h3>
+  <canvas id="trend7Cost" class="chart-lg"></canvas>
+</div>
+
+<div class="chartwrap">
+  <h3>30-day decisions
+    <span class="stamp" style="font-weight: normal; margin-left: 8px;">
+      total: {{ t30.totals.direct }} direct / {{ t30.totals.request }} request / {{ t30.totals.decline }} decline
+    </span>
+  </h3>
+  <canvas id="trend30Decisions" class="chart-lg"></canvas>
+</div>
+
+<div class="chartwrap">
+  <h3>30-day LLM cost (USD)
+    <span class="stamp" style="font-weight: normal; margin-left: 8px;">
+      month total: ${{ "%.2f" | format(t30.totals.cost_usd) }}
+    </span>
+  </h3>
+  <canvas id="trend30Cost" class="chart-lg"></canvas>
+</div>
+
+<p class="stamp"><a href="/api/trends.json">Raw JSON</a></p>
+
+<script>
+(function() {
+  if (typeof Chart === "undefined") {
+    document.getElementById("trend7Fallback").style.display = "block";
+    return;
+  }
+  var decisionsCfg = function(labels, direct, request, decline) {
+    return {
+      type: "line",
+      data: {labels: labels, datasets: [
+        {label: "direct",  data: direct,  borderColor: "#1b8a3a", tension: 0.2},
+        {label: "request", data: request, borderColor: "#e0a020", tension: 0.2},
+        {label: "decline", data: decline, borderColor: "#c33",    tension: 0.2}
+      ]},
+      options: {responsive: true, maintainAspectRatio: false,
+                plugins: {legend: {position: "bottom"}},
+                scales: {y: {beginAtZero: true, ticks: {precision: 0}}}}
+    };
+  };
+  var costCfg = function(labels, costs) {
+    return {
+      type: "bar",
+      data: {labels: labels, datasets: [
+        {label: "cost USD", data: costs, backgroundColor: "rgba(34,102,204,0.6)", borderColor: "#2266cc"}
+      ]},
+      options: {responsive: true, maintainAspectRatio: false,
+                plugins: {legend: {display: false}},
+                scales: {y: {beginAtZero: true,
+                             ticks: {callback: function(v){return "$"+v.toFixed(2);}}}}}
+    };
+  };
+  new Chart(document.getElementById("trend7Decisions"),
+    decisionsCfg({{ t7.labels|tojson }}, {{ t7.direct|tojson }}, {{ t7.request|tojson }}, {{ t7.decline|tojson }}));
+  new Chart(document.getElementById("trend7Cost"),
+    costCfg({{ t7.labels|tojson }}, {{ t7.cost_usd|tojson }}));
+  new Chart(document.getElementById("trend30Decisions"),
+    decisionsCfg({{ t30.labels|tojson }}, {{ t30.direct|tojson }}, {{ t30.request|tojson }}, {{ t30.decline|tojson }}));
+  new Chart(document.getElementById("trend30Cost"),
+    costCfg({{ t30.labels|tojson }}, {{ t30.cost_usd|tojson }}));
+})();
+</script>
 </body></html>
 """
 

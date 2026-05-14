@@ -342,6 +342,235 @@ def test_collect_review_sessions_ignores_underscore_closed_at_top_level(paid_tmp
     assert rows == []
 
 
+# ---------------------------------------------------------------------------
+# v1.5.5 A5 — trend collector tests
+# ---------------------------------------------------------------------------
+
+def test_collect_trend_default_7_days_empty(paid_tmp):
+    t = dashboard.collect_trend()
+    assert t["days"] == 7
+    assert len(t["labels"]) == 7
+    assert len(t["direct"]) == 7
+    assert len(t["request"]) == 7
+    assert len(t["decline"]) == 7
+    assert len(t["cost_usd"]) == 7
+    assert all(v == 0 for v in t["direct"])
+    assert all(v == 0.0 for v in t["cost_usd"])
+    assert t["totals"]["direct"] == 0
+    assert t["totals"]["cost_usd"] == 0.0
+
+
+def test_collect_trend_labels_are_chronological(paid_tmp):
+    t = dashboard.collect_trend(days=7)
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    # Newest label is today (UTC)
+    assert t["labels"][-1] == today_iso
+    # Strictly ascending
+    assert t["labels"] == sorted(t["labels"])
+
+
+def test_collect_trend_buckets_audit_by_utc_day(paid_tmp):
+    audit = paid_tmp / "audit_log.jsonl"
+    today = datetime.now(timezone.utc).date()
+    yesterday = today - timedelta(days=1)
+    rows = [
+        # 2 direct today + 1 request today
+        {"ts": datetime(today.year, today.month, today.day, 9, tzinfo=timezone.utc).isoformat(),
+         "action": {"state": "direct"}},
+        {"ts": datetime(today.year, today.month, today.day, 10, tzinfo=timezone.utc).isoformat(),
+         "action": {"state": "direct"}},
+        {"ts": datetime(today.year, today.month, today.day, 11, tzinfo=timezone.utc).isoformat(),
+         "action": {"state": "request"}},
+        # 1 decline yesterday
+        {"ts": datetime(yesterday.year, yesterday.month, yesterday.day, 15, tzinfo=timezone.utc).isoformat(),
+         "action": {"state": "decline"}},
+    ]
+    audit.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    t = dashboard.collect_trend(days=7)
+    # Today is last index
+    assert t["direct"][-1] == 2
+    assert t["request"][-1] == 1
+    assert t["decline"][-1] == 0
+    # Yesterday is second-to-last
+    assert t["decline"][-2] == 1
+    assert t["direct"][-2] == 0
+    # Totals match
+    assert t["totals"]["direct"] == 2
+    assert t["totals"]["request"] == 1
+    assert t["totals"]["decline"] == 1
+
+
+def test_collect_trend_buckets_cost_by_date_field(paid_tmp):
+    ledger = paid_tmp / "cost_ledger.jsonl"
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    yesterday_iso = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+    rows = [
+        {"ts": "ignored", "date": today_iso, "cost_usd": 1.50},
+        {"ts": "ignored", "date": today_iso, "cost_usd": 0.25},
+        {"ts": "ignored", "date": yesterday_iso, "cost_usd": 2.0},
+    ]
+    ledger.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    t = dashboard.collect_trend(days=7)
+    assert abs(t["cost_usd"][-1] - 1.75) < 1e-6
+    assert abs(t["cost_usd"][-2] - 2.0) < 1e-6
+    assert abs(t["totals"]["cost_usd"] - 3.75) < 1e-6
+
+
+def test_collect_trend_handles_bad_rows(paid_tmp):
+    audit = paid_tmp / "audit_log.jsonl"
+    today = datetime.now(timezone.utc).date()
+    rows = [
+        {"ts": "not-a-date", "action": {"state": "direct"}},      # bad ts → skip
+        {"ts": "ignored", "action": "not-a-dict"},                  # bad action → skip
+        {"ts": datetime(today.year, today.month, today.day, 9, tzinfo=timezone.utc).isoformat(),
+         "action": {"state": "direct"}},                            # good
+    ]
+    audit.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    ledger = paid_tmp / "cost_ledger.jsonl"
+    bad_ledger = [
+        {"date": "not-a-date", "cost_usd": 5.0},
+        {"date": today.isoformat(), "cost_usd": "not-a-float"},
+        {"date": today.isoformat(), "cost_usd": 0.50},
+    ]
+    ledger.write_text("\n".join(json.dumps(r) for r in bad_ledger) + "\n", encoding="utf-8")
+
+    t = dashboard.collect_trend(days=7)
+    assert t["direct"][-1] == 1
+    assert abs(t["cost_usd"][-1] - 0.50) < 1e-6
+
+
+def test_collect_trend_out_of_window_ignored(paid_tmp):
+    audit = paid_tmp / "audit_log.jsonl"
+    ten_days_ago = datetime.now(timezone.utc) - timedelta(days=10)
+    rows = [
+        {"ts": ten_days_ago.isoformat(), "action": {"state": "direct"}},
+    ]
+    audit.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    t = dashboard.collect_trend(days=7)
+    assert t["totals"]["direct"] == 0
+    t30 = dashboard.collect_trend(days=30)
+    assert t30["totals"]["direct"] == 1
+
+
+def test_collect_trend_30_days(paid_tmp):
+    t = dashboard.collect_trend(days=30)
+    assert t["days"] == 30
+    assert len(t["labels"]) == 30
+
+
+def test_collect_trend_min_1_day(paid_tmp):
+    t = dashboard.collect_trend(days=0)
+    assert t["days"] == 1
+    assert len(t["labels"]) == 1
+
+
+def test_trends_template_renders(paid_tmp):
+    try:
+        from jinja2 import Template
+    except ImportError:
+        import pytest
+        pytest.skip("jinja2 not installed in this test env")
+    tpl = Template(dashboard._TRENDS_TEMPLATE)
+    out = tpl.render(t7=dashboard.collect_trend(7), t30=dashboard.collect_trend(30))
+    assert "7-day decisions" in out
+    assert "30-day decisions" in out
+    assert "cdn.jsdelivr.net/npm/chart.js" in out  # CDN include
+    assert "trend7Decisions" in out
+    assert "trend30Cost" in out
+
+
+# ---------------------------------------------------------------------------
+# v1.5.5 A7 — platform_breakdown schema tests
+# ---------------------------------------------------------------------------
+
+def _write_cp_for_platform(paid_tmp, platform, user_id, role="junior"):
+    """Helper: write a counterparty profile that identity.list_all_counterparties picks up."""
+    cp_id = f"{platform}_{user_id}"
+    d = storage.PAID_DIR / "counterparties" / cp_id
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "profile.json").write_text(json.dumps({
+        "schema_version": 2,
+        "cp_id": cp_id,
+        "platform": platform,
+        "user_id": user_id,
+        "display_name": cp_id,
+        "role": role,
+        "topics_allowed": [],
+        "topics_always_escalate": [],
+        "web_search_allowed": True,
+        "blacklist_action": "decline",
+        "ignore_reason": "",
+        "ignore_set_at": "",
+        "discovery_notified_at": "",
+        "active_review_session": "",
+        "review_history": [],
+        "msg_count": 0,
+        "first_seen": _today_iso(8),
+        "last_seen": _today_iso(10),
+    }), encoding="utf-8")
+    return cp_id
+
+
+def test_platform_breakdown_empty_when_no_cps(paid_tmp):
+    s = dashboard.collect_summary()
+    assert s["platform_breakdown"] == {}
+
+
+def test_platform_breakdown_counts_cps_per_platform(paid_tmp):
+    _write_cp_for_platform(paid_tmp, "feishu", "ou_a")
+    _write_cp_for_platform(paid_tmp, "feishu", "ou_b", role="external")
+    _write_cp_for_platform(paid_tmp, "telegram", "tg_c")
+
+    s = dashboard.collect_summary()
+    pb = s["platform_breakdown"]
+    assert set(pb.keys()) == {"feishu", "telegram"}
+    assert pb["feishu"]["cp_count"] == 2
+    assert pb["telegram"]["cp_count"] == 1
+    # role_counts breakdown
+    assert pb["feishu"]["role_counts"] == {"junior": 1, "external": 1}
+    assert pb["telegram"]["role_counts"] == {"junior": 1}
+
+
+def test_platform_breakdown_counts_today_decisions(paid_tmp):
+    cp_lark = _write_cp_for_platform(paid_tmp, "feishu", "ou_a")
+    cp_tg = _write_cp_for_platform(paid_tmp, "telegram", "tg_b")
+
+    audit = paid_tmp / "audit_log.jsonl"
+    rows = [
+        # Explicit platform field
+        {"ts": _today_iso(9), "platform": "feishu",
+         "counterparty": cp_lark, "action": {"state": "direct"}},
+        # Older row without platform — falls back to cp lookup
+        {"ts": _today_iso(10), "counterparty": cp_lark,
+         "action": {"state": "request"}},
+        {"ts": _today_iso(11), "counterparty": cp_tg,
+         "action": {"state": "direct"}},
+    ]
+    audit.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    s = dashboard.collect_summary()
+    pb = s["platform_breakdown"]
+    assert pb["feishu"]["decisions_today"] == 2
+    assert pb["telegram"]["decisions_today"] == 1
+
+
+def test_platform_breakdown_robust_to_unknown_platform(paid_tmp):
+    """Audit row pointing at a cp that doesn't exist anymore shouldn't crash
+    or create a phantom platform key."""
+    audit = paid_tmp / "audit_log.jsonl"
+    audit.write_text(json.dumps({
+        "ts": _today_iso(10),
+        "counterparty": "feishu_ou_ghost",  # no profile
+        "action": {"state": "direct"},
+    }) + "\n", encoding="utf-8")
+    s = dashboard.collect_summary()
+    # No cps registered, no platform → empty breakdown
+    assert s["platform_breakdown"] == {}
+
+
 def test_home_template_renders_with_progress_bars(paid_tmp):
     """A3 smoke: home template must render with the new metric bars + recent
     activity section, without raising on either zero-data or full-data shape.
@@ -359,7 +588,10 @@ def test_home_template_renders_with_progress_bars(paid_tmp):
     tpl = Template(dashboard._HOME_TEMPLATE)
 
     s_empty = dashboard.collect_summary()
-    out = tpl.render(s=s_empty, cps=[], pending=[], recent=[], reviews_active=[])
+    out = tpl.render(
+        s=s_empty, cps=[], pending=[], recent=[], reviews_active=[],
+        trend7=dashboard.collect_trend(7), mp_done=0, mp_total=6,
+    )
     assert "Direct-answer rate today" in out
     # Either cost bar OR disabled note must render (depends on settings)
     assert "LLM cost today" in out
@@ -377,7 +609,10 @@ def test_home_template_renders_with_progress_bars(paid_tmp):
         {"ts": _today_iso(10), "cp": "cp_a", "state": "direct",
          "topic": "policy", "q_preview": "hello world"},
     ]
-    out2 = tpl.render(s=s_with, cps=[], pending=[], recent=recent, reviews_active=[])
+    out2 = tpl.render(
+        s=s_with, cps=[], pending=[], recent=recent, reviews_active=[],
+        trend7=dashboard.collect_trend(7), mp_done=3, mp_total=6,
+    )
     assert "67.5%" in out2
     assert "$3.50" in out2
     assert "cp_a" in out2
