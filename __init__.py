@@ -1130,8 +1130,30 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
                         "action": "skip",
                         "reason": f"paid_group_mode_reserved_{_routing}",
                     }
-            # _routing == "group_review" falls through — existing /review
-            # interception + active-session handling apply as if it were P2P.
+            if _routing == "group_review_strict" and not owner_in_group_command:
+                # v1.5.1 fix (audit Critical #5): review-only group, sender
+                # typed a non-command message. Only let through if THIS
+                # sender has an active review session in progress — that
+                # makes the message a QA continuation. Otherwise drop so
+                # the bot doesn't auto-reply to everyday chatter.
+                has_active = False
+                if platform and sender_id:
+                    try:
+                        cp_check = identity.load_counterparty(platform, sender_id)
+                        has_active = bool(
+                            cp_check and cp_check.active_review_session
+                        )
+                    except Exception as exc:
+                        _safe_log(f"[group_routing] active-session check EXC: {exc}")
+                if not has_active:
+                    return {
+                        "action": "skip",
+                        "reason": "paid_group_review_only_non_review_message",
+                    }
+                # else: fall through — downstream has_active_review branch
+                # routes the message through the review skill.
+            # _routing == "group_review" (command-prefixed) falls through —
+            # existing /review interception handles it as P2P would.
 
         if platform and sender_id and identity.is_owner(platform, sender_id):
             # v1.5 Phase 7: owner-issued /paid-*-group commands. Intercept

@@ -31,7 +31,7 @@ import ipaddress
 import logging
 import re
 import socket
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 # httpx is imported eagerly when available so that the module-level
 # `httpx` symbol exists for monkeypatching in tests. When absent we
@@ -145,6 +145,74 @@ def _classify_ip(ip: ipaddress._BaseAddress) -> str:
     return ""
 
 
+def _fetch_with_ssrf_aware_redirects(url: str):
+    """Fetch *url* with SSRF revalidation on every redirect hop.
+
+    Returns ``(response, None)`` on success or ``(None, error_message)``
+    on failure. ``response`` is the final non-redirect httpx.Response;
+    ``error_message`` is a human-readable string for the brief's ⚠️
+    block.
+
+    Behavior:
+      - http(s) only at every hop.
+      - At each hop, parse the host, run ``_is_safe_host`` on it, and
+        refuse to fetch if any IP behind that host is in a forbidden
+        range. This defeats the "publicly-hosted 302 → internal IP"
+        SSRF bypass that ``follow_redirects=True`` previously allowed
+        (v1.5.0 audit High #1).
+      - Up to ``_MAX_REDIRECTS`` hops. More → "too many redirects" error.
+      - 30x with no Location → treated as a non-redirect terminal response
+        (caller decides what to do with the status code).
+    """
+    assert httpx is not None  # caller has already gated on this
+
+    current_url = url
+    seen: list[str] = []
+
+    for _hop in range(_MAX_REDIRECTS + 1):
+        # Per-hop scheme + SSRF gate
+        try:
+            parts = urlsplit(current_url)
+        except Exception as exc:
+            return None, f"URL parse failed: {exc}"
+        scheme = (parts.scheme or "").lower()
+        if scheme not in ("http", "https"):
+            return None, f"web scrape blocked: non-http(s) redirect target ({scheme})"
+        host = (parts.hostname or "").lower()
+        ok, reason = _is_safe_host(host)
+        if not ok:
+            return None, f"web scrape blocked by SSRF guard: {reason}"
+
+        seen.append(current_url)
+        try:
+            with httpx.Client(
+                follow_redirects=False,           # we drive redirects ourselves
+                timeout=_TIMEOUT_SEC,
+                headers={"User-Agent": "paid-review/1.5 (web-scrape)"},
+            ) as client:
+                resp = client.get(current_url)
+        except httpx.TimeoutException as exc:
+            return None, f"web scrape timeout after {_TIMEOUT_SEC}s: {exc}"
+        except Exception as exc:
+            logger.warning("[web-scrape] fetch crashed %s: %s", current_url, exc)
+            return None, f"web scrape fetch crashed: {exc}"
+
+        # 3xx with a Location → next hop. Anything else → terminal.
+        if 300 <= resp.status_code < 400:
+            location = resp.headers.get("location") or resp.headers.get("Location") or ""
+            if not location:
+                # 30x without Location — treat as terminal redirect-failure
+                return resp, None
+            next_url = urljoin(current_url, location.strip())
+            if next_url in seen:
+                return None, "web scrape redirect loop detected"
+            current_url = next_url
+            continue
+        return resp, None
+
+    return None, f"web scrape exceeded {_MAX_REDIRECTS} redirects"
+
+
 class WebScrapeBackend(IngestBackend):
     """Fetches a public HTTP(S) URL and extracts the article body."""
 
@@ -198,26 +266,6 @@ class WebScrapeBackend(IngestBackend):
                 ],
             )
 
-        # SSRF gate
-        try:
-            host = (urlsplit(url).hostname or "").lower()
-        except Exception as exc:
-            return BackendResult(
-                normalized="",
-                backend=self.name,
-                source=source,
-                errors=[f"URL parse failed: {exc}"],
-            )
-
-        ok, reason = _is_safe_host(host)
-        if not ok:
-            return BackendResult(
-                normalized="",
-                backend=self.name,
-                source=source,
-                errors=[f"web scrape blocked by SSRF guard: {reason}"],
-            )
-
         # Fetch — module-level `httpx` is the import target, which
         # also makes it monkeypatch-able from tests.
         if httpx is None:
@@ -228,43 +276,25 @@ class WebScrapeBackend(IngestBackend):
                 errors=["httpx import race: module unavailable at fetch time"],
             )
 
-        try:
-            with httpx.Client(
-                follow_redirects=True,
-                timeout=_TIMEOUT_SEC,
-                max_redirects=_MAX_REDIRECTS,
-                headers={"User-Agent": "paid-review/1.5 (web-scrape)"},
-            ) as client:
-                resp = client.get(url)
-        except httpx.TimeoutException as exc:
+        # v1.5.1 fix (audit High #1): manual redirect loop. Previously we
+        # passed follow_redirects=True to httpx and only validated the
+        # initial URL's host — an attacker could host a public URL that
+        # 302-redirects to http://10.0.0.1/secret and we'd happily fetch
+        # internal-network content. Now we re-run _is_safe_host on every
+        # hop.
+        resp, err = _fetch_with_ssrf_aware_redirects(url)
+        if err is not None:
             return BackendResult(
-                normalized="",
-                backend=self.name,
-                source=source,
-                errors=[f"web scrape timeout after {_TIMEOUT_SEC}s: {exc}"],
-            )
-        except httpx.TooManyRedirects:
-            return BackendResult(
-                normalized="",
-                backend=self.name,
-                source=source,
-                errors=[f"web scrape exceeded {_MAX_REDIRECTS} redirects"],
-            )
-        except Exception as exc:
-            logger.warning("[web-scrape] fetch crashed %s: %s", url, exc)
-            return BackendResult(
-                normalized="",
-                backend=self.name,
-                source=source,
-                errors=[f"web scrape fetch crashed: {exc}"],
+                normalized="", backend=self.name, source=source, errors=[err],
             )
 
-        if resp.status_code >= 400:
+        if resp is None or resp.status_code >= 400:
+            code = resp.status_code if resp is not None else "?"
             return BackendResult(
                 normalized="",
                 backend=self.name,
                 source=source,
-                errors=[f"web scrape HTTP {resp.status_code}"],
+                errors=[f"web scrape HTTP {code}"],
             )
 
         content_type = (resp.headers.get("content-type") or "").lower()
