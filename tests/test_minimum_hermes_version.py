@@ -102,6 +102,9 @@ def test_check_capability_reports_minimum_required():
 def test_register_good_ctx_registers_all_commands(paid_tmp, monkeypatch):
     # Stub _alert_owner so we don't try real send_dm.
     monkeypatch.setattr(_plug, "_alert_owner", lambda **kw: None)
+    # v1.4.2: classifier health-check would otherwise try a real LLM call.
+    # Mock — this test is scoped to hermes capability handling.
+    monkeypatch.setattr(_plug, "_classifier_health_check", lambda: None)
     ctx = _GoodCtx()
     _plug.register(ctx)
     # All 3 hooks (some platforms may degrade pre_gateway_dispatch but we
@@ -128,6 +131,9 @@ def test_register_pre_v0_11_skips_commands_but_keeps_hooks(paid_tmp, monkeypatch
         alerts.append({"reason": reason, "detail": detail})
 
     monkeypatch.setattr(_plug, "_alert_owner", fake_alert)
+    # v1.4.2: scope this test to version-handling; mock the health-check
+    # which is exercised by its own tests below.
+    monkeypatch.setattr(_plug, "_classifier_health_check", lambda: None)
     ctx = _PreV011Ctx()
     _plug.register(ctx)
     # Hooks DID register.
@@ -145,6 +151,7 @@ def test_register_ancient_ctx_bails_out(paid_tmp, monkeypatch):
     """Truly ancient hermes (no register_hook either) — refuse to half-load.
     Better to crash visibly than leave PAID in a partial-broken state."""
     monkeypatch.setattr(_plug, "_alert_owner", lambda **kw: None)
+    monkeypatch.setattr(_plug, "_classifier_health_check", lambda: None)
     ctx = _AncientCtx()
     # Should not raise — just bail silently after logging.
     _plug.register(ctx)
@@ -161,6 +168,7 @@ def test_register_alert_owner_failure_swallowed(paid_tmp, monkeypatch):
         raise RuntimeError("alert path itself broken")
 
     monkeypatch.setattr(_plug, "_alert_owner", raising_alert)
+    monkeypatch.setattr(_plug, "_classifier_health_check", lambda: None)
     ctx = _PreV011Ctx()
     # Should not raise.
     _plug.register(ctx)
@@ -176,3 +184,78 @@ def test_plugin_yaml_declares_minimum_hermes_version():
     content = yaml_path.read_text()
     assert "minimum_hermes_version: " in content
     assert _plug._MINIMUM_HERMES_VERSION in content
+
+
+# ---------------------------------------------------------------------------
+# v1.4.2: classifier dry-run health check at plugin register.
+# ---------------------------------------------------------------------------
+
+
+def test_classifier_health_check_success_no_alert(monkeypatch):
+    """LLM ping returns OK → log it, no alert."""
+    alerts: list[dict] = []
+
+    def fake_alert(reason, detail):
+        alerts.append({"reason": reason, "detail": detail})
+
+    # Patch the call_llm import inside _classifier_health_check.
+    from paid import hermes_io as _hio
+    monkeypatch.setattr(_hio, "call_llm", lambda *a, **kw: "ok")
+    monkeypatch.setattr(_plug, "_alert_owner", fake_alert)
+
+    _plug._classifier_health_check()
+    assert alerts == []
+
+
+def test_classifier_health_check_config_error_alerts(monkeypatch):
+    """HermesConfigError (missing yaml/env api_key) → loud alert."""
+    alerts: list[dict] = []
+
+    def fake_alert(reason, detail):
+        alerts.append({"reason": reason, "detail": detail})
+
+    from paid import hermes_io as _hio
+
+    def _raise_config(*a, **kw):
+        raise _hio.HermesConfigError(
+            "model section missing one of base_url / api_key / default"
+        )
+
+    monkeypatch.setattr(_hio, "call_llm", _raise_config)
+    monkeypatch.setattr(_plug, "_alert_owner", fake_alert)
+
+    _plug._classifier_health_check()
+    assert len(alerts) == 1
+    assert alerts[0]["reason"] == "classifier_config_invalid"
+    assert "missing one of" in alerts[0]["detail"]
+
+
+def test_classifier_health_check_llm_unreachable_alerts(monkeypatch):
+    """Generic LLM exception (network / 4xx) → alert with different reason."""
+    alerts: list[dict] = []
+
+    def fake_alert(reason, detail):
+        alerts.append({"reason": reason, "detail": detail})
+
+    from paid import hermes_io as _hio
+    monkeypatch.setattr(_hio, "call_llm",
+                        lambda *a, **kw: (_ for _ in ()).throw(_hio.LLMCallError("DNS fail")))
+    monkeypatch.setattr(_plug, "_alert_owner", fake_alert)
+
+    _plug._classifier_health_check()
+    assert len(alerts) == 1
+    assert alerts[0]["reason"] == "classifier_llm_unreachable"
+
+
+def test_classifier_health_check_swallows_alert_failures(monkeypatch):
+    """If _alert_owner itself raises, health-check must not propagate."""
+    from paid import hermes_io as _hio
+    monkeypatch.setattr(_hio, "call_llm",
+                        lambda *a, **kw: (_ for _ in ()).throw(_hio.HermesConfigError("bad")))
+
+    def raising_alert(reason, detail):
+        raise RuntimeError("alert broken")
+
+    monkeypatch.setattr(_plug, "_alert_owner", raising_alert)
+    # Should NOT raise.
+    _plug._classifier_health_check()
