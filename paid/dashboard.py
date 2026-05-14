@@ -125,6 +125,18 @@ def collect_summary() -> dict[str, Any]:
     direct_rate = (state_counts.get("direct", 0) / total * 100) if total else 0
 
     owner = identity.load_owner()
+
+    # v1.5.5 A3: cost-cap snapshot for top-of-home progress bar. Read via
+    # cost.cap_status — same source of truth as `bin/check_cost_cap.py`.
+    try:
+        from . import cost as _cost
+        cost_status = _cost.cap_status()
+    except Exception:
+        cost_status = {
+            "today_usd": 0.0, "daily_soft_cap": 5.0, "daily_hard_cap": 20.0,
+            "weekly_soft_cap": 25.0, "enabled": False,
+        }
+
     return {
         "owner_name": (owner.name or owner.owner_id) if owner else None,
         "owner_identities": len(owner.identities) if owner else 0,
@@ -135,12 +147,150 @@ def collect_summary() -> dict[str, Any]:
         "request_today": state_counts.get("request", 0),
         "decline_today": state_counts.get("decline", 0),
         "direct_rate_today": round(direct_rate, 1),
+        "direct_rate_target": 50,  # master design §6
         "l1_hits_today": l1,
         "l4_hits_today": l4,
         "classifier_fallback_today": fb,
         "pending_count": len(approval.list_pending()),
         "audit_rows_total": len(audit),
+        # v1.5.5 A3 cost fields
+        "cost_today_usd": round(float(cost_status.get("today_usd", 0.0)), 4),
+        "cost_soft_cap_usd": float(cost_status.get("daily_soft_cap", 0.0)),
+        "cost_hard_cap_usd": float(cost_status.get("daily_hard_cap", 0.0)),
+        "cost_cap_enabled": bool(cost_status.get("enabled", False)),
     }
+
+
+def _safe_truncate(text: str, n: int) -> str:
+    """Truncate to n chars without slicing a multi-byte char (CJK safe).
+
+    Python str slicing is by code point, not byte — CJK is naturally safe
+    when ``text`` is already a unicode str. We collapse newlines / extra
+    whitespace so the truncated preview is one line.
+    """
+    if not text:
+        return ""
+    flat = " ".join(text.split())
+    if len(flat) <= n:
+        return flat
+    return flat[: max(0, n - 1)] + "…"
+
+
+def _derive_review_next_action(stage: str, last_event_kind: str) -> str:
+    """Owner-facing one-liner: who's PAID waiting on?
+
+    Mapping is intentionally coarse — anything more detailed should live
+    in the review session itself, not the dashboard.
+    """
+    s = (stage or "").upper()
+    if s == "CLOSED":
+        return "closed"
+    if s == "INTAKE":
+        return "awaiting subject from junior"
+    if s == "SUBJECT":
+        return "scanning material"
+    if s == "SCAN":
+        return "preparing Q&A for junior"
+    if s == "QA":
+        return "awaiting junior reply"
+    if s == "MERGE":
+        return "merging findings"
+    if s == "GATE":
+        return "awaiting your gate decision"
+    return s.lower() or "unknown"
+
+
+def _scan_review_sessions_dir(root: Path, archived: bool) -> list[dict[str, Any]]:
+    """Internal: yield rows from one sessions root (active or archived)."""
+    if not root.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    iter_dirs: list[Path] = []
+    if archived:
+        # _closed/<month>/<sid>/
+        for month_dir in root.iterdir():
+            if month_dir.is_dir():
+                iter_dirs.extend(p for p in month_dir.iterdir() if p.is_dir())
+    else:
+        # sessions/<sid>/ — but skip _closed which is for archives
+        for p in root.iterdir():
+            if p.is_dir() and p.name != "_closed":
+                iter_dirs.append(p)
+    for sid_dir in iter_dirs:
+        meta = sid_dir / "meta.json"
+        if not meta.exists():
+            continue
+        try:
+            data = json.loads(meta.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        stage = str(data.get("stage", "") or "")
+        rows.append({
+            "sid": sid_dir.name,
+            "cp_id": data.get("cp_id", ""),
+            "platform": data.get("platform", ""),
+            "stage": stage,
+            "verdict": data.get("verdict", ""),
+            "rounds": int(data.get("rounds", 0) or 0),
+            "max_rounds": int(data.get("max_rounds", 3) or 3),
+            "created_at": data.get("created_at", ""),
+            "updated_at": data.get("updated_at", ""),
+            "closed_at": data.get("closed_at"),
+            "delivery_failed": bool(data.get("delivery_failed", False)),
+            "is_archived": archived,
+            "is_closed": stage == "CLOSED" or archived,
+            "next_action": _derive_review_next_action(
+                stage, data.get("last_event_kind", "")
+            ),
+        })
+    return rows
+
+
+def collect_review_sessions(
+    include_closed: bool = False, limit: int | None = None
+) -> list[dict[str, Any]]:
+    """v1.5.5 A4: enumerate review skill sessions.
+
+    Default returns only ACTIVE sessions (stage != CLOSED, not archived).
+    Pass ``include_closed=True`` to also include archived sessions under
+    ``review/sessions/_closed/<month>/``. Rows are sorted newest-updated
+    first. A bad/missing/corrupt ``meta.json`` is skipped silently.
+    """
+    sessions_root = storage.PAID_DIR / "review" / "sessions"
+    rows = _scan_review_sessions_dir(sessions_root, archived=False)
+    if include_closed:
+        rows += _scan_review_sessions_dir(
+            sessions_root / "_closed", archived=True,
+        )
+    rows.sort(
+        key=lambda r: r.get("updated_at") or r.get("created_at") or "",
+        reverse=True,
+    )
+    if limit is not None:
+        rows = rows[: max(0, limit)]
+    return rows
+
+
+def collect_recent_activity(limit: int = 10) -> list[dict[str, Any]]:
+    """Newest N decisions (v1.5.5 A3): for the home page's quick-glance table.
+
+    Returns rows with ts/cp/state/topic/q_preview (80 chars). Empty list
+    when audit log missing.
+    """
+    audit = _read_jsonl(storage.PAID_DIR / "audit_log.jsonl")
+    audit.sort(key=lambda r: r.get("ts", ""), reverse=True)
+    out: list[dict[str, Any]] = []
+    for r in audit[: max(0, limit)]:
+        act = r.get("action") or {}
+        cls = r.get("classification") or {}
+        out.append({
+            "ts": r.get("ts", ""),
+            "cp": r.get("counterparty", ""),
+            "state": act.get("state", "—") if isinstance(act, dict) else "—",
+            "topic": cls.get("topic", "") if isinstance(cls, dict) else "",
+            "q_preview": _safe_truncate(r.get("junior_msg", "") or "", 80),
+        })
+    return out
 
 
 def collect_counterparties() -> list[dict[str, Any]]:
@@ -233,11 +383,16 @@ def build_app():
                 "stakes": r.stakes,
                 "confidence": r.confidence,
                 "age_min": int((datetime.now(timezone.utc).timestamp() - r.ts_created) / 60),
-                "q_preview": r.junior_question[:120],
+                "q_preview": _safe_truncate(r.junior_question, 80),
             }
             for r in approval.list_pending()
         ]
-        return render_template_string(_HOME_TEMPLATE, s=s, cps=cps[:10], pending=pending)
+        recent = collect_recent_activity(limit=10)
+        reviews_active = collect_review_sessions(include_closed=False, limit=10)
+        return render_template_string(
+            _HOME_TEMPLATE, s=s, cps=cps[:10], pending=pending, recent=recent,
+            reviews_active=reviews_active,
+        )
 
     @app.route("/counterparties")
     def counterparties_view():
@@ -253,7 +408,22 @@ def build_app():
         audit = _read_jsonl(storage.PAID_DIR / "audit_log.jsonl")
         rows = [r for r in audit if r.get("counterparty") == cp_id]
         rows.sort(key=lambda r: r.get("ts", ""), reverse=True)
-        return render_template_string(_CP_DETAIL_TEMPLATE, cp=cp, rows=rows[:50])
+        # v1.5.5 A4: review history for this cp (active + closed)
+        all_reviews = collect_review_sessions(include_closed=True)
+        cp_reviews = [r for r in all_reviews if r["cp_id"] == cp_id]
+        return render_template_string(
+            _CP_DETAIL_TEMPLATE, cp=cp, rows=rows[:50], reviews=cp_reviews,
+        )
+
+    @app.route("/reviews")
+    def reviews_view():
+        active = collect_review_sessions(include_closed=False)
+        closed = [r for r in collect_review_sessions(include_closed=True) if r["is_closed"]]
+        # Keep closed list bounded — recent 50 only
+        closed = closed[:50]
+        return render_template_string(
+            _REVIEWS_TEMPLATE, active=active, closed=closed,
+        )
 
     @app.route("/pending")
     def pending_view():
@@ -319,12 +489,28 @@ _BASE_HEAD = """\
     .pill { display: inline-block; padding: 1px 8px; border-radius: 10px;
             font-size: 11px; background: #eef; color: #335; }
     .stamp { color: #999; font-size: 12px; }
+    /* v1.5.5 A3 — top-of-home progress bars */
+    .barwrap { background: #fff; padding: 10px 14px; border: 1px solid #e3e3e3;
+               border-radius: 6px; margin-bottom: 10px; }
+    .barwrap .label { display: flex; justify-content: space-between;
+                      font-size: 12px; color: #555; margin-bottom: 4px; }
+    .barwrap .label b { color: #222; font-weight: 600; }
+    .bar { width: 100%; height: 10px; background: #eee; border-radius: 5px;
+           overflow: hidden; position: relative; }
+    .bar .fill { height: 100%; transition: width 200ms ease; }
+    .bar .fill.ok   { background: #1b8a3a; }
+    .bar .fill.warn { background: #e0a020; }
+    .bar .fill.bad  { background: #c33; }
+    .bar .marker { position: absolute; top: -2px; width: 2px; height: 14px;
+                   background: #888; }
+    .muted { color: #888; font-size: 11px; margin-top: 4px; }
   </style>
 </head><body>
 <nav>
   <a href="/">Summary</a>
   <a href="/counterparties">Counterparties</a>
   <a href="/pending">Pending</a>
+  <a href="/reviews">Reviews</a>
   <a href="/audit">Audit</a>
   <a href="/fatal">Fatal alerts</a>
   <a href="/api/summary.json">JSON</a>
@@ -346,6 +532,46 @@ _HOME_TEMPLATE = _BASE_HEAD + """\
   <div class="card"><div class="lbl">L1 / L4 / fallback</div>
     <div class="v">{{ s.l1_hits_today }} / {{ s.l4_hits_today }} / {{ s.classifier_fallback_today }}</div></div>
 </div>
+
+{# v1.5.5 A3 — direct-rate progress bar (vs 50% target) #}
+{% set dr_pct = s.direct_rate_today %}
+{% set dr_klass = "ok" if dr_pct >= s.direct_rate_target else ("warn" if dr_pct >= 30 else "bad") %}
+<div class="barwrap">
+  <div class="label">
+    <span>Direct-answer rate today</span>
+    <span><b>{{ "%.1f" | format(dr_pct) }}%</b> &nbsp;/&nbsp; target {{ s.direct_rate_target }}%</span>
+  </div>
+  <div class="bar">
+    <div class="fill {{ dr_klass }}" style="width: {{ [dr_pct, 100]|min }}%"></div>
+    <div class="marker" style="left: {{ s.direct_rate_target }}%"></div>
+  </div>
+  <div class="muted">{{ s.direct_today }} direct · {{ s.request_today }} request · {{ s.decline_today }} decline</div>
+</div>
+
+{# v1.5.5 A3 — cost-today bar (vs soft/hard caps) #}
+{% if s.cost_cap_enabled %}
+{% set hard = s.cost_hard_cap_usd or 1.0 %}
+{% set pct = (s.cost_today_usd / hard * 100) if hard > 0 else 0 %}
+{% set pct_clamped = [pct, 100]|min %}
+{% set marker_soft_pct = (s.cost_soft_cap_usd / hard * 100) if hard > 0 else 0 %}
+{% set cost_klass = "bad" if pct >= 100 else ("warn" if s.cost_today_usd >= s.cost_soft_cap_usd else "ok") %}
+<div class="barwrap">
+  <div class="label">
+    <span>LLM cost today</span>
+    <span><b>${{ "%.2f" | format(s.cost_today_usd) }}</b>
+      &nbsp;/&nbsp; soft ${{ "%.2f" | format(s.cost_soft_cap_usd) }}
+      &nbsp;/&nbsp; hard ${{ "%.2f" | format(s.cost_hard_cap_usd) }}</span>
+  </div>
+  <div class="bar">
+    <div class="fill {{ cost_klass }}" style="width: {{ pct_clamped }}%"></div>
+    <div class="marker" style="left: {{ [marker_soft_pct, 100]|min }}%"></div>
+  </div>
+  <div class="muted">Soft-cap marker shown on bar; bar fills to {{ "%.0f" | format(pct_clamped) }}% of hard cap.</div>
+</div>
+{% else %}
+<div class="barwrap"><div class="label"><span>LLM cost today</span>
+  <span class="muted">cap disabled — see settings.cost.enabled</span></div></div>
+{% endif %}
 
 <h2>Pending approvals</h2>
 {% if not pending %}<p>(none)</p>{% else %}
@@ -370,6 +596,35 @@ _HOME_TEMPLATE = _BASE_HEAD + """\
   <td>{{ c.role }}</td>
   <td>{{ c.msg_count }}</td>
   <td class="stamp">{{ c.last_seen[:19] or "—" }}</td>
+</tr>{% endfor %}</table>
+{% endif %}
+
+{# v1.5.5 A4 — active review sessions summary #}
+<h2>Active review sessions ({{ reviews_active|length }})
+  <a class="stamp" href="/reviews" style="font-weight: normal; margin-left: 8px;">view all →</a></h2>
+{% if not reviews_active %}<p>(none)</p>{% else %}
+<table><tr><th>sid</th><th>cp</th><th>platform</th><th>stage</th><th>rounds</th><th>updated</th><th>next action</th></tr>
+{% for r in reviews_active %}<tr>
+  <td><code>{{ r.sid[:12] }}</code></td>
+  <td>{{ r.cp_id or "—" }}</td>
+  <td><span class="pill">{{ r.platform or "—" }}</span></td>
+  <td>{{ r.stage }}</td>
+  <td>{{ r.rounds }}/{{ r.max_rounds }}</td>
+  <td class="stamp">{{ (r.updated_at or "")[:19] }}</td>
+  <td>{{ r.next_action }}</td>
+</tr>{% endfor %}</table>
+{% endif %}
+
+{# v1.5.5 A3 — recent activity with question preview (80 chars) #}
+<h2>Recent activity (newest {{ recent|length }})</h2>
+{% if not recent %}<p>(no audit rows yet)</p>{% else %}
+<table><tr><th>ts</th><th>cp</th><th>state</th><th>topic</th><th>q</th></tr>
+{% for r in recent %}<tr>
+  <td class="stamp">{{ r.ts[:19] }}</td>
+  <td>{{ r.cp or "—" }}</td>
+  <td>{{ r.state }}</td>
+  <td>{{ r.topic or "—" }}</td>
+  <td>{{ r.q_preview }}</td>
 </tr>{% endfor %}</table>
 {% endif %}
 </body></html>
@@ -405,6 +660,20 @@ _CP_DETAIL_TEMPLATE = _BASE_HEAD + """\
 {% endif %}
 {% if cp.notes %}<p><i>{{ cp.notes }}</i></p>{% endif %}
 
+{# v1.5.5 A4 — cp's review history (active + archived) #}
+{% if reviews %}
+<h2>Review sessions for this cp ({{ reviews|length }})</h2>
+<table><tr><th>sid</th><th>stage</th><th>verdict</th><th>rounds</th><th>created</th><th>closed</th></tr>
+{% for r in reviews %}<tr>
+  <td><code>{{ r.sid[:12] }}</code></td>
+  <td>{{ r.stage }}</td>
+  <td>{{ r.verdict or "—" }}</td>
+  <td>{{ r.rounds }}/{{ r.max_rounds }}</td>
+  <td class="stamp">{{ (r.created_at or "")[:19] }}</td>
+  <td class="stamp">{{ (r.closed_at or "")[:19] or "—" }}</td>
+</tr>{% endfor %}</table>
+{% endif %}
+
 <h2>Recent activity (newest 50)</h2>
 <table><tr><th>ts</th><th>state</th><th>topic</th><th>conf</th><th>q</th></tr>
 {% for r in rows %}
@@ -415,8 +684,43 @@ _CP_DETAIL_TEMPLATE = _BASE_HEAD + """\
   <td>{{ act.state or "—" }}</td>
   <td>{{ cls.topic or "—" }}</td>
   <td>{{ "%.2f" | format(cls.confidence|default(0)) }}</td>
-  <td>{{ (r.junior_msg or "")[:140] }}</td>
+  <td>{{ (r.junior_msg or "")[:80] }}</td>
 </tr>{% endfor %}</table>
+</body></html>
+"""
+
+_REVIEWS_TEMPLATE = _BASE_HEAD + """\
+<h1>Review sessions</h1>
+
+<h2>Active ({{ active|length }})</h2>
+{% if not active %}<p>(none)</p>{% else %}
+<table><tr><th>sid</th><th>cp</th><th>platform</th><th>stage</th><th>verdict</th><th>rounds</th>
+  <th>created</th><th>updated</th><th>next action</th></tr>
+{% for r in active %}<tr>
+  <td><code>{{ r.sid[:12] }}</code></td>
+  <td>{% if r.cp_id %}<a href="/counterparties/{{ r.cp_id }}">{{ r.cp_id }}</a>{% else %}—{% endif %}</td>
+  <td><span class="pill">{{ r.platform or "—" }}</span></td>
+  <td>{{ r.stage }}</td>
+  <td>{{ r.verdict or "—" }}</td>
+  <td>{{ r.rounds }}/{{ r.max_rounds }}</td>
+  <td class="stamp">{{ (r.created_at or "")[:19] }}</td>
+  <td class="stamp">{{ (r.updated_at or "")[:19] }}</td>
+  <td>{{ r.next_action }}</td>
+</tr>{% endfor %}</table>
+{% endif %}
+
+<h2>Closed (recent {{ closed|length }})</h2>
+{% if not closed %}<p>(none)</p>{% else %}
+<table><tr><th>sid</th><th>cp</th><th>verdict</th><th>rounds</th><th>created</th><th>closed</th></tr>
+{% for r in closed %}<tr>
+  <td><code>{{ r.sid[:12] }}</code></td>
+  <td>{% if r.cp_id %}<a href="/counterparties/{{ r.cp_id }}">{{ r.cp_id }}</a>{% else %}—{% endif %}</td>
+  <td>{{ r.verdict or "—" }}</td>
+  <td>{{ r.rounds }}/{{ r.max_rounds }}</td>
+  <td class="stamp">{{ (r.created_at or "")[:19] }}</td>
+  <td class="stamp">{{ (r.closed_at or "")[:19] or "—" }}</td>
+</tr>{% endfor %}</table>
+{% endif %}
 </body></html>
 """
 
