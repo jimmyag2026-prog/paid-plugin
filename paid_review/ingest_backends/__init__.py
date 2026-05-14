@@ -21,6 +21,7 @@ from .text import TextBackend
 from .lark_doc import LarkDocBackend
 from .pdf import PdfBackend
 from .image import ImageBackend
+from .web_scrape import WebScrapeBackend
 
 __all__ = [
     "BackendResult",
@@ -29,4 +30,5 @@ __all__ = [
     "LarkDocBackend",
     "PdfBackend",
     "ImageBackend",
+    "WebScrapeBackend",
 ]
