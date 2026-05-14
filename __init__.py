@@ -803,6 +803,46 @@ def on_pre_llm_call(**kwargs) -> dict | None:
         owner = identity.load_owner()
         owner_name = identity.display_name(owner)
 
+        # v1.5.6 (review fix): when daily hard cap is exhausted, skip ALL PAID
+        # LLM work and tell hermes to reply "system unavailable" to the junior.
+        # Without this, classifier.classify() would call_llm → LLMCallError →
+        # classifier's broad except clause → fallback Classification →
+        # state=request, flooding owner with J3 cards for every inbound
+        # message while the cap is hot. The wrap directive itself does NOT
+        # count against the cap because hermes's main agent (not PAID) makes
+        # the outbound LLM call. fatal_alerts.jsonl row + owner alert is fired
+        # exactly once per UTC day inside hermes_io._enforce_cost_cap.
+        try:
+            from paid import cost as _cost
+            _cap = _cost.cap_status()
+            if _cap.get("enabled") and _cap.get("daily_hard_exceeded"):
+                _safe_log(
+                    f"[pre_llm] cp={cp.cp_id} cost_cap_exceeded "
+                    f"today=${_cap.get('today_usd', 0):.2f} "
+                    f"hard=${_cap.get('daily_hard_cap', 0):.2f}"
+                )
+                audit.log_action(
+                    session_id=session_id, counterparty=cp,
+                    junior_msg=user_message,
+                    classification=None, action=None,
+                    extra={"platform": platform,
+                           "blocked_by": "cost_cap_exceeded",
+                           "today_usd": _cap.get("today_usd"),
+                           "daily_hard_cap": _cap.get("daily_hard_cap")},
+                )
+                return {
+                    "context": (
+                        "IGNORE the user message. Reply EXACTLY with the "
+                        "following text and nothing else, preserving the line "
+                        "break: '系统暂时不可用，请稍后再试。\\n"
+                        "System temporarily unavailable, please try again later.'"
+                    )
+                }
+        except Exception as _cost_exc:
+            # Fail-open: if the cap-status read crashes, let normal flow run.
+            # The inline enforce inside hermes_io.call_llm is the safety net.
+            _safe_log(f"[pre_llm] cap_status check failed (fail-open): {_cost_exc}")
+
         # Layer 1 INPUT — prompt-injection guard. If hit, short-circuit to
         # decline (don't waste an LLM call) and surface to owner alerts.
         l1_hit, l1_labels = safety.detect_prompt_injection(user_message)

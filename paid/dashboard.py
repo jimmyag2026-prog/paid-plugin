@@ -195,6 +195,11 @@ def _compute_platform_breakdown(today_audit_rows: list[dict]) -> dict[str, dict[
                       "role_counts": {}}
         return out[p]
 
+    # v1.5.6 review fix #7: cp_count intentionally counts ALL roles
+    # including 'ignored' and 'blocked'. role_counts gives the breakdown so
+    # callers can filter if they want active-only. Surfacing the total
+    # platform footprint (incl. silenced cps) is the more honest signal for
+    # a future multi-pilot dashboard view.
     for c in cps:
         if not c.platform:
             continue
@@ -223,12 +228,14 @@ def _compute_platform_breakdown(today_audit_rows: list[dict]) -> dict[str, dict[
     return out
 
 
-def _safe_truncate(text: str, n: int) -> str:
+def _safe_truncate(text: str | None, n: int) -> str:
     """Truncate to n chars without slicing a multi-byte char (CJK safe).
 
     Python str slicing is by code point, not byte — CJK is naturally safe
     when ``text`` is already a unicode str. We collapse newlines / extra
-    whitespace so the truncated preview is one line.
+    whitespace so the truncated preview is one line. ``None`` is accepted
+    as a courtesy (v1.5.6 review fix #5 — type hint widened to match the
+    implementation) and returns ``""``.
     """
     if not text:
         return ""
@@ -520,7 +527,12 @@ def build_app():
             f"(import error: {exc})"
         ) from exc
 
-    app = Flask("paid-dashboard")
+    # v1.5.6 (review fix #2): serve vendored Chart.js from paid/static/ so
+    # the dashboard works offline / behind corp firewalls and removes the
+    # CDN supply-chain surface ahead of the planned Caddy reverse-proxy.
+    _static_dir = str(Path(__file__).resolve().parent / "static")
+    app = Flask("paid-dashboard", static_folder=_static_dir,
+                static_url_path="/static")
     app.jinja_env.autoescape = True
 
     @app.route("/")
@@ -693,10 +705,12 @@ _BASE_HEAD = """\
     canvas.chart { max-width: 100%; height: 180px !important; }
     canvas.chart-lg { max-width: 100%; height: 280px !important; }
   </style>
-  <!-- v1.5.5 A5: Chart.js v4 via jsdelivr CDN. If CDN is unreachable, the
-       <canvas> elements stay empty and inline JS shows the fallback notice. -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"
-          crossorigin="anonymous"></script>
+  <!-- v1.5.6 A5: Chart.js v4 vendored at paid/static/chart.umd.min.js.
+       Was loaded from jsdelivr CDN in v1.5.5 but vendored in v1.5.6 to
+       (1) work offline / behind firewalls, (2) remove CDN supply-chain
+       surface ahead of Caddy reverse-proxy deployment. If the file is
+       missing for any reason the inline JS fallback below kicks in. -->
+  <script src="/static/chart.umd.min.js"></script>
 </head><body>
 <nav>
   <a href="/">Summary</a>

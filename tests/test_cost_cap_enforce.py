@@ -111,6 +111,85 @@ def test_alert_dedup_one_per_day(paid_tmp, monkeypatch):
     assert len(rows2) == 1  # still one
 
 
+# ---------------------------------------------------------------------------
+# v1.5.6 review fix #1: flag-file lazy sweep (>30 day old flags get unlinked
+# when today's flag is created)
+# ---------------------------------------------------------------------------
+
+def test_sweep_old_flags_unlinks_files_older_than_retention(paid_tmp):
+    """Manual call to _sweep_old_cost_cap_flags: today + 5d ago + 60d ago →
+    after sweep, only today + 5d ago remain (default retention 30d)."""
+    from datetime import datetime, timezone, timedelta as _td
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    recent_iso = (datetime.now(timezone.utc).date() - _td(days=5)).isoformat()
+    old_iso = (datetime.now(timezone.utc).date() - _td(days=60)).isoformat()
+
+    for iso in (today_iso, recent_iso, old_iso):
+        (paid_tmp / f"cost_cap_alerted_{iso}.flag").touch()
+
+    hermes_io._sweep_old_cost_cap_flags()
+
+    assert (paid_tmp / f"cost_cap_alerted_{today_iso}.flag").exists()
+    assert (paid_tmp / f"cost_cap_alerted_{recent_iso}.flag").exists()
+    assert not (paid_tmp / f"cost_cap_alerted_{old_iso}.flag").exists()
+
+
+def test_sweep_ignores_unrelated_files(paid_tmp):
+    """Sweep must NOT touch files that aren't cost_cap_alerted_*.flag."""
+    (paid_tmp / "some_other.flag").write_text("keep me")
+    (paid_tmp / "settings.json").write_text("{}")
+    (paid_tmp / "cost_cap_alerted_garbage.flag").touch()  # bad date format
+    from datetime import datetime, timezone, timedelta as _td
+    old_iso = (datetime.now(timezone.utc).date() - _td(days=99)).isoformat()
+    (paid_tmp / f"cost_cap_alerted_{old_iso}.flag").touch()
+
+    hermes_io._sweep_old_cost_cap_flags()
+
+    assert (paid_tmp / "some_other.flag").exists()
+    assert (paid_tmp / "settings.json").exists()
+    # Bad date format → left alone (not deleted)
+    assert (paid_tmp / "cost_cap_alerted_garbage.flag").exists()
+    # Old well-formed flag → deleted
+    assert not (paid_tmp / f"cost_cap_alerted_{old_iso}.flag").exists()
+
+
+def test_sweep_runs_when_today_flag_created(paid_tmp, monkeypatch):
+    """Integration: _maybe_alert_cost_cap_once on first-of-day write should
+    trigger the sweep automatically."""
+    from datetime import datetime, timezone, timedelta as _td
+    old_iso = (datetime.now(timezone.utc).date() - _td(days=90)).isoformat()
+    old_flag = paid_tmp / f"cost_cap_alerted_{old_iso}.flag"
+    old_flag.touch()
+    assert old_flag.exists()
+
+    from paid import cost
+    monkeypatch.setattr(cost, "cap_status",
+                        lambda: _fake_cap_status(today_usd=25.0))
+    with pytest.raises(hermes_io.LLMCallError):
+        hermes_io._enforce_cost_cap()
+
+    # Today's flag exists; old one is gone
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    assert (paid_tmp / f"cost_cap_alerted_{today_iso}.flag").exists()
+    assert not old_flag.exists()
+
+
+def test_sweep_failure_does_not_prevent_raise(paid_tmp, monkeypatch):
+    """If the sweep itself errors, the cap raise must still fire."""
+    from paid import cost
+    monkeypatch.setattr(cost, "cap_status",
+                        lambda: _fake_cap_status(today_usd=25.0))
+
+    def _boom(*a, **kw):
+        raise RuntimeError("filesystem hiccup")
+    monkeypatch.setattr(hermes_io, "_sweep_old_cost_cap_flags", _boom)
+
+    # _maybe_alert_cost_cap_once must NOT itself raise even though sweep does.
+    # The cap-enforce raise is upstream of alert, so it still fires:
+    with pytest.raises(hermes_io.LLMCallError):
+        hermes_io._enforce_cost_cap()
+
+
 def test_alert_path_failure_does_not_prevent_raise(paid_tmp, monkeypatch):
     """If we can't write the flag or the fatal row, raise must still fire."""
     from paid import cost

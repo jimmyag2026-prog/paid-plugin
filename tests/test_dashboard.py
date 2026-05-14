@@ -477,9 +477,22 @@ def test_trends_template_renders(paid_tmp):
     out = tpl.render(t7=dashboard.collect_trend(7), t30=dashboard.collect_trend(30))
     assert "7-day decisions" in out
     assert "30-day decisions" in out
-    assert "cdn.jsdelivr.net/npm/chart.js" in out  # CDN include
+    assert "/static/chart.umd.min.js" in out  # v1.5.6: vendored, no CDN
     assert "trend7Decisions" in out
     assert "trend30Cost" in out
+
+
+def test_chartjs_vendored_file_exists():
+    """v1.5.6 review fix #2: Chart.js must be vendored at paid/static/. Catches
+    a regression where someone deletes the file or moves the static dir."""
+    from paid import dashboard as _d
+    static_file = Path(_d.__file__).resolve().parent / "static" / "chart.umd.min.js"
+    assert static_file.exists(), f"missing vendored Chart.js at {static_file}"
+    # Sanity check it actually contains Chart.js (catches truncation / replaced-by-html)
+    head = static_file.read_text(encoding="utf-8", errors="replace")[:500]
+    assert "Chart" in head or "chartjs" in head.lower()
+    # Size sanity: Chart.js 4.4.0 UMD min is ~200KB; flag clearly broken files
+    assert static_file.stat().st_size > 50_000
 
 
 # ---------------------------------------------------------------------------

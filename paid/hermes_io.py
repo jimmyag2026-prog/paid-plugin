@@ -95,6 +95,40 @@ def _enforce_cost_cap() -> None:
     )
 
 
+_COST_CAP_FLAG_RETENTION_DAYS = 30
+
+
+def _sweep_old_cost_cap_flags(retention_days: int = _COST_CAP_FLAG_RETENTION_DAYS) -> None:
+    """v1.5.6 review fix #1: delete cost_cap_alerted_*.flag older than N days.
+
+    Lazy sweep — called from _maybe_alert_cost_cap_once on each new-day write.
+    Retention default 30 days so forensic question 'when did we last hit cap'
+    is still answerable from disk for the last month. Older flags accumulate
+    forever otherwise (~365/year of empty files).
+
+    Best-effort: any error here MUST NOT prevent the cap raise upstream.
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    from . import storage as _storage
+    try:
+        cutoff = _dt.now(_tz.utc).date() - _td(days=max(0, int(retention_days)))
+        for flag in _storage.PAID_DIR.glob(f"{_COST_CAP_FLAG_PREFIX}*.flag"):
+            # name format: cost_cap_alerted_YYYY-MM-DD.flag — pull the date
+            date_str = flag.name[len(_COST_CAP_FLAG_PREFIX):-len(".flag")]
+            try:
+                flag_date = _dt.strptime(date_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue  # unknown filename pattern — leave alone
+            if flag_date < cutoff:
+                try:
+                    flag.unlink()
+                except OSError:
+                    pass
+    except Exception:
+        # Sweep is opportunistic; never let it raise.
+        pass
+
+
 def _maybe_alert_cost_cap_once(status: dict) -> None:
     """On first cap-exceed of the UTC day, write a fatal_alerts.jsonl row.
 
@@ -103,6 +137,10 @@ def _maybe_alert_cost_cap_once(status: dict) -> None:
          ``bin/check_cost_cap.py`` cron pick it up and IM the owner.
       2. Per-UTC-day flag file — dedupes our writes within a day; cron has
          its own IM debounce window for the IM-channel side.
+
+    v1.5.6 review fix #1: when we write today's flag we opportunistically
+    sweep flags >30 days old so PAID_DIR doesn't accumulate ~365 empty
+    flag files/year.
 
     Failure to write MUST NOT prevent the raise upstream — that would let
     cost climb further. Swallow all errors.
@@ -119,6 +157,12 @@ def _maybe_alert_cost_cap_once(status: dict) -> None:
         flag.touch()
     except Exception:
         return
+    # Cleanup old flags (best-effort; internal try/except + outer guard so a
+    # future refactor that breaks sweep can't break the alert path).
+    try:
+        _sweep_old_cost_cap_flags()
+    except Exception:
+        pass
     try:
         _storage.append_jsonl(
             _storage.PAID_DIR / "fatal_alerts.jsonl",
