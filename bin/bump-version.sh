@@ -39,14 +39,19 @@ fi
 
 echo "Bumping $OLD → $NEW"
 
+# Version strings are passed via the environment into single-quoted
+# heredocs so the shell never interpolates into Python source (avoids the
+# heredoc-injection foot-gun even though $NEW is semver-validated above).
+
 # 1. paid/_version.py — canonical source.
-python3 - <<PY
-import pathlib, re
+NEW="$NEW" python3 - <<'PY'
+import os, pathlib, re
+new = os.environ["NEW"]
 p = pathlib.Path("paid/_version.py")
 text = p.read_text()
 new_text = re.sub(
     r'^__version__\s*=\s*"[^"]+"',
-    f'__version__ = "$NEW"',
+    f'__version__ = "{new}"',
     text,
     count=1,
     flags=re.MULTILINE,
@@ -56,13 +61,14 @@ p.write_text(new_text)
 PY
 
 # 2. plugin.yaml — Hermes manifest.
-python3 - <<PY
-import pathlib, re
+NEW="$NEW" python3 - <<'PY'
+import os, pathlib, re
+new = os.environ["NEW"]
 p = pathlib.Path("plugin.yaml")
 text = p.read_text()
 new_text = re.sub(
     r'^version:\s*\S+',
-    f'version: $NEW',
+    f'version: {new}',
     text,
     count=1,
     flags=re.MULTILINE,

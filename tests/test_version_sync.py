@@ -6,8 +6,12 @@ catches the drift before release.
 
 Files checked:
 - ``plugin.yaml`` ``version:`` field (read by Hermes at plugin load)
-- ``pyproject.toml`` resolves dynamically from ``paid._version`` so it
-  doesn't need explicit checking — verified indirectly via build
+- ``pyproject.toml`` declares ``dynamic = ["version"]`` (no literal)
+- the setuptools dynamic ``attr`` actually *resolves* to the canonical
+  version using setuptools' own resolver — this is the build-time path
+  (``pip install`` / ``python -m build``) and the exact failure mode the
+  SSOT change exists to fix (a wheel labeled with a stale version). The
+  import-path check alone does NOT exercise this.
 """
 
 from __future__ import annotations
@@ -63,3 +67,26 @@ def test_paid_package_exports_version() -> None:
     import paid
 
     assert paid.__version__ == CANONICAL
+
+
+def test_setuptools_dynamic_resolves_to_canonical() -> None:
+    """The pyproject ``[tool.setuptools.dynamic]`` attr must resolve to the
+    canonical version *via setuptools' own resolver* — the build-time path.
+
+    The other tests check the import path (`from paid import __version__`)
+    and the pyproject declaration shape, but NOT that setuptools actually
+    resolves ``{attr = "paid._version.__version__"}`` to the right value.
+    That gap is precisely the original bug (a wheel labeled with a stale
+    version while the runtime was correct). ``read_attr`` is the same
+    function setuptools.config.pyprojecttoml uses to expand dynamic attrs,
+    so this exercises the real build resolution without a full ``build``.
+    """
+    from setuptools.config.expand import read_attr
+
+    resolved = read_attr("paid._version.__version__", root_dir=str(REPO_ROOT))
+    assert resolved == CANONICAL, (
+        f"setuptools dynamic attr resolved to {resolved!r} but canonical "
+        f"is {CANONICAL!r} — `pip install`/`build` would label the wheel "
+        f"with the wrong version. Check [tool.setuptools.dynamic] in "
+        f"pyproject.toml and paid/_version.py."
+    )
