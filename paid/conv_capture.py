@@ -183,9 +183,14 @@ def extract_from_message(
     profile_summary = _di._summarize_profile(profile)
     prompt = _CC_USER_TMPL.format(message=text, profile_summary=profile_summary)
     try:
+        # v1.6.9 fix: hermes_io.call_llm takes (prompt, system=...), NOT
+        # messages=[]. Pre-v1.6.9 every invocation raised TypeError which
+        # the broad except clause below swallowed → silently returned [].
+        # Result: conv_capture LLM extraction never ran in production since
+        # v1.6.2 shipped. Same bug exists in doc_ingest (also fixed).
         raw = hermes_io.call_llm(
+            prompt=prompt,
             system=_CC_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
         )
     except Exception as e:
