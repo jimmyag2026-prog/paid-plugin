@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from paid_review import ingest as ingest_mod
 from paid_review.ingest_backends.base import BackendResult, IngestBackend
 from paid_review.ingest_backends.text import TextBackend
@@ -118,6 +120,12 @@ def test_ingest_with_failed_url_does_not_yield_empty_normalized(tmp_path):
 
 
 def _ws_with_extracted(monkeypatch, body_text: str) -> WebScrapeBackend:
+    # The anti-scrape heuristic runs AFTER extraction, so it only
+    # applies when an extractor is available. On a venv without
+    # bs4/readability the backend short-circuits at the missing-dep
+    # check (which is itself the v1.6.15 doctor.py concern) — skip
+    # rather than assert the wrong branch.
+    pytest.importorskip("bs4")
     b = WebScrapeBackend()
     # Force the extractor to yield the placeholder body.
     monkeypatch.setattr(
