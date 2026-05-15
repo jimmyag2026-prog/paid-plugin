@@ -67,6 +67,7 @@ def run_checks() -> list[dict[str, Any]]:
         ("systemd_timers", _check_systemd_timers),
         ("data_files", _check_data_files),
         ("settings_schema", _check_settings_schema),
+        ("primary_channel", _check_primary_channel),
         ("recent_errors", _check_recent_errors),
     ]
     return [_run_one(name, fn) for name, fn in checks]
@@ -154,6 +155,48 @@ def _check_owner_json() -> tuple[bool, str, str]:
     if not idents:
         return False, "owner.json has no identities[]", "add at least one identity"
     return True, f"schema=2 identities={len(idents)}", ""
+
+
+def _check_primary_channel() -> tuple[bool, str, str]:
+    """v1.7.0: warn when owner has ≥2 enabled identities but no
+    primary channel set — PAID falls back to first-enabled which can
+    be surprising on multi-channel setups.
+
+    Single-channel owners always pass (nothing to pick).
+    """
+    path = storage.PAID_DIR / "owner.json"
+    if not path.exists():
+        # owner_json check already covers this; don't double-report.
+        return True, "skipped (owner.json missing — see owner_json check)", ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return True, "skipped (owner.json parse error — see owner_json check)", ""
+    enabled = [
+        str(i.get("platform", "") or "")
+        for i in (data.get("identities") or [])
+        if isinstance(i, dict) and i.get("enabled", True)
+        and i.get("platform")
+    ]
+    enabled = [p for p in enabled if p]  # drop blanks
+    preferred = str(data.get("preferred_platform", "") or "").strip()
+    if len(enabled) < 2:
+        return True, f"single-channel ({enabled[0] if enabled else 'none'})", ""
+    if not preferred:
+        return (
+            False,
+            f"{len(enabled)} channels enabled ({', '.join(enabled)}) "
+            f"but no primary set — PAID uses {enabled[0]!r} by default",
+            f"run /paid-set-primary <platform> in any owner DM",
+        )
+    if preferred not in enabled:
+        return (
+            False,
+            f"primary={preferred!r} not in enabled channels "
+            f"({', '.join(enabled)}) — falling back to {enabled[0]!r}",
+            f"run /paid-set-primary {enabled[0]} (or add {preferred} identity)",
+        )
+    return True, f"primary={preferred} (of {len(enabled)} enabled)", ""
 
 
 def _check_hermes_version() -> tuple[bool, str, str]:

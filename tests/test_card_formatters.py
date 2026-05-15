@@ -220,9 +220,11 @@ def test_slack_blocks_have_actions_with_three_buttons_when_draft():
     assert "paid_reject" in action_ids
 
 
-def test_slack_blocks_no_draft_still_renders_all_three_buttons_v1_2_2():
-    """v1.2.2 UX change: 3 buttons even without a draft for consistency.
-    The 'no draft' section block explicitly warns about ✅ being a no-op."""
+def test_slack_blocks_no_draft_still_renders_all_three_buttons_v1_7_0():
+    """v1.7.0: 3 buttons render even without a draft. ✅ Approve now
+    sends a language-matched default agreement (no longer inert), so the
+    'no draft' section reflects the new wording — no more slash-command
+    fallback instruction."""
     payload = card_formatters.format_slack(_make_spec(has_draft=False, draft=""))
     actions = [b for b in payload["blocks"] if b["type"] == "actions"]
     elements = actions[0]["elements"]
@@ -231,11 +233,11 @@ def test_slack_blocks_no_draft_still_renders_all_three_buttons_v1_2_2():
     assert "paid_approve" in action_ids
     assert "paid_reply" in action_ids
     assert "paid_reject" in action_ids
-    # The no-draft section warns about ✅ being inert.
+    # The no-draft section now explains the three click outcomes.
     sections = [b for b in payload["blocks"] if b["type"] == "section"]
     no_draft_text = " ".join(s["text"]["text"] for s in sections if s.get("text"))
-    assert "/paid-approve" in no_draft_text
-    assert "won't" in no_draft_text or "no_draft" in no_draft_text.lower() or "none" in no_draft_text.lower()
+    assert "default agreement" in no_draft_text
+    assert "none" in no_draft_text.lower() or "no draft" in no_draft_text.lower()
 
 
 def test_slack_action_value_is_request_id():

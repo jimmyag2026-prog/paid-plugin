@@ -15,15 +15,31 @@ It runs locally, all logs stay on your machine, and it speaks through
 your existing IM accounts (Telegram / Lark / Feishu / WhatsApp / WeCom /
 Slack — whichever Hermes is wired up to).
 
-**Status: v1.4.0 — approval card clicks wired (Lark + Telegram).**
-End-to-end loop is wired, **600 tests passing**, verified live on Lark
-approval-card flow and Telegram button-callback flow with
-`hermes-agent` v0.12.0. Ships interactive Lark approval cards and
-Telegram InlineKeyboard cards both with **fully-routed
-✅ Approve / ✏️ Reply / ❌ Reject** buttons; Slack Block Kit cards (click
-routing follow-up); a local-only Flask web dashboard; daily snapshot
-reports; and a `paid status` upgrade with today's metrics + activity
-dots.
+**Status: v1.7.0 — approval card clicks wired on all three IM platforms
+(Lark, Telegram, Slack).** End-to-end loop is wired, **1248 tests
+passing** against `hermes-agent` v0.12.0. Slack Block Kit, Telegram
+InlineKeyboard, and Lark interactive-card all share fully-routed
+✅ Approve / ✏️ Reply / ❌ Reject behaviour. Owner picks the primary
+notification channel via `/paid-set-primary` or the setup wizard.
+
+**v1.6 → v1.7 (2026-05-14)** — Multi-channel UX completion.
+
+- **Slack click routing** (M3.5.C-slack): lazy-attaches an `app.action`
+  handler on the live `slack_bolt.AsyncApp` so `paid_approve` /
+  `paid_reply` / `paid_reject` action_ids route back to PAID. Owner
+  verified via `body["user"]["id"]` against owner.json. Card is
+  `chat_update`-ed in place after resolution; falls back to
+  `chat_postMessage` if the original message is too old to edit.
+  Mirrors the same shape as v1.4.0 Telegram callback path so all three
+  IM platforms now behave identically on the J3 path.
+- **Owner primary IM channel**: new `OwnerProfile.preferred_platform`
+  field; `/paid-set-primary <lark|telegram|slack|auto>` switches it at
+  runtime. Setup wizard auto-adds the caller's `(platform, sender_id)`
+  as the first identity (closes the v1.6.x TODO at
+  `setup_wizard.py:466`), and asks Q6 only when ≥2 enabled channels
+  exist. `/paid-status` (no args) now shows primary + enabled channels.
+  `/paid-doctor` adds a `primary_channel` check that warns on
+  multi-channel-but-unset and on stale pointers.
 
 **v1.3 → v1.4 (2026-05-13)** — Approval cards work end-to-end on click.
 
@@ -39,7 +55,7 @@ dots.
   callback_data routes back to PAID (M3.5.C, see
   [`design/08`](https://github.com/jimmyag2026-prog/paid-may/blob/main/design/08_multiplatform_design.md) §1).
   No hermes upstream changes.
-- **Slack**: same shape, planned for v1.4.x once a workspace is wired live.
+- **Slack**: ✅ done in v1.7.0 (see v1.6 → v1.7 changelog above).
 
 **v1.1 → v1.2 (2026-05-03)** — Multi-platform v0.1: TG + Slack approval
 cards. Owner picks `preferred_platform` in `owner.json` (v2 schema with

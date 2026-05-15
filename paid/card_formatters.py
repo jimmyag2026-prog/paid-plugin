@@ -14,8 +14,12 @@ Conventions:
   - **Telegram** click routing: see `feat/tg-button-callback` PR (M3.5.C).
     Without that, TG buttons are visual-only and owner uses slash
     commands.
-  - **Slack** click routing: planned v1.4.x (M3.5.C-slack), pending a
-    live Slack workspace for honest smoke.
+  - **Slack** click routing: ✅ v1.7.0 (M3.5.C-slack). ``paid_*``
+    action_ids route via ``_ensure_slack_callback_registered`` (lazy-
+    attached single regex handler on the live ``slack_bolt.AsyncApp``).
+    Owner verified via ``body["user"]["id"]`` against owner.json. Action
+    semantics match the Lark/TG paths so the three platforms share J3
+    behaviour.
 """
 
 from __future__ import annotations
@@ -246,9 +250,10 @@ def format_slack(spec: ApprovalCardSpec) -> dict:
     Returns ``{"blocks": [...], "text": str}``. ``text`` is the
     notification fallback shown in mobile push / accessibility readers /
     legacy clients — Slack API REQUIRES it whenever blocks are sent.
-    Action buttons render but their click events are NOT routed back to
-    PAID (see module docstring); the context block at the bottom
-    instructs the owner to use slash commands.
+    Action buttons route back to PAID via the lazy-attached action
+    handler in ``__init__.py`` (``_ensure_slack_callback_registered``);
+    ✅ Approve → ``_do_approve``, ❌ Reject → ``_do_reject``, ✏️ Reply
+    arms ``awaiting_input`` for the owner's next plain-text message.
 
     Slack limit: 50 blocks per message. We use ~7 blocks well under.
     """
@@ -293,18 +298,22 @@ def format_slack(spec: ApprovalCardSpec) -> dict:
                 "type": "mrkdwn",
                 "text": (
                     f"*Draft:* _none — PAID couldn't ground a reply from your SOP_\n"
-                    f":warning: The ✅ button won't send anything. "
-                    f"Reply with `/paid-approve {spec.request_id} <your text>` "
-                    f"to send your own, or tap ❌ Reject."
+                    f":warning: ✅ Approve sends a default agreement "
+                    f"(e.g. \"可以的\" / \"Approved\"). "
+                    f"✏️ Reply lets you type a custom answer. "
+                    f"❌ Reject deflects to you directly."
                 ),
             },
         })
 
-    # Action buttons — visual only, click is NOT routed to PAID. action_id
-    # uses the same paid_* prefix as TG callback_data for symmetry/v1.x.
-    # All three buttons render every time (v1.2.2): consistent visual model
-    # across cards is more useful than hiding a button that wouldn't fire.
-    # The 'no draft' note above explains the recovery path explicitly.
+    # Action buttons — clicks route to PAID via the lazy-attached handler
+    # in __init__.py (_ensure_slack_callback_registered). The action_id
+    # paid_* prefix matches the regex constraint there. value=request_id
+    # carries the rid; the handler parses (action_id, value) into (verb,
+    # rid). All three buttons render every time (v1.2.2): consistent
+    # visual model across cards is more useful than hiding a button that
+    # wouldn't fire. The 'no draft' note above explains the recovery
+    # path for the empty-draft case.
     button_elements: list[dict] = [
         {
             "type": "button",

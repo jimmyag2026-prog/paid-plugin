@@ -59,6 +59,11 @@ class WizardState:
     # v1.6.1: pending doc ingest proposals
     doc_proposals: list = field(default_factory=list)   # list[UpdateProposal]
     doc_url: str = ""
+    # v1.7.0: post-Q5 follow-up. True iff the wizard is waiting for the
+    # owner to answer "which channel is your primary?" after the standard
+    # 5 questions completed. Only fires when ≥2 enabled identities exist
+    # AND profile.preferred_platform is not already set.
+    awaiting_preferred_platform: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +362,10 @@ def _add_reference(prof: Any, url: str, kind: str, extracted_topics: list) -> No
 
 
 def _consume_first_time(state: WizardState, answer: str) -> tuple[str, bool]:
+    # v1.7.0: post-Q5 follow-up — owner is replying to Q6 (preferred_platform).
+    if state.awaiting_preferred_platform:
+        return _consume_preferred_platform_answer(state, answer)
+
     qdef = _QUESTIONS[state.step - 1]
     parsed = _parse_answer(qdef["key"], answer)
     if isinstance(parsed, str) and parsed.startswith("ERR:"):
@@ -370,8 +379,8 @@ def _consume_first_time(state: WizardState, answer: str) -> tuple[str, bool]:
         next_q = _QUESTIONS[state.step - 1]
         return (next_q["prompt"], False)
 
-    # All 5 answered — build profile + derive + summary
-    return _finalize_first_time(state)
+    # All 5 answered — ask Q6 if multi-channel, else finalize directly.
+    return _maybe_ask_preferred_platform(state)
 
 
 def _consume_edit(state: WizardState, answer: str) -> tuple[str, bool]:
@@ -390,29 +399,84 @@ def _consume_edit(state: WizardState, answer: str) -> tuple[str, bool]:
     if not state.edit_field:
         # Owner is responding to the edit menu — pick a field
         choice = answer.lower().strip()
-        field_map = {
-            "1": "name", "name": "name",
-            "2": "voice_preset", "voice": "voice_preset", "tone": "voice_preset",
-            "3": "always_escalate", "topics": "always_escalate", "escalate": "always_escalate",
-            "4": "preferred_language", "language": "preferred_language", "lang": "preferred_language",
-            "5": "daily_cost_cap_usd", "cost": "daily_cost_cap_usd", "cap": "daily_cost_cap_usd",
-            "6": "done", "done": "done", "save": "done", "退出": "done",
-        }
+        # v1.7.0: #6 is primary-channel when multi-channel, else "done".
+        multi_channel = len(_enabled_platforms(existing)) >= 2
+        if multi_channel:
+            field_map = {
+                "1": "name", "name": "name",
+                "2": "voice_preset", "voice": "voice_preset", "tone": "voice_preset",
+                "3": "always_escalate", "topics": "always_escalate", "escalate": "always_escalate",
+                "4": "preferred_language", "language": "preferred_language", "lang": "preferred_language",
+                "5": "daily_cost_cap_usd", "cost": "daily_cost_cap_usd", "cap": "daily_cost_cap_usd",
+                "6": "preferred_platform", "primary": "preferred_platform",
+                "主频道": "preferred_platform", "channel": "preferred_platform",
+                "7": "done", "done": "done", "save": "done", "退出": "done",
+            }
+            menu_hint = "1=名字, 2=语气, 3=话题, 4=语言, 5=成本, 6=主频道, 7=保存退出"
+            range_hint = "1-7"
+        else:
+            field_map = {
+                "1": "name", "name": "name",
+                "2": "voice_preset", "voice": "voice_preset", "tone": "voice_preset",
+                "3": "always_escalate", "topics": "always_escalate", "escalate": "always_escalate",
+                "4": "preferred_language", "language": "preferred_language", "lang": "preferred_language",
+                "5": "daily_cost_cap_usd", "cost": "daily_cost_cap_usd", "cap": "daily_cost_cap_usd",
+                "6": "done", "done": "done", "save": "done", "退出": "done",
+            }
+            menu_hint = "1=名字, 2=语气, 3=话题, 4=语言, 5=成本, 6=保存退出"
+            range_hint = "1-6"
         picked = field_map.get(choice)
         if picked is None:
-            return (
-                "请回 1-6 选择字段（1=名字, 2=语气, 3=话题, 4=语言, 5=成本, 6=保存退出）",
-                False,
-            )
+            return (f"请回 {range_hint} 选择字段({menu_hint})", False)
         if picked == "done":
             with _LOCK:
                 _WIZARD_STATE.pop((state.platform, state.owner_id), None)
             return ("PAID setup 完成。", True)
         state.edit_field = picked
+        if picked == "preferred_platform":
+            # Custom prompt (not in _QUESTIONS — depends on owner's actual
+            # enabled identities)
+            return (
+                _render_preferred_platform_question(_enabled_platforms(existing)),
+                False,
+            )
         qdef = next(q for q in _QUESTIONS if q["key"] == picked)
         return (qdef["prompt"], False)
 
     # Owner is responding to a specific field's question
+    # v1.7.0: preferred_platform has its own parser (depends on enabled list)
+    if state.edit_field == "preferred_platform":
+        enabled = _enabled_platforms(existing)
+        raw = (answer or "").strip().lower()
+        if not raw:
+            return ("空回复 — 回平台名或数字。", False)
+        auto_idx = str(len(enabled) + 1)
+        if raw in ("auto", "skip", "自动", auto_idx):
+            existing.preferred_platform = ""
+            picked = "_auto_"
+        elif raw.isdigit() and 1 <= int(raw) <= len(enabled):
+            existing.preferred_platform = enabled[int(raw) - 1]
+            picked = existing.preferred_platform
+        else:
+            canonical = {"feishu": "lark", "lark": "lark", "telegram": "telegram",
+                         "tg": "telegram", "slack": "slack"}
+            cand = canonical.get(raw, raw)
+            if cand not in enabled:
+                return (
+                    f"无法识别 {answer!r}。请回 1-{len(enabled)+1} 或平台名 "
+                    f"({', '.join(enabled)} / auto)。",
+                    False,
+                )
+            existing.preferred_platform = cand
+            picked = cand
+        _profile.save_profile(existing)
+        _profile_sync.derive_from_profile(existing)
+        state.edit_field = ""
+        return (
+            f"✓ 主频道已设为 {picked}。\n\n{_render_edit_menu(existing)}",
+            False,
+        )
+
     parsed = _parse_answer(state.edit_field, answer)
     if isinstance(parsed, str) and parsed.startswith("ERR:"):
         qdef = next(q for q in _QUESTIONS if q["key"] == state.edit_field)
@@ -436,6 +500,144 @@ def _consume_edit(state: WizardState, answer: str) -> tuple[str, bool]:
 # ---------------------------------------------------------------------------
 
 
+def _ensure_caller_identity(prof: _profile.OwnerProfile, state: WizardState) -> None:
+    """v1.7.0: if the wizard caller's (platform, sender_id) isn't already in
+    prof.identities, append it as an enabled entry. Idempotent — re-running
+    /paid-setup never duplicates rows.
+
+    This collapses the old setup_wizard.py:466 TODO (v1.6.x: have wizard
+    auto-add the platform+sender_id of the invocation as the first
+    identity). Without this, the owner has to hand-edit owner_profile.json
+    to make even single-channel notifications work; with it, day-one ops
+    work the moment the wizard finishes.
+    """
+    if not state.platform or not state.owner_id:
+        return
+    for ident in prof.identities:
+        if (
+            isinstance(ident, dict)
+            and str(ident.get("platform", "")) == state.platform
+            and str(ident.get("user_id", "")) == state.owner_id
+        ):
+            return  # already present — no-op
+    prof.identities.append({
+        "platform": state.platform,
+        "user_id": state.owner_id,
+        "home_chat_id": state.owner_id,
+        "enabled": True,
+        "name": prof.name or "",
+    })
+
+
+def _enabled_platforms(prof: _profile.OwnerProfile) -> list[str]:
+    out: list[str] = []
+    for ident in prof.identities:
+        if not isinstance(ident, dict):
+            continue
+        if not ident.get("enabled", True):
+            continue
+        plat = str(ident.get("platform", "") or "")
+        if plat and plat not in out:
+            out.append(plat)
+    return out
+
+
+def _maybe_ask_preferred_platform(state: WizardState) -> tuple[str, bool]:
+    """After Q5: peek at the would-be profile, including the auto-added
+    caller identity, and decide whether to ask Q6.
+
+    Skips Q6 when:
+      - profile would have only 1 enabled channel (nothing to pick)
+      - profile.preferred_platform already set (don't badger the owner)
+    """
+    existing = _profile.load_profile()
+    if existing is None:
+        # Build a throwaway preview profile so we can count post-add identities.
+        preview = _profile.new_profile(
+            owner_id=state.owner_id,
+            name=state.answers.get("name", "") or "",
+            voice_preset=state.answers.get("voice_preset", "founder"),
+            preferred_language=state.answers.get("preferred_language", "auto"),
+        )
+    else:
+        preview = existing
+    _ensure_caller_identity(preview, state)
+    enabled = _enabled_platforms(preview)
+
+    already_set = bool((preview.preferred_platform or "").strip())
+    if len(enabled) < 2 or already_set:
+        return _finalize_first_time(state)
+
+    state.awaiting_preferred_platform = True
+    return (_render_preferred_platform_question(enabled), False)
+
+
+def _render_preferred_platform_question(enabled_platforms: list[str]) -> str:
+    """Q6 prompt — owner picks which channel PAID should DM by default."""
+    lines = [
+        "6/6 你有多个 IM channel — PAID 主要在哪里找你？",
+        "（影响 approval card / discovery card / 告警 默认走哪条）",
+        "",
+    ]
+    for i, plat in enumerate(enabled_platforms, start=1):
+        lines.append(f"  {i}. {plat}")
+    lines.append(f"  {len(enabled_platforms)+1}. auto — 让 PAID 挑（首条 enabled）")
+    return "\n".join(lines)
+
+
+def _consume_preferred_platform_answer(
+    state: WizardState, answer: str
+) -> tuple[str, bool]:
+    """Parse Q6 answer + finalize. ``state.answers['preferred_platform']`` is
+    set to the chosen platform string, or `_auto_` to leave empty."""
+    existing = _profile.load_profile()
+    if existing is None:
+        preview = _profile.new_profile(
+            owner_id=state.owner_id,
+            name=state.answers.get("name", "") or "",
+            voice_preset=state.answers.get("voice_preset", "founder"),
+            preferred_language=state.answers.get("preferred_language", "auto"),
+        )
+    else:
+        preview = existing
+    _ensure_caller_identity(preview, state)
+    enabled = _enabled_platforms(preview)
+
+    raw = (answer or "").strip().lower()
+    if not raw:
+        return ("空回复 — 回平台名(lark/telegram/slack) 或数字。", False)
+
+    auto_idx = str(len(enabled) + 1)
+    if raw in ("auto", "skip", "自动", auto_idx):
+        state.answers["preferred_platform"] = "_auto_"
+        return _finalize_first_time(state)
+
+    # numeric pick
+    if raw.isdigit():
+        n = int(raw)
+        if 1 <= n <= len(enabled):
+            state.answers["preferred_platform"] = enabled[n - 1]
+            return _finalize_first_time(state)
+        return (
+            f"请回 1-{len(enabled)+1} 选择 channel,或 `auto` 让 PAID 自动挑。",
+            False,
+        )
+
+    # name pick (case-insensitive; "feishu" maps to "lark" if user typed that)
+    canonical = {"feishu": "lark", "lark": "lark", "telegram": "telegram",
+                 "tg": "telegram", "slack": "slack"}
+    picked = canonical.get(raw, raw)
+    if picked in enabled:
+        state.answers["preferred_platform"] = picked
+        return _finalize_first_time(state)
+
+    return (
+        f"无法识别 {answer!r}。请回 1-{len(enabled)+1} 或平台名 "
+        f"({', '.join(enabled)} / auto)。",
+        False,
+    )
+
+
 def _finalize_first_time(state: WizardState) -> tuple[str, bool]:
     """Apply the 5 wizard answers and persist.
 
@@ -445,6 +647,10 @@ def _finalize_first_time(state: WizardState) -> tuple[str, bool]:
     extracted from sop.md by the migration LLM). Prior to v1.6.8 we always
     built a fresh ``new_profile`` here, which silently wiped any field outside
     the 5-question scope.
+
+    v1.7.0: auto-add caller identity to profile.identities if not present
+    (collapses old TODO in this same function). If state.answers contains
+    preferred_platform (Q6 was asked + answered), apply it.
     """
     existing = _profile.load_profile()
     if existing is not None:
@@ -480,6 +686,16 @@ def _finalize_first_time(state: WizardState) -> tuple[str, bool]:
         elif cost == "_inf_":
             prof.preferences.daily_cost_cap_usd = 99999.0
 
+    # v1.7.0: ensure the wizard caller's identity is on the profile.
+    _ensure_caller_identity(prof, state)
+
+    # v1.7.0: apply Q6 answer if present.
+    pref = state.answers.get("preferred_platform")
+    if pref == "_auto_":
+        prof.preferred_platform = ""  # leave empty → fallback to identities[0]
+    elif isinstance(pref, str) and pref:
+        prof.preferred_platform = pref
+
     _profile.save_profile(prof)
     audit = _profile_sync.derive_from_profile(prof)
 
@@ -495,15 +711,28 @@ def _finalize_first_time(state: WizardState) -> tuple[str, bool]:
 
 
 def _render_edit_menu(prof: _profile.OwnerProfile) -> str:
+    enabled = _enabled_platforms(prof)
+    if len(enabled) >= 2:
+        primary_line = (
+            f"  • 主频道: {prof.preferred_platform or '(自动 — 用首条 enabled)'}\n"
+        )
+        menu_extra = "  6. 主频道  7. 保存退出"
+    else:
+        # Only 1 channel — no choice to make; hide the menu item to keep
+        # the wizard small for single-channel owners.
+        primary_line = ""
+        menu_extra = "  6. 保存退出"
     return (
         f"PAID setup — 当前 profile:\n"
         f"  • 名字: {prof.name or '(未设置)'}\n"
         f"  • 语气: {prof.voice.tone}\n"
         f"  • Escalate topics: {', '.join(prof.topics.always_escalate) or '(空)'}\n"
         f"  • 默认语言: {prof.preferred_language}\n"
-        f"  • 每日 LLM cost cap: ${prof.preferences.daily_cost_cap_usd:.2f}\n\n"
+        f"  • 每日 LLM cost cap: ${prof.preferences.daily_cost_cap_usd:.2f}\n"
+        f"{primary_line}\n"
         f"改哪个？回数字或字段名：\n"
-        f"  1. 名字  2. 语气  3. 话题  4. 语言  5. 成本  6. 保存退出"
+        f"  1. 名字  2. 语气  3. 话题  4. 语言  5. 成本\n"
+        f"{menu_extra}"
     )
 
 

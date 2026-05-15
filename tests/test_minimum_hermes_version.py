@@ -118,7 +118,7 @@ def test_register_good_ctx_registers_all_commands(paid_tmp, monkeypatch):
     # v1.5.5 A1: + /paid-doctor (7 health checks; Lark card or plain text)
     assert set(ctx.commands_registered) == {
         "paid-pending", "paid-approve", "paid-reject", "paid-status",
-        "paid-cancel-input", "paid-doctor", "card",
+        "paid-cancel-input", "paid-doctor", "paid-set-primary", "card",
     }
 
 

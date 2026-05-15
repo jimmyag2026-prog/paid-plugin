@@ -174,7 +174,9 @@ def test_run_checks_returns_all_rows(paid_tmp):
     ids = {r["id"] for r in rows}
     expected = {
         "hermes_config", "owner_json", "hermes_version",
-        "systemd_timers", "data_files", "settings_schema", "recent_errors",
+        "systemd_timers", "data_files", "settings_schema",
+        "primary_channel",  # v1.7.0
+        "recent_errors",
     }
     assert ids == expected
     # Every row has the canonical 4 fields

@@ -51,6 +51,7 @@ ALLOWED_PROFILE_FIELDS: frozenset[str] = frozenset({
     "topics.always_direct",
     "topics.always_decline",
     "preferred_language",
+    "preferred_platform",
     "preferences.daily_cost_cap_usd",
     "observed.preferred_decision_window_hrs",
 })
@@ -184,6 +185,12 @@ class OwnerProfile:
     """[{platform, user_id, home_chat_id?, enabled?, name?}, ...]
     Same shape as legacy owner.json identities."""
 
+    preferred_platform: str = ""
+    """Owner's primary IM channel for PAID outbound DMs (approval cards,
+    discovery cards, alerts). Must match one of identities[].platform.
+    Empty → fall back to the first enabled identity (legacy behavior).
+    Settable via /paid-set-primary or the setup wizard. v1.7.0."""
+
     voice: Voice = field(default_factory=Voice)
     topics: Topics = field(default_factory=Topics)
     preferences: Preferences = field(default_factory=Preferences)
@@ -268,6 +275,7 @@ def _profile_from_dict(data: dict[str, Any]) -> OwnerProfile:
         name=str(data.get("name", "") or ""),
         preferred_language=str(data.get("preferred_language", "auto") or "auto"),
         identities=list(data.get("identities", []) or []),
+        preferred_platform=str(data.get("preferred_platform", "") or ""),
         voice=Voice(
             tone=str(voice_data.get("tone", "direct-friendly") or "direct-friendly"),
             style_notes=str(voice_data.get("style_notes", "") or ""),
