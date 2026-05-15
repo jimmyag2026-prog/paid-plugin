@@ -1504,6 +1504,10 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
                 and not owner_text_peek.startswith("/")
                 and _conv_capture.has_pending(platform, sender_id)
             ):
+                _safe_log(
+                    f"[conv_capture] apply path: pending exists for "
+                    f"{platform}:{sender_id[:8]}, reply='{owner_text_peek[:40]}'"
+                )
                 _chat_id_cc = ""
                 if source is not None:
                     _cid_cc = getattr(source, "chat_id", None)
@@ -1512,6 +1516,7 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
                     _cc_reply = _conv_capture.apply_confirmed(
                         platform, sender_id, owner_text_peek,
                     )
+                    _safe_log(f"[conv_capture] apply done: '{_cc_reply[:60]}'")
                 except Exception as exc:
                     _safe_log(f"[conv_capture] apply EXC: {exc}")
                     _cc_reply = f"Profile 更新确认出错 — {exc}。"
@@ -1522,15 +1527,34 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
             # Message still passes through to Claude; this fires asynchronously.
             if owner_text_peek and not owner_text_peek.startswith("/"):
                 try:
+                    _safe_log(
+                        f"[conv_capture] detect entry: plat={platform} "
+                        f"sender={sender_id[:8]} text='{owner_text_peek[:60]}'"
+                    )
                     _prof_for_cc = None
                     try:
                         from paid import profile as _profile_mod
                         _prof_for_cc = _profile_mod.load_profile()
-                    except Exception:
-                        pass
-                    if _prof_for_cc is not None:
+                    except Exception as _pf_exc:
+                        _safe_log(f"[conv_capture] profile load EXC: {_pf_exc}")
+                    if _prof_for_cc is None:
+                        _safe_log("[conv_capture] detect skip: profile is None")
+                    else:
+                        _scan_ok = _conv_capture.should_scan(owner_text_peek)
+                        _rate_limited = _conv_capture.is_rate_limited(
+                            platform, sender_id,
+                        )
+                        _safe_log(
+                            f"[conv_capture] gates: should_scan={_scan_ok} "
+                            f"rate_limited={_rate_limited}"
+                        )
                         _cc_proposals = _conv_capture.extract_from_message(
                             owner_text_peek, _prof_for_cc, platform, sender_id,
+                        )
+                        _safe_log(
+                            f"[conv_capture] extract result: "
+                            f"proposals={len(_cc_proposals)} "
+                            f"fields={[p.field for p in _cc_proposals]}"
                         )
                         if _cc_proposals:
                             _conv_capture.store_pending(platform, sender_id, _cc_proposals)
@@ -1541,11 +1565,36 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
                             if source is not None:
                                 _cid_ccp = getattr(source, "chat_id", None)
                                 _chat_id_ccp = str(_cid_ccp) if _cid_ccp else ""
-                            _send_setup_wizard_reply(
-                                platform, sender_id, _chat_id_ccp, _cc_prompt,
+                            _safe_log(
+                                f"[conv_capture] sending confirm: "
+                                f"chat_id='{_chat_id_ccp}' "
+                                f"target={_chat_id_ccp or sender_id} "
+                                f"prompt_len={len(_cc_prompt)}"
                             )
+                            # Inline the send so we can log the actual result
+                            # from hermes_io.send_dm (the helper swallows it).
+                            _cc_send_target = _chat_id_ccp or sender_id
+                            try:
+                                _cc_send_result = hermes_io.send_dm(
+                                    platform, _cc_send_target, _cc_prompt,
+                                    fallback_to_queue=True,
+                                )
+                                _safe_log(
+                                    f"[conv_capture] send_dm result: "
+                                    f"ok={_cc_send_result.get('ok')} "
+                                    f"msg_id={_cc_send_result.get('msg_id')} "
+                                    f"queued={_cc_send_result.get('queued')} "
+                                    f"err={_cc_send_result.get('error')}"
+                                )
+                            except Exception as _cc_send_exc:
+                                _safe_log(
+                                    f"[conv_capture] send_dm EXC: "
+                                    f"{type(_cc_send_exc).__name__}: {_cc_send_exc}"
+                                )
                 except Exception as exc:
-                    _safe_log(f"[conv_capture] detect EXC: {exc}")
+                    _safe_log(
+                        f"[conv_capture] detect EXC: {type(exc).__name__}: {exc}"
+                    )
 
             # Owner-side messages normally pass through to hermes / Claude.
             # BUT: if the owner clicked ✅ / ✏️ on a card and we armed
