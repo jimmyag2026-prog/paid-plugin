@@ -216,7 +216,10 @@ def test_extract_parses_valid_json(monkeypatch):
     proposals = di.extract_profile_updates("doc content", prof)
     assert len(proposals) == 1
     assert proposals[0].field == "voice.do_not_say"
-    assert proposals[0].proposed == ["按规定", "依据条款"]
+    # v1.6.11: list fields merge with existing values. The "founder" voice
+    # preset seeds do_not_say with ["按规定", "依据条款", "请理解"]; the LLM
+    # re-proposed the first two so the merged result keeps all three.
+    assert proposals[0].proposed == ["按规定", "依据条款", "请理解"]
     assert not proposals[0].accepted
 
 

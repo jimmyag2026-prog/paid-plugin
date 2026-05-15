@@ -357,6 +357,20 @@ def _parse_proposals(raw: str, profile: Any) -> list[UpdateProposal]:
         proposed = item.get("proposed")
         rationale = str(item.get("rationale", ""))[:300]
         current = _get_current_value(profile, f)
+
+        # v1.6.11: for list-typed profile fields, the LLM's "proposed" is
+        # a delta (items to add), not a full replacement. Merge with the
+        # existing list, preserve insertion order, dedupe. Without this
+        # merge, accepting a conv_capture proposal of ["pricing"] would
+        # overwrite an always_decline of three prior items down to one.
+        if f in _profile.LIST_PROFILE_FIELDS and isinstance(proposed, list):
+            current_list = list(current) if isinstance(current, list) else []
+            merged: list = list(current_list)
+            for x in proposed:
+                if x not in merged:
+                    merged.append(x)
+            proposed = merged
+
         results.append(UpdateProposal(
             field=f,
             current=current,
