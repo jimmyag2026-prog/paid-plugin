@@ -177,12 +177,52 @@ def check_sweep_log_freshness(log_path: Path | None = None,
     return [Check("ok", f"sweep log fresh ({age.total_seconds()/3600:.1f}h old)")]
 
 
+def check_ingest_deps() -> list[Check]:
+    """v1.6.15: ingest backends graceful-degrade when their libs are
+    missing, so a stale venv silently turns every URL/PDF/image review
+    into an empty-input run (jelabs pilot day-1). Surface the gap loudly
+    instead of letting it fail silent."""
+    out: list[Check] = []
+    # (import name, pip package, what it unblocks)
+    deps = [
+        ("bs4", "beautifulsoup4", "web page scraping"),
+        ("readability", "readability-lxml", "web article extraction"),
+        ("lxml", "lxml", "readability/HTML parsing"),
+        ("httpx", "httpx", "URL fetch (web + Lark Drive)"),
+    ]
+    for mod, pkg, what in deps:
+        try:
+            __import__(mod)
+            out.append(Check("ok", f"ingest dep {pkg}"))
+        except Exception:
+            out.append(Check(
+                "warn", f"ingest dep {pkg} MISSING",
+                f"`pip install {pkg}` — without it {what} silently "
+                "degrades to empty input",
+            ))
+    # PDF + OCR are CLI/optional — soft check only.
+    import shutil
+    if not shutil.which("pdftotext"):
+        out.append(Check(
+            "warn", "pdftotext not on PATH",
+            "PDF ingest falls back to pdfminer if installed; install "
+            "poppler-utils for best results",
+        ))
+    if not shutil.which("tesseract"):
+        out.append(Check(
+            "warn", "tesseract not on PATH",
+            "image-OCR ingest disabled until tesseract installed",
+        ))
+    return out
+
+
 def run_all(cron_path: Path = _DEFAULT_CRON_PATH,
             sweep_log_path: Path | None = None) -> list[Check]:
     checks: list[Check] = []
     checks += check_paid_dir_layout()
     checks += check_prompts()
     checks += check_active_sessions()
+    checks += check_ingest_deps()
     checks += check_cron_entry(cron_path)
     checks += check_sweep_log_freshness(sweep_log_path)
     return checks

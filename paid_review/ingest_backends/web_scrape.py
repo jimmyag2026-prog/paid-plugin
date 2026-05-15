@@ -58,6 +58,30 @@ _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _HTTP_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 
+# v1.6.15: anti-scrape / JS-wall placeholder signatures. Sites like x.com
+# return HTTP 200 with a short "enable JavaScript" shell when hit by a
+# non-browser client. Pre-v1.6.15 that shell (non-empty!) sailed past the
+# 0-chars guard and got fed to the four-pillar reviewer AS IF it were the
+# document — worse than an empty input. If the *entire* extracted body is
+# short AND contains one of these, treat it as a failed fetch.
+_ANTISCRAPE_SIGNATURES = (
+    "javascript is disabled",
+    "please enable javascript",
+    "enable javascript or switch to a supported browser",
+    "we've detected that javascript is disabled",
+    "something went wrong, but don",  # x.com error shell
+    "privacy related extensions may cause issues",
+    "are you a robot",
+    "verify you are human",
+    "checking if the site connection is secure",  # Cloudflare interstitial
+    "请开启 javascript",
+    "请启用 javascript",
+)
+# Only treat as anti-scrape when the body is short — a real article that
+# merely mentions "JavaScript" in passing must not be nuked.
+_ANTISCRAPE_MAX_LEN = 800
+
+
 # Hosts/ports that other backends own — WebScrapeBackend must not steal them.
 _LARK_HOST_SUFFIXES = (".feishu.cn", ".larksuite.com")
 
@@ -332,6 +356,25 @@ class WebScrapeBackend(IngestBackend):
                     "relevant text directly."
                 ],
             )
+
+        # v1.6.15: anti-scrape wall detection. A short body that is just a
+        # "enable JavaScript" / bot-check shell is NOT content — reject it
+        # so _route_urls_in_text keeps the URL + reason instead of feeding
+        # the shell to the reviewer.
+        _stripped = extracted.strip()
+        if len(_stripped) <= _ANTISCRAPE_MAX_LEN:
+            _low = _stripped.lower()
+            if any(sig in _low for sig in _ANTISCRAPE_SIGNATURES):
+                return BackendResult(
+                    normalized="",
+                    backend=self.name,
+                    source=source,
+                    errors=[
+                        "site requires JavaScript / blocks scrapers "
+                        "(anti-scrape wall). A stronger fetch tool is "
+                        "needed for this host, or paste the text directly."
+                    ],
+                )
 
         prefix = f"# {title.strip()}\n\n" if title and title.strip() else ""
         body = prefix + extracted.strip()

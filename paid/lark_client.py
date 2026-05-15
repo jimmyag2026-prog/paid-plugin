@@ -401,6 +401,81 @@ class LarkClient:
         )
         return body.get("data", {}).get("node", {}) or {}
 
+    def download_file(self, file_token: str) -> tuple[bytes, str, str]:
+        """Download a Drive file (网盘文件) by its file_token.
+
+        Endpoint: ``GET /open-apis/drive/v1/files/{file_token}/download``
+        Required scope: ``drive:drive:readonly`` (or drive:file:readonly).
+
+        Returns ``(content_bytes, filename, mime_type)``. Filename comes
+        from the ``Content-Disposition`` header, mime from
+        ``Content-Type``. Raises LarkAPIError on failure.
+
+        Unlike :meth:`_request`, the response is a binary stream, not
+        JSON — so this has its own minimal token+retry flow rather than
+        routing through ``_request`` (which parses ``resp.json()``).
+        """
+        import re as _re
+        from urllib.parse import unquote
+
+        path = f"/open-apis/drive/v1/files/{file_token}/download"
+        url = f"{self.base_url}{path}"
+        attempts = 0
+        refreshed = False
+        while attempts <= _DEFAULT_MAX_RETRIES:
+            attempts += 1
+            token = self._get_tenant_access_token()
+            try:
+                resp = self._http.request(
+                    "GET", url, headers={"Authorization": f"Bearer {token}"},
+                )
+            except httpx.HTTPError as exc:
+                if attempts > _DEFAULT_MAX_RETRIES:
+                    raise LarkAPIError(
+                        f"GET {path} network error after {attempts}: {exc}"
+                    ) from exc
+                _backoff(attempts)
+                continue
+
+            if resp.status_code == 401 and not refreshed:
+                refreshed = True
+                self._get_tenant_access_token(force_refresh=True)
+                continue
+            if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                if attempts > _DEFAULT_MAX_RETRIES:
+                    raise LarkAPIError(
+                        f"GET {path} HTTP {resp.status_code} after {attempts}",
+                        status=resp.status_code,
+                    )
+                _backoff(attempts, retry_after=resp.headers.get("Retry-After"))
+                continue
+            if resp.status_code >= 400:
+                # Lark sometimes returns a JSON error body even on the
+                # download endpoint (e.g. permission / token invalid).
+                detail = resp.text[:300]
+                raise LarkAPIError(
+                    f"GET {path} HTTP {resp.status_code}: {detail}",
+                    status=resp.status_code,
+                )
+
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+            # If Lark returned JSON, it's an error envelope, not the file.
+            if ctype == "application/json":
+                raise LarkAPIError(
+                    f"GET {path} returned JSON (not file): {resp.text[:300]}"
+                )
+
+            cd = resp.headers.get("Content-Disposition") or ""
+            fname = ""
+            m = _re.search(r"filename\*?=(?:UTF-8''|\")?([^\";]+)", cd)
+            if m:
+                fname = unquote(m.group(1).strip().strip('"'))
+            if not fname:
+                fname = file_token
+            return resp.content, fname, ctype or "application/octet-stream"
+
+        raise LarkAPIError(f"GET {path} exhausted retries")
+
 
 # ---------------------------------------------------------------------------
 # Backoff helper
