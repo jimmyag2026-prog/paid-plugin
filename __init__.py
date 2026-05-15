@@ -1380,19 +1380,36 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
             if _routing == "group_disabled" and not owner_in_group_command:
                 return {"action": "skip", "reason": "paid_group_not_enabled"}
             if _routing in ("group_everyday", "group_both"):
-                # Phase 6 reserves these modes — drop until Phase 6.x wires
-                # the everyday Claude flow. /paid-* and /review continue to
-                # work via the explicit allowances below.
-                allowed_prefixes = ("/paid-", "/review", "/r ")
-                stripped_peek = event_text_peek.lstrip()
-                if not any(
-                    stripped_peek.startswith(p) or stripped_peek == p.rstrip()
-                    for p in allowed_prefixes
-                ):
-                    return {
-                        "action": "skip",
-                        "reason": f"paid_group_mode_reserved_{_routing}",
-                    }
+                # v1.6.17b: everyday/both now actually wire the Claude flow
+                # (was reserved/dropped pre-v1.6.17 — jelabs pilot day-1:
+                # owner set mode=both, cp's "请问团队开会时间…" was silently
+                # dropped with paid_group_mode_reserved_group_both, bot
+                # looked dead in the group).
+                #
+                # A non-command group message in everyday/both falls
+                # through to the same J2 cp pipeline a P2P DM uses
+                # (classify → decide → approval card to owner DM → reply
+                # back to the group). /paid-* and /review keep their
+                # existing downstream handlers.
+                #
+                # Mention gating: we rely on hermes' FEISHU_ALLOW_BOTS=
+                # mentions contract — only @-mentioned group messages are
+                # delivered to the agent pipeline, so anything reaching
+                # here is already addressed to the bot. We do NOT re-parse
+                # mention markup (brittle across platforms); if an operator
+                # sets ALLOW_BOTS=all they explicitly opted into the bot
+                # seeing all group chatter in everyday mode.
+                _grp_chat_id = (
+                    str(getattr(source, "chat_id", "") or "")
+                    if source is not None else ""
+                )
+                _safe_log(
+                    f"[group_routing] everyday/both fall-through "
+                    f"routing={_routing} chat={_grp_chat_id} "
+                    f"text='{event_text_peek[:50]}'"
+                )
+                # fall through — owner-command / review / cp-classify
+                # branches below handle it exactly as P2P.
             if _routing == "group_review_strict" and not owner_in_group_command:
                 # v1.5.1 fix (audit Critical #5): review-only group, sender
                 # typed a non-command message. Only let through if THIS
