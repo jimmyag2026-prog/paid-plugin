@@ -51,11 +51,14 @@ class WizardState:
     """Per-owner wizard progress."""
     platform: str
     owner_id: str
-    mode: str = "first_time"  # "first_time" | "edit"
+    mode: str = "first_time"  # "first_time" | "edit" | "doc_confirm"
     step: int = 0              # 0 means just started; 1-5 means waiting for that question's answer
     answers: dict[str, Any] = field(default_factory=dict)
     edit_field: str = ""       # when mode="edit", which single field is being edited
     since_ts: float = 0.0
+    # v1.6.1: pending doc ingest proposals
+    doc_proposals: list = field(default_factory=list)   # list[UpdateProposal]
+    doc_url: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +227,128 @@ def resync() -> str:
         f"✓ 重新生成了 {len(audit['wrote'])} 个 derived 文件: "
         + ", ".join(audit["wrote"])
     )
+
+
+def start_doc_ingest(platform: str, owner_id: str, url: str) -> str:
+    """v1.6.1: Fetch a doc URL, extract profile update proposals, store for confirm.
+
+    Returns a DM-ready message to send to the owner (either the confirm prompt
+    or an error/empty message).  Does NOT start a first-time wizard — works
+    independently of wizard state.
+    """
+    from . import doc_ingest as _di
+
+    prof = _profile.load_profile()
+    if prof is None:
+        return (
+            "还没有 owner_profile.json — 先发 `/paid-setup` 完成初始 setup。"
+        )
+
+    try:
+        _kind, content = _di.fetch_content(url)
+    except ValueError as e:
+        return f"⚠️ 无法获取文档内容：{e}"
+
+    proposals = _di.extract_profile_updates(content, prof)
+    if not proposals:
+        # Still store the reference even if no structural updates
+        _add_reference(prof, url, _kind, [])
+        _profile.save_profile(prof)
+        return (
+            f"🔍 读取了 {url} 但没有找到可更新的 profile 字段。\n"
+            "文档 URL 已加入 references 列表。"
+        )
+
+    # Store state for owner confirm
+    with _LOCK:
+        state = _WIZARD_STATE.get((platform, owner_id))
+        if state is None or state.mode not in ("doc_confirm",):
+            state = WizardState(
+                platform=platform,
+                owner_id=owner_id,
+                mode="doc_confirm",
+                since_ts=time.time(),
+            )
+            _WIZARD_STATE[(platform, owner_id)] = state
+        state.doc_proposals = proposals
+        state.doc_url = url
+        state.since_ts = time.time()
+
+    return _di.format_confirm_prompt(proposals)
+
+
+def consume_doc_confirm(platform: str, owner_id: str, reply: str) -> tuple[str, bool]:
+    """v1.6.1: Owner replied to the doc-confirm prompt. Apply accepted proposals.
+
+    Returns (message, done). done=True clears the doc_confirm state.
+    """
+    from . import doc_ingest as _di
+
+    _prune_expired()
+    with _LOCK:
+        state = _WIZARD_STATE.get((platform, owner_id))
+
+    if state is None or state.mode != "doc_confirm":
+        return ("没有待确认的文档更新。", True)
+
+    proposals = state.doc_proposals
+    accepted_indices = _di.parse_confirm_reply(reply, len(proposals))
+    for i, prop in enumerate(proposals):
+        prop.accepted = (i + 1) in accepted_indices
+
+    prof = _profile.load_profile()
+    if prof is None:
+        with _LOCK:
+            _WIZARD_STATE.pop((platform, owner_id), None)
+        return ("profile 丢失，请重新 `/paid-setup`。", True)
+
+    _di.apply_proposals(prof, proposals)
+
+    # Add reference URL to profile
+    accepted_topics = [
+        tok
+        for p in proposals if p.accepted and p.field == "topics.always_escalate"
+        for tok in (p.proposed if isinstance(p.proposed, list) else [])
+    ]
+    _add_reference(prof, state.doc_url, "doc", accepted_topics)
+    _profile.save_profile(prof)
+
+    n_accepted = sum(1 for p in proposals if p.accepted)
+    n_total = len(proposals)
+    with _LOCK:
+        _WIZARD_STATE.pop((platform, owner_id), None)
+
+    return (
+        f"✓ 接受了 {n_accepted}/{n_total} 条更新，profile 已保存并重新生成 derived 文件。",
+        True,
+    )
+
+
+def is_doc_confirm_active(platform: str, owner_id: str) -> bool:
+    """True iff owner is waiting to confirm a doc ingest proposal list."""
+    _prune_expired()
+    with _LOCK:
+        state = _WIZARD_STATE.get((platform, owner_id))
+    return state is not None and state.mode == "doc_confirm"
+
+
+def _add_reference(prof: Any, url: str, kind: str, extracted_topics: list) -> None:
+    """Append/update a reference entry in profile.references[]."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Dedup by URL
+    for ref in prof.references:
+        if isinstance(ref, dict) and ref.get("url") == url:
+            ref["last_synced_at"] = now
+            ref["extracted_topics"] = extracted_topics
+            return
+    prof.references.append({
+        "kind": kind,
+        "url": url,
+        "label": "",
+        "last_synced_at": now,
+        "extracted_topics": extracted_topics,
+    })
 
 
 # ---------------------------------------------------------------------------

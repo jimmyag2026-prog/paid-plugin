@@ -1385,6 +1385,29 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
             if wiz_rv is not None:
                 return wiz_rv
 
+            # v1.6.1: doc confirm reply capture (mode="doc_confirm")
+            if (
+                owner_text_peek
+                and not owner_text_peek.startswith("/")
+                and _setup_wizard.is_doc_confirm_active(platform, sender_id)
+            ):
+                _chat_id_dc = ""
+                if source is not None:
+                    _cid_dc = getattr(source, "chat_id", None)
+                    _chat_id_dc = str(_cid_dc) if _cid_dc else ""
+                try:
+                    _dc_reply, _dc_done = _setup_wizard.consume_doc_confirm(
+                        platform, sender_id, owner_text_peek,
+                    )
+                except Exception as exc:
+                    _safe_log(f"[doc_confirm] EXC: {exc}")
+                    _dc_reply, _dc_done = (
+                        f"文档确认出错 — {exc}。",
+                        True,
+                    )
+                _send_setup_wizard_reply(platform, sender_id, _chat_id_dc, _dc_reply)
+                return {"action": "skip", "reason": "paid_doc_confirm"}
+
             # v1.6.0: owner in wizard → capture next plain text as answer
             if (
                 owner_text_peek
@@ -2175,12 +2198,25 @@ def _handle_setup_command_in_pre_gateway(
     cmd = parts[0] if parts else ""
 
     if cmd == "/paid-setup":
-        # Two sub-forms: "/paid-setup cancel" or just "/paid-setup"
-        sub = (parts[1].strip().lower() if len(parts) > 1 else "")
-        if sub in ("cancel", "exit", "quit", "abort"):
+        sub = (parts[1].strip() if len(parts) > 1 else "")
+        sub_lower = sub.lower()
+        if sub_lower in ("cancel", "exit", "quit", "abort"):
             reply = _setup_wizard.cancel(platform, sender_id)
             _send_setup_wizard_reply(platform, sender_id, chat_id, reply)
             return {"action": "skip", "reason": "paid_setup_cancelled"}
+        # v1.6.1: "/paid-setup add-doc <url>"
+        if sub_lower.startswith("add-doc"):
+            url_part = sub[len("add-doc"):].strip()
+            if not url_part:
+                _send_setup_wizard_reply(
+                    platform, sender_id, chat_id,
+                    "用法：`/paid-setup add-doc <url>`\n"
+                    "例：`/paid-setup add-doc https://example.feishu.cn/docx/abc`",
+                )
+                return {"action": "skip", "reason": "paid_setup_add_doc_usage"}
+            reply = _setup_wizard.start_doc_ingest(platform, sender_id, url_part)
+            _send_setup_wizard_reply(platform, sender_id, chat_id, reply)
+            return {"action": "skip", "reason": "paid_setup_add_doc"}
         # Start wizard (first-time or edit mode)
         reply = _setup_wizard.start(platform, sender_id)
         _send_setup_wizard_reply(platform, sender_id, chat_id, reply)
