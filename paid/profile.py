@@ -279,6 +279,10 @@ def _profile_from_dict(data: dict[str, Any]) -> OwnerProfile:
             update_mode=str(prefs_data.get("update_mode", "confirm-each") or "confirm-each"),
         ),
         references=list(data.get("references", []) or []),
+        # v1.6.8: counterparty_overrides was declared in v1.6.4 but
+        # _profile_from_dict didn't reconstruct it, so the field was
+        # silently dropped on every save→load round-trip.
+        counterparty_overrides=list(data.get("counterparty_overrides", []) or []),
         observed=Observed(
             approval_rate=float(observed_data.get("approval_rate", 0.0) or 0.0),
             top_escalated_topics=list(observed_data.get("top_escalated_topics", []) or []),
