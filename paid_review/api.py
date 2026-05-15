@@ -215,6 +215,56 @@ def _handle_intake(
     if not state.lang:
         state.lang = detect_lang(seed or text or "")
 
+    # v1.6.15b: ingest-failure UX gate. If a link couldn't be fetched
+    # (anti-scrape wall / no backend / Lark download failed), don't
+    # silently run SCAN/QA on degraded input and emit "no opinion
+    # provided" noise (jelabs pilot day-1). Surface the failure and let
+    # the user decide: continue (they'll paste text / proceed with what
+    # we have) or /review cancel. Fires exactly once — tracked via
+    # last_event_kind == "ingest_failed".
+    if state.ingest_errors and state.last_event_kind != "ingest_failed":
+        state.last_event_kind = "ingest_failed"
+        save_state(state)
+        return ReviewReply(
+            text=_i18n_t(
+                "ingest_failed_gate", state.lang or "zh",
+                errors="\n".join(f"- {e}" for e in state.ingest_errors),
+            ),
+            stage="INTAKE",
+            event_kind="ingest_failed",
+        )
+    if state.last_event_kind == "ingest_failed":
+        decision = (text or "").strip().lower()
+        if decision in _INGEST_ABORT_TOKENS:
+            state.verdict = "FORCED_PARTIAL"
+            state.forced = True
+            state.forced_reason = "junior_cancelled_on_ingest_error"
+            state.closed_at = _now_iso()
+            transition(state, "CLOSED")
+            state.last_event_kind = "cancelled"
+            save_state(state)
+            return ReviewReply(
+                text=_i18n_t("ingest_failed_cancelled", state.lang or "zh"),
+                stage="CLOSED",
+                event_kind="cancelled",
+                closed=True,
+            )
+        if decision in _INGEST_CONTINUE_TOKENS:
+            # Consume the gate; fall through to normal subject flow.
+            state.last_event_kind = ""
+            save_state(state)
+        else:
+            return ReviewReply(
+                text=_i18n_t(
+                    "ingest_failed_clarify", state.lang or "zh",
+                    errors="\n".join(
+                        f"- {e}" for e in state.ingest_errors
+                    ),
+                ),
+                stage="INTAKE",
+                event_kind="ingest_failed",
+            )
+
     candidates = _build_subject_options(seed)
     if not candidates:
         candidates = [seed[:80] if seed else "(待补充)"]
@@ -256,6 +306,19 @@ def _handle_intake(
 
 _SUBJECT_AFFIRM_TOKENS = {"yes", "y", "ok", "okay", "对", "对的", "是", "是的", "正确",
                           "确认", "好的", "可以", "go", "start"}
+
+# v1.6.15b ingest-failure gate decisions. /review cancel is intercepted
+# upstream in __init__.py before it reaches here, but a bare cancel /
+# 取消 / 算了 typed at the gate must also abort.
+_INGEST_CONTINUE_TOKENS = {
+    "continue", "cont", "c", "yes", "y", "ok", "okay", "go", "proceed",
+    "start", "继续", "继续吧", "接着", "对", "是", "好的", "可以", "没关系",
+    "无所谓", "直接来", "照旧",
+}
+_INGEST_ABORT_TOKENS = {
+    "cancel", "/review cancel", "/r cancel", "no", "n", "stop", "abort",
+    "取消", "算了", "不用了", "退出", "结束",
+}
 
 
 def _handle_subject(

@@ -88,6 +88,21 @@ REPLIES: dict[str, dict[str, str]] = {
         "en": "\n\n_Other candidates: {alts}_",
         "ko": "\n\n_다른 후보: {alts}_",
     },
+    "ingest_failed_gate": {
+        "zh": "⚠️ 有链接/材料没抓取成功，我手上没拿到它的内容：\n{errors}\n\n这样直接 review 结论会不准。你想怎么办？\n• 回 `继续` — 用现有内容（或你接着把要点贴过来）继续\n• 回 `/review cancel` — 取消这次 review",
+        "en": "⚠️ I couldn't fetch some of the linked material — I don't have its content:\n{errors}\n\nReviewing without it would give an unreliable result. How do you want to proceed?\n• Reply `continue` — proceed with what we have (or paste the key text next)\n• Reply `/review cancel` — cancel this review",
+        "ko": "⚠️ 일부 링크/자료를 가져오지 못했어요 — 내용이 없습니다:\n{errors}\n\n이대로 review 하면 결과가 부정확해요. 어떻게 할까요?\n• `계속` — 현재 내용으로 진행 (또는 핵심 텍스트를 붙여넣기)\n• `/review cancel` — 이번 review 취소",
+    },
+    "ingest_failed_clarify": {
+        "zh": "没太懂～ 那个链接没抓到内容：\n{errors}\n\n回 `继续` 用现有内容往下走，或 `/review cancel` 取消。",
+        "en": "Didn't catch that. The link content is still missing:\n{errors}\n\nReply `continue` to proceed with what we have, or `/review cancel` to abort.",
+        "ko": "잘 못 알아들었어요. 링크 내용이 여전히 없어요:\n{errors}\n\n`계속` 으로 진행하거나 `/review cancel` 로 취소하세요.",
+    },
+    "ingest_failed_cancelled": {
+        "zh": "好的，已取消这次 review。需要的话把材料文字直接贴过来、或换个能打开的链接，再发 `/review`。",
+        "en": "OK, cancelled this review. Paste the material as text or share a fetchable link, then send `/review` again.",
+        "ko": "네, 이번 review 를 취소했어요. 자료를 텍스트로 붙여넣거나 열 수 있는 링크로 다시 `/review` 해주세요.",
+    },
     "subject_ask_reprompt": {
         "zh": "还在等你确认主题：**{top}**\n回 `yes` 开始，或直接把正确的主题打过来。",
         "en": "Still waiting on the subject: **{top}**\nReply `yes` to start, or send me the right subject.",
