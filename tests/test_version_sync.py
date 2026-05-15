@@ -81,6 +81,11 @@ def test_setuptools_dynamic_resolves_to_canonical() -> None:
     function setuptools.config.pyprojecttoml uses to expand dynamic attrs,
     so this exercises the real build resolution without a full ``build``.
     """
+    # Python 3.12 venvs no longer bundle setuptools by default (PEP 632).
+    # This test exercises the *build-time* resolver, so it only applies
+    # where setuptools exists; the import-path + pyproject-shape tests
+    # below still guard SSOT everywhere. Skip rather than fail on 3.12.
+    pytest.importorskip("setuptools")
     from setuptools.config.expand import read_attr
 
     resolved = read_attr("paid._version.__version__", root_dir=str(REPO_ROOT))
