@@ -56,6 +56,22 @@ ALLOWED_PROFILE_FIELDS: frozenset[str] = frozenset({
 })
 
 
+# v1.6.11 — list-typed profile fields. When an LLM proposes ``["pricing"]``
+# for one of these, the intent is "add pricing to whatever's already there",
+# NOT "replace the entire list with just pricing". Pre-v1.6.11 the apply
+# path setattr'd the proposed value verbatim, silently wiping any prior
+# items the owner had configured. The parser now merges proposed values
+# into the existing list (with order-preserving dedup) before the apply
+# step ever runs. Scalar fields (name, tone, language, daily_cost_cap_usd,
+# observed numbers) remain replace-on-apply.
+LIST_PROFILE_FIELDS: frozenset[str] = frozenset({
+    "voice.do_not_say",
+    "topics.always_direct",
+    "topics.always_escalate",
+    "topics.always_decline",
+})
+
+
 # ---------------------------------------------------------------------------
 # Nested dataclasses
 # ---------------------------------------------------------------------------
