@@ -33,6 +33,7 @@ _DEFAULTS: dict[str, Any] = {
     "llm_retry_backoffs_seconds": [0.5, 1.5, 4.0],
     "model_override": "",
     "update_mode": "confirm-each",
+    "media_enrichment_mode": "off",
 }
 
 
@@ -101,6 +102,18 @@ def model_override() -> str:
     """Optional model name override (empty string = use Hermes default)."""
     raw = load().get("model_override", "")
     return str(raw or "").strip()
+
+
+def media_enrichment_mode() -> str:
+    """OCR mode for non-review media enrichment.
+
+    Valid values: "off" (default), "tesseract", "pdftotext", "both".
+    Any unrecognised value returns "off" so a typo is always safe.
+    """
+    raw = str(load().get("media_enrichment_mode", "off") or "").strip().lower()
+    if raw in ("tesseract", "pdftotext", "both"):
+        return raw
+    return "off"
 
 
 def update_mode() -> str:
