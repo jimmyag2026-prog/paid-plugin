@@ -206,10 +206,21 @@ def test_review_only_group_lets_review_command_through(paid_tmp_iso, monkeypatch
     assert captured["called"][2].startswith("/review")
 
 
-def test_everyday_mode_drops_non_command_chatter(paid_tmp_iso, monkeypatch):
+def test_everyday_mode_non_command_chatter_falls_through(
+    paid_tmp_iso, monkeypatch
+):
+    """v1.6.17b: everyday/both mode now WIRES the Claude flow — a
+    non-command @-mention message must fall through (return None) to the
+    normal J2 cp pipeline, NOT be dropped with paid_group_mode_reserved.
+    (Pre-v1.6.17 jelabs day-1: owner set mode=both, cp's natural-language
+    question was silently dropped, bot looked dead in the group.)"""
     plugin = _fresh_plugin()
     _mock_owner(monkeypatch, plugin)
     _silence_outbound(monkeypatch, plugin)
+    monkeypatch.setattr(
+        plugin.safety, "detect_prompt_injection",
+        lambda t: (False, []),
+    )
 
     plugin.group_routing.save_group_config(plugin.group_routing.GroupConfig(
         group_key="feishu_oc_ev",
@@ -221,15 +232,46 @@ def test_everyday_mode_drops_non_command_chatter(paid_tmp_iso, monkeypatch):
     ))
 
     e = _make_event(
-        text="random message in the group",
+        text="请问团队开会时间是什么时候？",
         chat_id="oc_ev",
         chat_type="group",
         user_id="ou_evie",
     )
     rv = plugin.on_pre_gateway_dispatch(event=e)
-    assert rv == {
-        "action": "skip", "reason": "paid_group_mode_reserved_group_everyday",
-    }
+    # None → hermes proceeds → on_pre_llm_call cp-classify runs, exactly
+    # like a P2P DM. NOT a paid_group_mode_reserved skip.
+    assert rv is None
+
+
+def test_both_mode_non_command_chatter_falls_through(
+    paid_tmp_iso, monkeypatch
+):
+    """Same contract for mode=both (jelabs picked 'both')."""
+    plugin = _fresh_plugin()
+    _mock_owner(monkeypatch, plugin)
+    _silence_outbound(monkeypatch, plugin)
+    monkeypatch.setattr(
+        plugin.safety, "detect_prompt_injection",
+        lambda t: (False, []),
+    )
+
+    plugin.group_routing.save_group_config(plugin.group_routing.GroupConfig(
+        group_key="feishu_oc_both",
+        platform="feishu",
+        group_id="oc_both",
+        enabled=True,
+        mode="both",
+        owner_user_id="owner_lark",
+    ))
+
+    e = _make_event(
+        text="帮我看看这个想法靠不靠谱",
+        chat_id="oc_both",
+        chat_type="group",
+        user_id="ou_evie",
+    )
+    rv = plugin.on_pre_gateway_dispatch(event=e)
+    assert rv is None
 
 
 def test_everyday_mode_allows_paid_commands(paid_tmp_iso, monkeypatch):

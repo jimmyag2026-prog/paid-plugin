@@ -202,6 +202,14 @@ def _route_urls_in_text(
         url = m.group(0).rstrip(".,;)]>")
         handler = next((b for b in url_backends if b.can_handle_url(url)), None)
         if handler is None:
+            # No backend claims it (e.g. JS-only site no backend can read).
+            # Leave the URL in remaining_text + annotate so the reviewer
+            # SEES there was a link we couldn't read — never silently drop,
+            # otherwise four-pillar runs on empty input and emits garbage
+            # "no opinion provided" findings (v1.6.15: jelabs pilot day-1).
+            out_text = out_text.replace(
+                url, f"[未能读取此链接（无可用抓取后端）: {url}]"
+            )
             continue
         try:
             res = handler.ingest_url(url)
@@ -213,9 +221,20 @@ def _route_urls_in_text(
                 errors=[f"unhandled exception: {exc}"],
             )
         results.append(res)
-        # Strip the URL from the text — the backend's content replaces it
-        # in normalized.md. Keep a placeholder to preserve sentence shape.
-        out_text = out_text.replace(url, "")
+        # v1.6.15: only strip the URL when the backend actually produced
+        # content. If it errored with empty normalized (anti-scrape wall,
+        # missing dep, fetch failure), keep the URL + reason inline so the
+        # reviewer knows a link existed and why it's missing — instead of
+        # the pre-v1.6.15 behaviour where the URL vanished and the review
+        # silently ran on whatever text was left (often nothing).
+        produced_content = bool((res.normalized or "").strip())
+        if produced_content:
+            out_text = out_text.replace(url, "")
+        else:
+            reason = "; ".join(res.errors) if res.errors else "no content extracted"
+            out_text = out_text.replace(
+                url, f"[未能读取此链接（{reason}）: {url}]"
+            )
     return out_text, results
 
 

@@ -10,6 +10,9 @@ URL patterns supported (per v3 review-agent precedent):
   - Feishu CN:           https://*.feishu.cn/docx/<doc_id>
   - Wiki:                .../wiki/<wiki_token>
                          → chains via get_wiki_node to underlying docx
+  - Drive file (v1.6.18): .../file/<file_token>
+                         → download_file → re-route through PDF/image/text
+                           file backends by mime type
   - Bitable (later):     .../base/<base_token>   ← Tier 3, NOT in this backend
 """
 
@@ -37,12 +40,19 @@ _DOC_URL_RE = re.compile(
 _WIKI_URL_RE = re.compile(
     r"https?://[\w.-]+\.(?:feishu\.cn|larksuite\.com)/wiki/([A-Za-z0-9]+)"
 )
+# Drive file (网盘文件):  https://<host>/file/<file_token>
+# v1.6.18: jelabs pilot day-1 — cp shared a Drive file link; pre-v1.6.18
+# this matched no backend, the URL was silently dropped, and the review
+# ran on empty input.
+_FILE_URL_RE = re.compile(
+    r"https?://[\w.-]+\.(?:feishu\.cn|larksuite\.com)/file/([A-Za-z0-9]+)"
+)
 
 
 def extract_lark_resource(url: str) -> tuple[str, str] | None:
     """Returns (resource_type, resource_id) for a Lark URL, or None.
 
-    resource_type ∈ {"doc", "wiki"}.
+    resource_type ∈ {"doc", "wiki", "file"}.
     """
     if not isinstance(url, str):
         return None
@@ -52,6 +62,9 @@ def extract_lark_resource(url: str) -> tuple[str, str] | None:
     m = _WIKI_URL_RE.search(url)
     if m:
         return ("wiki", m.group(1))
+    m = _FILE_URL_RE.search(url)
+    if m:
+        return ("file", m.group(1))
     return None
 
 
@@ -91,6 +104,8 @@ class LarkDocBackend(IngestBackend):
             return self._ingest_doc(rid, url)
         if rtype == "wiki":
             return self._ingest_wiki(rid, url)
+        if rtype == "file":
+            return self._ingest_drive_file(rid, url)
         # Defensive: extract_lark_resource only returns known types.
         return BackendResult(
             normalized="",
@@ -184,3 +199,107 @@ class LarkDocBackend(IngestBackend):
             source=url,
             note=note,
         )
+
+    def _ingest_drive_file(self, file_token: str, url: str) -> BackendResult:
+        """Download a Drive 网盘文件 and re-route it through the file
+        backends (PDF / image-OCR / text) by mime type. v1.6.18.
+
+        Lark Drive files aren't text resources like docx — they're
+        arbitrary binaries (PDF, docx-as-file, png, ...). We download to
+        a temp path, then delegate to the same stateless file backends
+        the attachment path uses, so a shared PDF link behaves exactly
+        like an uploaded PDF attachment.
+        """
+        import os
+        import tempfile
+        from pathlib import Path
+
+        try:
+            content, fname, mime = self._lark.download_file(file_token)
+        except Exception as exc:
+            logger.warning(
+                "[lark_doc] download_file %s failed: %s", file_token, exc
+            )
+            return BackendResult(
+                normalized="",
+                backend=self.name,
+                source=url,
+                errors=[f"Lark Drive file download failed: {exc}"],
+            )
+
+        if not content:
+            return BackendResult(
+                normalized="",
+                backend=self.name,
+                source=url,
+                errors=[f"Lark Drive file {file_token} returned 0 bytes"],
+            )
+
+        suffix = Path(fname).suffix.lower()
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="lark_drive_", suffix=suffix or "", delete=False
+            ) as tf:
+                tf.write(content)
+                tmp_path = Path(tf.name)
+
+            # Lazy import to avoid a circular import at module load
+            # (ingest_backends/__init__ pulls these in).
+            from .image import ImageBackend
+            from .pdf import PdfBackend
+            from .text import TextBackend
+
+            file_backends = [PdfBackend(), ImageBackend(), TextBackend()]
+            handler = next(
+                (
+                    b
+                    for b in file_backends
+                    if b.can_handle_file(mime=mime, ext=suffix)
+                ),
+                None,
+            )
+            if handler is None:
+                return BackendResult(
+                    normalized=f"[Lark Drive 文件: {fname}]",
+                    backend=self.name,
+                    source=url,
+                    note=f"downloaded {len(content)} bytes; "
+                    f"no backend for mime={mime or '?'} ext={suffix or '?'}",
+                    errors=[
+                        f"Lark Drive file '{fname}' (mime={mime or '?'}) "
+                        "has no matching ingest backend; ask the sender to "
+                        "share it as a Lark Doc or paste the text."
+                    ],
+                )
+
+            try:
+                res = handler.ingest_file(tmp_path, mime=mime)
+            except Exception as exc:
+                return BackendResult(
+                    normalized="",
+                    backend=self.name,
+                    source=url,
+                    errors=[
+                        f"Lark Drive file '{fname}' "
+                        f"{handler.name} ingest failed: {exc}"
+                    ],
+                )
+
+            chain_note = f"Lark Drive '{fname}' → {handler.name}"
+            note = (
+                f"{chain_note}; {res.note}" if res.note else chain_note
+            )
+            return BackendResult(
+                normalized=res.normalized,
+                backend=self.name,
+                source=url,
+                note=note,
+                errors=res.errors,
+            )
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass

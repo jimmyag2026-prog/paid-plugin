@@ -14,6 +14,19 @@ into `~/.hermes/plugins/paid-v1/`.
   (https://github.com/NousResearch/hermes-agent)
 - An LLM provider configured in `~/.hermes/config.yaml`. PAID uses the
   same provider; no extra keys needed.
+- **Review-skill ingest dependencies** — install these into the hermes
+  venv or `/review` silently degrades to empty input for any URL/PDF/
+  image (jelabs pilot day-1 root cause). Run after step 1:
+
+  ```bash
+  # into the same venv hermes-gateway runs from
+  pip install beautifulsoup4 readability-lxml lxml httpx
+  # optional but recommended (PDF text + image OCR):
+  #   poppler-utils (pdftotext)  +  tesseract-ocr  +  pytesseract pillow
+  ```
+
+  Verify with `python -m scripts.doctor` — the `ingest dep …` checks
+  must all be `[OK]` before onboarding a pilot.
 
 ---
 

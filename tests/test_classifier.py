@@ -246,3 +246,64 @@ def test_fallback_rate_window_caps_at_100(monkeypatch):
     assert ratio == 1.0
 
     classifier.reset_classifier_history()
+
+
+# ---------------------------------------------------------------------------
+# v1.6.14 — internal people-management carve-out (jelabs pilot day-1)
+# ---------------------------------------------------------------------------
+
+
+def test_v1614_carveout_guidance_is_in_prompt():
+    """Contract guard: the classifier prompt MUST carry the internal
+    people-management carve-out. jelabs day-1 — cp asked "我想问问周三
+    是否可以wfh？", classifier tagged logistics→direct→answered, but the
+    owner only delegated external logistics, not authority over their
+    own team's WFH. The fix is prompt-level; pin it so it can't silently
+    regress (same philosophy as the v1.6.10 call_llm contract test)."""
+    canned = {
+        "topic": "logistics", "stakes": "low", "in_scope": False,
+        "is_blacklisted": True, "confidence": 0.9, "needs_retrieval": False,
+        "suggested_queries": [], "draft_answer": "", "reasoning": "internal",
+    }
+    with mock.patch.object(
+        classifier.hermes_io, "call_llm", return_value=json.dumps(canned)
+    ) as call_mock:
+        classifier.classify(
+            user_message="我想问问周三是否可以wfh？",
+            counterparty=FakeCP(),
+            owner_name="XiaEvie",
+            sop_excerpt="(no WFH policy in SOP)",
+        )
+    args, kwargs = call_mock.call_args
+    sent_prompt = kwargs.get("prompt") or args[0]
+    low = sent_prompt.lower()
+    assert "internal people-management carve-out" in low
+    # The specific employee-management cases must be enumerated.
+    assert "wfh" in low
+    assert "leave" in low and "compensation" in low
+    # And it must instruct in_scope=false + is_blacklisted=true for these.
+    assert "in_scope=false and is_blacklisted=true" in low
+
+
+def test_v1614_carveout_lets_llm_escalate_internal_wfh():
+    """With the carve-out, the LLM is expected to return
+    in_scope=false/is_blacklisted=true for an internal WFH ask. We mock
+    that compliant response and assert the Classification carries it
+    through (so the decision module will escalate, not auto-answer)."""
+    canned = {
+        "topic": "logistics", "stakes": "high", "in_scope": False,
+        "is_blacklisted": True, "confidence": 0.92, "needs_retrieval": False,
+        "suggested_queries": [], "draft_answer": "",
+        "reasoning": "internal people-management — owner decision",
+    }
+    with mock.patch.object(
+        classifier.hermes_io, "call_llm", return_value=json.dumps(canned)
+    ):
+        result = classifier.classify(
+            user_message="周三能不能在家办公？",
+            counterparty=FakeCP(),
+            owner_name="XiaEvie",
+            sop_excerpt="(no WFH policy)",
+        )
+    assert result.in_scope is False
+    assert result.is_blacklisted is True
