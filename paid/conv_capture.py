@@ -180,21 +180,42 @@ def extract_from_message(
 # ---------------------------------------------------------------------------
 # Pending confirm state — lightweight, no threading needed
 # (pre_llm_call is sequential within a single request; state is short-lived)
+# v1.6.6: TTL prune added so an owner who never replies doesn't leak the
+# entry forever (mirrors setup_wizard's _WIZARD_STATE TTL behaviour).
 # ---------------------------------------------------------------------------
 
-# Keyed by (platform, owner_id) → list[UpdateProposal]
-_PENDING: dict[tuple[str, str], list] = {}
+_PENDING_TTL_SEC = 60 * 60  # 1 hour — owner has this long to reply
+
+# Keyed by (platform, owner_id) → (proposals, stored_at_unix_ts)
+_PENDING: dict[tuple[str, str], tuple[list, float]] = {}
+
+
+def _prune_expired_pending() -> None:
+    """Drop entries older than _PENDING_TTL_SEC. Uses time.time() (Unix epoch)
+    to stay consistent with setup_wizard's TTL clock — see v1.6.1 incident
+    where monotonic/time mixing prune-killed states on every read."""
+    cutoff = time.time() - _PENDING_TTL_SEC
+    stale = [k for k, (_, ts) in _PENDING.items() if ts < cutoff]
+    for k in stale:
+        _PENDING.pop(k, None)
 
 
 def store_pending(platform: str, owner_id: str, proposals: list) -> None:
-    _PENDING[(platform, owner_id)] = proposals
+    _prune_expired_pending()
+    _PENDING[(platform, owner_id)] = (proposals, time.time())
 
 
 def pop_pending(platform: str, owner_id: str) -> list:
-    return _PENDING.pop((platform, owner_id), [])
+    _prune_expired_pending()
+    entry = _PENDING.pop((platform, owner_id), None)
+    if entry is None:
+        return []
+    proposals, _ts = entry
+    return proposals
 
 
 def has_pending(platform: str, owner_id: str) -> bool:
+    _prune_expired_pending()
     return (platform, owner_id) in _PENDING
 
 

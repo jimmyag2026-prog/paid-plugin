@@ -24,20 +24,21 @@ def isolated_storage(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# fetch_content — file:// backend
+# fetch_content — file:// rejected (v1.6.6 security fix)
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_content_file_ok(tmp_path):
+def test_fetch_content_file_rejected(tmp_path):
+    """v1.6.6: file:// must be rejected to keep local file contents out of
+    LLM context. The CLI import flow is the only sanctioned local path."""
     f = tmp_path / "test.txt"
     f.write_text("hello profile")
-    kind, text = di.fetch_content(f"file://{f}")
-    assert kind == "file"
-    assert "hello profile" in text
+    with pytest.raises(ValueError, match="not supported"):
+        di.fetch_content(f"file://{f}")
 
 
-def test_fetch_content_file_missing(tmp_path):
-    with pytest.raises(ValueError, match="Cannot read"):
+def test_fetch_content_file_missing_also_rejected(tmp_path):
+    with pytest.raises(ValueError, match="not supported"):
         di.fetch_content(f"file://{tmp_path}/nonexistent.txt")
 
 
@@ -47,21 +48,33 @@ def test_fetch_content_unsupported_scheme():
 
 
 # ---------------------------------------------------------------------------
-# fetch_content — web backend (mocked)
+# fetch_content — web backend (mocked, with v1.6.6 SSRF guard bypassed)
 # ---------------------------------------------------------------------------
 
 
+def _bypass_ssrf_check(monkeypatch):
+    """Make _assert_safe_url a no-op for unit tests that mock httpx."""
+    monkeypatch.setattr(di, "_assert_safe_url", lambda _u: None)
+
+
 def test_fetch_content_web_ok(monkeypatch):
+    """v1.6.6: web fetch now uses httpx.Client (manual redirects).
+    Mock the Client.get to return a fake response."""
+    _bypass_ssrf_check(monkeypatch)
+
     class FakeResp:
         text = "<html><body><p>Owner is a founder.</p></body></html>"
+        is_redirect = False
         def raise_for_status(self): pass
 
-    def fake_get(url, **kw):
-        return FakeResp()
+    class FakeClient:
+        def __init__(self, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, url): return FakeResp()
 
-    monkeypatch.setattr(di, "__name__", "paid.doc_ingest")
     import httpx
-    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(httpx, "Client", FakeClient)
 
     kind, text = di.fetch_content("https://example.com/about")
     assert kind == "web"
@@ -69,13 +82,88 @@ def test_fetch_content_web_ok(monkeypatch):
 
 
 def test_fetch_content_web_error(monkeypatch):
+    _bypass_ssrf_check(monkeypatch)
     import httpx
-    def fail_get(url, **kw):
-        raise httpx.HTTPError("connect failed")
 
-    monkeypatch.setattr(httpx, "get", fail_get)
+    class FailingClient:
+        def __init__(self, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, url): raise httpx.HTTPError("connect failed")
+
+    monkeypatch.setattr(httpx, "Client", FailingClient)
     with pytest.raises(ValueError, match="Failed to fetch"):
         di.fetch_content("https://example.com/doc")
+
+
+# ---------------------------------------------------------------------------
+# v1.6.6: SSRF guard
+# ---------------------------------------------------------------------------
+
+
+def test_ssrf_blocks_localhost():
+    with pytest.raises(ValueError, match="private/internal IP"):
+        di._assert_safe_url("http://localhost/foo")
+
+
+def test_ssrf_blocks_loopback_literal():
+    with pytest.raises(ValueError, match="private/internal IP"):
+        di._assert_safe_url("http://127.0.0.1/foo")
+
+
+def test_ssrf_blocks_aws_metadata():
+    """169.254.169.254 is link-local — AWS / GCP metadata endpoint."""
+    with pytest.raises(ValueError, match="private/internal IP"):
+        di._assert_safe_url("http://169.254.169.254/latest/meta-data/")
+
+
+def test_ssrf_blocks_rfc1918():
+    with pytest.raises(ValueError, match="private/internal IP"):
+        di._assert_safe_url("http://10.0.0.5/api")
+    with pytest.raises(ValueError, match="private/internal IP"):
+        di._assert_safe_url("http://192.168.1.1/")
+
+
+def test_ssrf_rejects_non_http_scheme():
+    with pytest.raises(ValueError, match="Unsafe URL scheme"):
+        di._assert_safe_url("gopher://1.2.3.4/")
+
+
+def test_ssrf_rejects_redirect_to_internal(monkeypatch):
+    """Redirect target gets re-validated, not just the initial URL."""
+    _checked: list[str] = []
+
+    def fake_check(url):
+        _checked.append(url)
+        if "169.254" in url:
+            raise ValueError("Unsafe URL — host resolves to private/internal IP")
+
+    monkeypatch.setattr(di, "_assert_safe_url", fake_check)
+    import httpx
+
+    class RedirectResp:
+        is_redirect = True
+        headers = {"location": "http://169.254.169.254/latest/meta-data/"}
+        def raise_for_status(self): pass
+
+    class RedirectClient:
+        def __init__(self, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, url): return RedirectResp()
+
+    monkeypatch.setattr(httpx, "Client", RedirectClient)
+    with pytest.raises(ValueError, match="private/internal IP"):
+        di.fetch_content("https://example.com/redirect")
+    # both the initial URL AND the redirect target were checked
+    assert any("example.com" in u for u in _checked)
+    assert any("169.254" in u for u in _checked)
+
+
+def test_ssrf_allows_public_ip(monkeypatch):
+    """A real public DNS name should pass the IP check."""
+    # 1.1.1.1 (Cloudflare DNS) is unambiguously public
+    di._assert_safe_url("http://1.1.1.1/")
 
 
 # ---------------------------------------------------------------------------
