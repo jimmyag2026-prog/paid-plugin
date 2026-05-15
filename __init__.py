@@ -974,6 +974,25 @@ def on_pre_llm_call(**kwargs) -> dict | None:
             lang=lang,
         )
 
+        # v1.6.5: prepend OCR-extracted media text if available and hermes
+        # hasn't already described the image (hermes vision adds "[Image:").
+        if platform and sender_id:
+            try:
+                from paid import media_enrichment as _me
+                _enriched = _me.pop_enriched_text(platform, sender_id)
+                if _enriched and "[Image:" not in (user_message or "")[:120]:
+                    context = (
+                        f"[Extracted text from CP-sent media via OCR]\n"
+                        f"{_enriched}\n"
+                        f"[End of extracted media text]\n\n"
+                        f"{context}"
+                    )
+                    _safe_log(
+                        f"[media_enrich] injected {len(_enriched)}ch for cp={cp.cp_id}"
+                    )
+            except Exception as _me_exc:
+                _safe_log(f"[media_enrich] inject EXC: {_me_exc}")
+
         audit.log_action(
             session_id=session_id,
             counterparty=cp,
@@ -1276,6 +1295,34 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
                 # Do NOT return skip — let hermes continue its routing.
                 # The buffer is a passive memo; hermes can still vision-
                 # analyze the image normally if cp never /reviews.
+
+        # v1.6.5: non-review media enrichment — run OCR/pdftotext on CP
+        # media that is NOT bound to a /review session, so the extracted
+        # text can be injected into the LLM context in on_pre_llm_call.
+        # Skip owner messages (they go through hermes' own vision flow).
+        if _has_media and platform and sender_id and not _is_owner_now:
+            _is_review_media = (
+                _event_text_for_media.startswith("/review")
+                or _event_text_for_media.startswith("/r ")
+                or _event_text_for_media in ("/r", "/review")
+            )
+            if not _is_review_media:
+                try:
+                    from paid import media_enrichment as _me
+                    from paid import settings as _settings
+                    _enrich_mode = _settings.media_enrichment_mode()
+                    if _enrich_mode != "off":
+                        _me.enrich_media_for_cp(
+                            platform, sender_id,
+                            _event_media_urls, _event_media_types, _enrich_mode,
+                        )
+                        _safe_log(
+                            f"[media_enrich] mode={_enrich_mode} "
+                            f"cp={platform}:{sender_id[:8]} "
+                            f"files={len(_event_media_urls)}"
+                        )
+                except Exception as _me_exc:
+                    _safe_log(f"[media_enrich] EXC: {_me_exc}")
 
         # v1.5 Phase 6: group routing gate. By default group chats are
         # NOT enabled — owner must opt in per group via /paid-enable-group
