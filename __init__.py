@@ -51,6 +51,7 @@ from paid import (
     storage,
 )
 from paid import setup_wizard as _setup_wizard
+from paid import conv_capture as _conv_capture
 
 
 # ---------------------------------------------------------------------------
@@ -1433,6 +1434,55 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
                     "action": "skip",
                     "reason": ("paid_setup_done" if _wiz_done else "paid_setup_step"),
                 }
+            # v1.6.2: conversation capture confirm reply
+            if (
+                owner_text_peek
+                and not owner_text_peek.startswith("/")
+                and _conv_capture.has_pending(platform, sender_id)
+            ):
+                _chat_id_cc = ""
+                if source is not None:
+                    _cid_cc = getattr(source, "chat_id", None)
+                    _chat_id_cc = str(_cid_cc) if _cid_cc else ""
+                try:
+                    _cc_reply = _conv_capture.apply_confirmed(
+                        platform, sender_id, owner_text_peek,
+                    )
+                except Exception as exc:
+                    _safe_log(f"[conv_capture] apply EXC: {exc}")
+                    _cc_reply = f"Profile 更新确认出错 — {exc}。"
+                _send_setup_wizard_reply(platform, sender_id, _chat_id_cc, _cc_reply)
+                return {"action": "skip", "reason": "paid_conv_capture_confirm"}
+
+            # v1.6.2: detect profile-update signals in owner chat (side-effect)
+            # Message still passes through to Claude; this fires asynchronously.
+            if owner_text_peek and not owner_text_peek.startswith("/"):
+                try:
+                    _prof_for_cc = None
+                    try:
+                        from paid import profile as _profile_mod
+                        _prof_for_cc = _profile_mod.load_profile()
+                    except Exception:
+                        pass
+                    if _prof_for_cc is not None:
+                        _cc_proposals = _conv_capture.extract_from_message(
+                            owner_text_peek, _prof_for_cc, platform, sender_id,
+                        )
+                        if _cc_proposals:
+                            _conv_capture.store_pending(platform, sender_id, _cc_proposals)
+                            _cc_prompt = _conv_capture.format_confirm(
+                                _cc_proposals,
+                            )
+                            _chat_id_ccp = ""
+                            if source is not None:
+                                _cid_ccp = getattr(source, "chat_id", None)
+                                _chat_id_ccp = str(_cid_ccp) if _cid_ccp else ""
+                            _send_setup_wizard_reply(
+                                platform, sender_id, _chat_id_ccp, _cc_prompt,
+                            )
+                except Exception as exc:
+                    _safe_log(f"[conv_capture] detect EXC: {exc}")
+
             # Owner-side messages normally pass through to hermes / Claude.
             # BUT: if the owner clicked ✅ / ✏️ on a card and we armed
             # awaiting_input, the next plain-text reply in the same chat
