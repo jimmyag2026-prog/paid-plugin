@@ -1127,9 +1127,16 @@ def on_post_llm_call(**kwargs) -> None:
             except Exception as exc:
                 _safe_log(f"[L4-LEAK] incident counter EXC: {exc}")
 
+        # v1.6.7: pass cp identification so audit.log_action routes the row
+        # to counterparties/<cp_id>/audit.jsonl instead of legacy audit_log.jsonl.
+        # cp_id was already resolved above (line ~1065-1070).
+        cp_for_audit = (
+            {"cp_id": cp_id, "platform": platform}
+            if cp_id else None
+        )
         audit.log_action(
             session_id=session_id,
-            counterparty=None,
+            counterparty=cp_for_audit,
             junior_msg="",
             classification=None,
             action=None,
