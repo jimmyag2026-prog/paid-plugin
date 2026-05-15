@@ -1,3 +1,5 @@
 """PAID v1 — Personal AI Delegate (Hermes plugin core)."""
 
-__version__ = "0.1.0"
+from paid._version import __version__
+
+__all__ = ["__version__"]
