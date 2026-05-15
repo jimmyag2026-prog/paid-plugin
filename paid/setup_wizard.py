@@ -437,34 +437,48 @@ def _consume_edit(state: WizardState, answer: str) -> tuple[str, bool]:
 
 
 def _finalize_first_time(state: WizardState) -> tuple[str, bool]:
-    voice_preset = state.answers.get("voice_preset", "founder")
-    prof = _profile.new_profile(
-        owner_id=state.owner_id,
-        name=state.answers.get("name", "") or "",
-        voice_preset=voice_preset,
-        preferred_language=state.answers.get("preferred_language", "auto"),
-    )
+    """Apply the 5 wizard answers and persist.
 
-    # always_escalate
-    escalate = state.answers.get("always_escalate")
-    if escalate == "_default_":
-        # keep dataclass default (already 5 items)
-        pass
-    elif isinstance(escalate, list) and escalate:
-        prof.topics.always_escalate = escalate
-
-    # daily cost cap
-    cost = state.answers.get("daily_cost_cap_usd")
-    if isinstance(cost, (int, float)):
-        prof.preferences.daily_cost_cap_usd = float(cost)
-    elif cost == "_inf_":
-        prof.preferences.daily_cost_cap_usd = 99999.0  # effectively no cap
-
-    # Seed owner identity from wizard caller — caller passes platform; we
-    # don't have user_id here without an additional event. Skip identities
-    # at wizard time; owner adds them via `paid setup` CLI or hand-edits.
-    # (TODO v1.6.x: have wizard auto-add the platform+sender_id of the
-    # wizard invocation event as the first identity.)
+    v1.6.8: if an existing profile is loaded (e.g. after migration from v1.5
+    or from a prior wizard run), apply answers as a PARTIAL update — never
+    overwrite fields the wizard didn't ask about (e.g. topics.always_decline
+    extracted from sop.md by the migration LLM). Prior to v1.6.8 we always
+    built a fresh ``new_profile`` here, which silently wiped any field outside
+    the 5-question scope.
+    """
+    existing = _profile.load_profile()
+    if existing is not None:
+        prof = existing
+        # Apply only the answers explicitly given. Each branch is the SAME
+        # logic as the edit-mode _apply_answer, so wizard first-time vs edit
+        # stay symmetric.
+        if "name" in state.answers:
+            _apply_answer(prof, "name", state.answers["name"])
+        if "voice_preset" in state.answers:
+            _apply_answer(prof, "voice_preset", state.answers["voice_preset"])
+        if "always_escalate" in state.answers:
+            _apply_answer(prof, "always_escalate", state.answers["always_escalate"])
+        if "preferred_language" in state.answers:
+            _apply_answer(prof, "preferred_language", state.answers["preferred_language"])
+        if "daily_cost_cap_usd" in state.answers:
+            _apply_answer(prof, "daily_cost_cap_usd", state.answers["daily_cost_cap_usd"])
+    else:
+        # Truly first-time: no existing profile at all. Build fresh.
+        voice_preset = state.answers.get("voice_preset", "founder")
+        prof = _profile.new_profile(
+            owner_id=state.owner_id,
+            name=state.answers.get("name", "") or "",
+            voice_preset=voice_preset,
+            preferred_language=state.answers.get("preferred_language", "auto"),
+        )
+        escalate = state.answers.get("always_escalate")
+        if isinstance(escalate, list) and escalate:
+            prof.topics.always_escalate = escalate
+        cost = state.answers.get("daily_cost_cap_usd")
+        if isinstance(cost, (int, float)):
+            prof.preferences.daily_cost_cap_usd = float(cost)
+        elif cost == "_inf_":
+            prof.preferences.daily_cost_cap_usd = 99999.0
 
     _profile.save_profile(prof)
     audit = _profile_sync.derive_from_profile(prof)

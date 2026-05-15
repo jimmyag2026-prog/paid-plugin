@@ -350,11 +350,16 @@ def test_l4c_handles_malformed_json(paid_tmp, monkeypatch):
 
 
 def test_check_output_includes_unsourced_when_l4d_on(paid_tmp):
+    """v1.6.8: L4d (unsourced claims) is INFORMATIONAL only — it surfaces
+    in the result dict but does NOT flip ``ok`` to False. Before v1.6.8 a
+    bare summary of user-provided content (e.g. ``DAU jumped to 12,500``)
+    triggered a corrective DM and a fatal alert. Only L4a (name leakage),
+    L4b (PII), and L4c (LLM judge) gate the ``ok`` flag."""
     _seed_cp(paid_tmp, "telegram_111", "Alice")
     res = safety.check_output(
         "DAU jumped to 12,500 last week.", "telegram_111"
     )
-    assert res["ok"] is False
+    assert res["ok"] is True  # L4d alone no longer flips ok
     assert "unsourced_claims" in res
     assert any("12,500" in c for c in res["unsourced_claims"])
 

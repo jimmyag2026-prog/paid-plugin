@@ -585,9 +585,16 @@ def check_output(
     bad = bool(name_hit or pii_hit)
 
     if run_l4d:
-        unsourced_hit, unsourced = detect_unsourced_claims(response)
+        # v1.6.8: L4d (unsourced-claims detector) is INFORMATIONAL only.
+        # Before this fix, L4d set bad=True, which made check_output return
+        # ok=False with only ``unsourced_claims`` populated — callers that
+        # only log ``name_leakage`` + ``pii`` saw "empty leak" alerts, and
+        # cp received corrective "disregard previous reply" DMs on benign
+        # summaries of user-provided documents. L4d still surfaces its
+        # findings in the returned dict for observability; only L4a/L4b/L4c
+        # gate the ok flag.
+        _unsourced_hit, unsourced = detect_unsourced_claims(response)
         out["unsourced_claims"] = unsourced
-        bad = bad or unsourced_hit
 
     # L4c only runs when explicitly requested or enabled in settings.
     run_l4c_resolved = (

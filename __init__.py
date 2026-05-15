@@ -1083,6 +1083,12 @@ def on_post_llm_call(**kwargs) -> None:
                         "platform": platform,
                         "name_leakage": l4["name_leakage"],
                         "pii": l4["pii"],
+                        # v1.6.8: include the rest of L4 detail so silent
+                        # empty-leak alerts (like the v1.6.7 L4d false-positive)
+                        # can be diagnosed instead of leaving the operator
+                        # guessing which detector fired.
+                        "unsourced_claims": l4.get("unsourced_claims", []),
+                        "llm_concerns": l4.get("llm_concerns", []),
                         "response_preview": response[:500],
                     },
                     ensure_ascii=False,
@@ -1146,6 +1152,10 @@ def on_post_llm_call(**kwargs) -> None:
                 "l4_ok": l4["ok"],
                 "l4_name_leakage": l4["name_leakage"],
                 "l4_pii": l4["pii"],
+                # v1.6.8: surface L4d/L4c in audit so empty-leak rows
+                # are diagnosable.
+                "l4_unsourced_claims": l4.get("unsourced_claims", []),
+                "l4_llm_concerns": l4.get("llm_concerns", []),
             },
         )
     except Exception as exc:
