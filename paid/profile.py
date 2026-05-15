@@ -159,6 +159,16 @@ class OwnerProfile:
 
     observed: Observed = field(default_factory=Observed)
 
+    counterparty_overrides: list[dict] = field(default_factory=list)
+    """Per-cp voice and SOP overrides (v1.6.4). Each entry:
+    {
+      "cp_id": "...",
+      "voice_overrides": {"tone": "...", "do_not_say": [...]},  // optional
+      "sop_overrides": {"always_direct": [...], "always_escalate": [...]}  // optional
+    }
+    Applied on top of global voice/topics when handling that cp's messages.
+    """
+
     schema_version: int = PROFILE_SCHEMA_VERSION
     created_at: str = ""
     updated_at: str = ""

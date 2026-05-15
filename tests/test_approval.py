@@ -31,7 +31,8 @@ def test_create_returns_record_with_id_and_timestamp(paid_tmp):
     assert req.request_id and len(req.request_id) == 8
     assert req.status == "pending"
     assert req.ts_created > 0
-    assert (paid_tmp / "pending_approvals.jsonl").exists()
+    # v1.6.4: written to per-cp dir
+    assert (paid_tmp / "counterparties" / "telegram_111" / "pending.jsonl").exists()
 
 
 def test_list_pending_returns_oldest_first(paid_tmp):
@@ -82,7 +83,9 @@ def test_event_log_is_append_only_audit_trail(paid_tmp):
     approval.set_status(req.request_id, "approved", final_text="X")
     approval.set_status(req.request_id, "rejected", final_text="Y")  # idempotent re-set
 
-    lines = (paid_tmp / "pending_approvals.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    # v1.6.4: written to per-cp dir
+    per_cp_log = paid_tmp / "counterparties" / "telegram_111" / "pending.jsonl"
+    lines = per_cp_log.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 3  # 1 create + 2 status
     types = [json.loads(l)["type"] for l in lines]
     assert types == ["create", "status", "status"]

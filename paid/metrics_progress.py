@@ -31,21 +31,9 @@ _DEEP_CHATS_TARGET = 5
 
 
 def _read_audit_log() -> list[dict[str, Any]]:
-    p = storage.PAID_DIR / "audit_log.jsonl"
-    if not p.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    try:
-        for line in p.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                continue
-    except Exception:
-        return []
-    return rows
+    # v1.6.4: merged read (per-cp + legacy)
+    from . import audit as _audit
+    return _audit.read_all_entries()
 
 
 def _indicator_1_pilot_cycle() -> dict[str, Any]:

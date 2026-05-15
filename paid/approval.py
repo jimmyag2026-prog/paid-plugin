@@ -1,20 +1,18 @@
 """Module Ap — approval lifecycle (J3, v0.5 simplified).
 
-Append-only event log at ``~/.hermes/paid/pending_approvals.jsonl``.
-Each line is one event:
+v1.6.4: per-cp physical isolation.
+Write path: counterparties/<cp_id>/pending.jsonl (per-cp)
+Read path:  all per-cp files + legacy pending_approvals.jsonl (grace period)
 
+Legacy path (pending_approvals.jsonl) is read for backward-compat but
+no longer written after v1.6.4. Migration script consolidates history.
+
+Each line is one event:
   - ``{"type":"create",  "request_id":..., "ts":..., ...payload...}``
   - ``{"type":"status",  "request_id":..., "ts":..., "status":"approved"|"rejected", "final_text":...}``
 
 State of a request = latest status event for its ``request_id``; if no status
 event has been written, it is ``pending``.
-
-v0.5 deliberately drops:
-  - ``modify`` button (only approve / reject)
-  - 5-min reminder + 30-min timeout (no background worker today)
-  - card-msg-id reverse lookup (no card surface yet — owner uses slash commands)
-
-See ``design/01_review_decisions.md §2.1`` for the W2 expansion.
 """
 
 from __future__ import annotations
@@ -31,16 +29,18 @@ Status = Literal["pending", "approved", "rejected", "timed_out"]
 
 
 def _pending_log() -> Path:
-    """Path to the append-only event log.
-
-    Resolved on each call so tests can monkeypatch ``storage.PAID_DIR``.
-    """
+    """Legacy single-file path (kept for grace-period reads; not written v1.6.4+)."""
     return storage.PAID_DIR / "pending_approvals.jsonl"
 
 
-# Back-compat: legacy module attr that callers may import directly. We keep
-# it as a lazy property-ish via a custom getattr below so it always reflects
-# the current ``storage.PAID_DIR``.
+def _cp_pending_path(cp_id: str) -> Path:
+    """Per-cp pending file path (v1.6.4 write target)."""
+    import re
+    safe = re.sub(r"[^A-Za-z0-9_\-@.]", "_", str(cp_id)) or "unknown"
+    return storage.PAID_DIR / "counterparties" / safe / "pending.jsonl"
+
+
+# Back-compat: legacy module attr that callers may import directly.
 def __getattr__(name: str):  # pragma: no cover — trivial proxy
     if name == "PENDING_LOG":
         return _pending_log()
@@ -102,8 +102,14 @@ def create(
         stakes=stakes,
         confidence=confidence,
     )
+    # v1.6.4: write to per-cp file
+    dest = (
+        _cp_pending_path(req.counterparty_id)
+        if req.counterparty_id
+        else _pending_log()
+    )
     storage.append_jsonl(
-        _pending_log(),
+        dest,
         {
             "type": "create",
             "request_id": req.request_id,
@@ -158,23 +164,40 @@ def _replay(events: Iterable[dict]) -> dict[str, PendingApproval]:
     return state
 
 
-def _read_all() -> list[dict]:
-    """Read the full event log (returns [] if missing)."""
-    log = _pending_log()
-    if not log.exists():
+def _read_jsonl_safe(path: Path) -> list[dict]:
+    """Read JSON-lines from path safely, return [] on any error."""
+    if not path.exists():
         return []
     out: list[dict] = []
-    import json as _json  # local import keeps storage's mockability
-    with log.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(_json.loads(line))
-            except _json.JSONDecodeError:
-                continue
+    import json as _json
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = _json.loads(line)
+                    if isinstance(obj, dict):
+                        out.append(obj)
+                except _json.JSONDecodeError:
+                    pass
+    except OSError:
+        pass
     return out
+
+
+def _read_all() -> list[dict]:
+    """Read all pending events: per-cp files + legacy (v1.6.4 grace period)."""
+    rows: list[dict] = []
+    # Legacy file (grace period — read but not written post-v1.6.4)
+    rows.extend(_read_jsonl_safe(_pending_log()))
+    # Per-cp files
+    cp_dir = storage.PAID_DIR / "counterparties"
+    if cp_dir.exists():
+        for pending_file in cp_dir.glob("*/pending.jsonl"):
+            rows.extend(_read_jsonl_safe(pending_file))
+    return rows
 
 
 def list_pending() -> list[PendingApproval]:
@@ -205,8 +228,14 @@ def set_status(
     cur = get(request_id)
     if cur is None:
         return None
+    # v1.6.4: write status event to the same file as the create event
+    dest = (
+        _cp_pending_path(cur.counterparty_id)
+        if cur.counterparty_id
+        else _pending_log()
+    )
     storage.append_jsonl(
-        _pending_log(),
+        dest,
         {
             "type": "status",
             "request_id": request_id,

@@ -54,13 +54,15 @@ def scan_audit_log(
     intermediate data for digest generation.
     """
     if audit_path is None:
-        audit_path = storage.PAID_DIR / "audit_log.jsonl"
-
-    if not audit_path.exists():
-        return _empty_stats()
-
-    cutoff = _cutoff_ts(lookback_days)
-    entries = _read_entries(audit_path, cutoff)
+        # v1.6.4: use merged read (per-cp + legacy)
+        from . import audit as _audit
+        entries = _audit.read_all_entries(lookback_days=lookback_days)
+    else:
+        # Direct path specified (tests / CLI pass-through)
+        if not audit_path.exists():
+            return _empty_stats()
+        cutoff = _cutoff_ts(lookback_days)
+        entries = _read_entries(audit_path, cutoff)
 
     if not entries:
         return _empty_stats()

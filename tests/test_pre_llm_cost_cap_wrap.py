@@ -124,9 +124,10 @@ def test_pre_llm_audit_row_written_with_blocked_by(paid_tmp, monkeypatch):
         user_message="test", session_id="sess_audit",
     )
 
-    audit_path = paid_tmp / "audit_log.jsonl"
-    assert audit_path.exists()
-    rows = [json.loads(l) for l in audit_path.read_text().splitlines() if l.strip()]
+    # v1.6.4: read via merged helper (per-cp + legacy)
+    from paid import audit as _audit
+    rows = _audit.read_all_entries()
+    assert rows, "Expected at least one audit row"
     cap_rows = [r for r in rows if (r.get("extra") or {}).get("blocked_by") == "cost_cap_exceeded"]
     assert len(cap_rows) == 1
     extra = cap_rows[0]["extra"]
