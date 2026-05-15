@@ -54,9 +54,10 @@ def test_log_action_with_full_payload(paid_tmp: Path):
         act,
         extra={"context_injected": "Persona:..."},
     )
-    log_path = paid_tmp / "audit_log.jsonl"
-    assert log_path.exists()
-    rows = _read_lines(log_path)
+    # v1.6.4: written to per-cp dir, not legacy audit_log.jsonl
+    cp_audit = paid_tmp / "counterparties" / "telegram_6914282833" / "audit.jsonl"
+    assert cp_audit.exists()
+    rows = _read_lines(cp_audit)
     assert len(rows) == 1
     row = rows[0]
     assert row["session_id"] == "sess-1"
@@ -67,6 +68,11 @@ def test_log_action_with_full_payload(paid_tmp: Path):
     assert row["action"]["state"] == "direct"
     assert row["extra"] == {"context_injected": "Persona:..."}
     assert "T" in row["ts"]  # ISO 8601
+
+    # read_all_entries also finds it
+    all_rows = audit.read_all_entries()
+    assert len(all_rows) == 1
+    assert all_rows[0]["session_id"] == "sess-1"
 
 
 def test_log_action_truncates_long_message(paid_tmp: Path):

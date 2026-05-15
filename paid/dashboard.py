@@ -62,6 +62,12 @@ def _read_jsonl(path: Path) -> list[dict]:
     return out
 
 
+def _read_all_audit() -> list[dict]:
+    """v1.6.4: read audit entries from per-cp files + legacy (grace period)."""
+    from . import audit as _audit
+    return _audit.read_all_entries()
+
+
 def _today_window() -> tuple[datetime, datetime]:
     today = datetime.now(timezone.utc).date()
     start = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
@@ -103,7 +109,7 @@ def _counterparty_health(last_seen: datetime | None) -> str:
 
 def collect_summary() -> dict[str, Any]:
     """Today's headline metrics. Stable shape — also exposed at /api/summary.json."""
-    audit = _read_jsonl(storage.PAID_DIR / "audit_log.jsonl")
+    audit = _read_all_audit()
     start, end = _today_window()
     today_rows = [r for r in audit if _within(r.get("ts", ""), start, end)]
 
@@ -370,7 +376,7 @@ def collect_trend(days: int = 7) -> dict[str, Any]:
     cost_usd = [0.0] * days
 
     # Audit: bucket by UTC date of row.ts
-    audit_rows = _read_jsonl(storage.PAID_DIR / "audit_log.jsonl")
+    audit_rows = _read_all_audit()
     for r in audit_rows:
         ts = r.get("ts", "")
         try:
@@ -437,7 +443,7 @@ def collect_recent_activity(limit: int = 10) -> list[dict[str, Any]]:
     Returns rows with ts/cp/state/topic/q_preview (80 chars). Empty list
     when audit log missing.
     """
-    audit = _read_jsonl(storage.PAID_DIR / "audit_log.jsonl")
+    audit = _read_all_audit()
     audit.sort(key=lambda r: r.get("ts", ""), reverse=True)
     out: list[dict[str, Any]] = []
     for r in audit[: max(0, limit)]:
@@ -455,7 +461,7 @@ def collect_recent_activity(limit: int = 10) -> list[dict[str, Any]]:
 
 def collect_counterparties() -> list[dict[str, Any]]:
     """All cps with last-seen + activity-dot, newest first."""
-    audit = _read_jsonl(storage.PAID_DIR / "audit_log.jsonl")
+    audit = _read_all_audit()
     last_seen: dict[str, str] = {}
     msg_count: Counter[str] = Counter()
     for row in audit:
@@ -503,7 +509,7 @@ def collect_audit_for_date(date_str: str | None) -> tuple[str, list[dict]]:
         d = today
     start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
     end = start + timedelta(days=1)
-    audit = _read_jsonl(storage.PAID_DIR / "audit_log.jsonl")
+    audit = _read_all_audit()
     rows = [r for r in audit if _within(r.get("ts", ""), start, end)]
     rows.sort(key=lambda r: r.get("ts", ""), reverse=True)
     return d.isoformat(), rows
@@ -575,7 +581,7 @@ def build_app():
         cp = next((c for c in identity.list_all_counterparties() if c.cp_id == cp_id), None)
         if cp is None:
             abort(404)
-        audit = _read_jsonl(storage.PAID_DIR / "audit_log.jsonl")
+        audit = _read_all_audit()
         rows = [r for r in audit if r.get("counterparty") == cp_id]
         rows.sort(key=lambda r: r.get("ts", ""), reverse=True)
         # v1.5.5 A4: review history for this cp (active + closed)

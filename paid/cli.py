@@ -246,7 +246,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
         sum(1 for c in cp_root.iterdir() if c.is_dir())
         if cp_root.exists() else 0
     )
-    pendings = approval.list_pending() if approval._pending_log().exists() else []
+    # v1.6.4: reads per-cp + legacy; no need to guard on legacy path existence
+    pendings = approval.list_pending()
     queue_path = storage.PAID_DIR / "outbound_queue.jsonl"
     queue_lines = 0
     if queue_path.exists():
@@ -263,8 +264,10 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"  outbound queue (unsent): {queue_lines}")
 
     # ---- today's metrics (UTC day) ----
-    audit_path = storage.PAID_DIR / "audit_log.jsonl"
-    if not audit_path.exists():
+    # v1.6.4: merged read (per-cp + legacy)
+    from . import audit as _audit_mod
+    audit_rows = _audit_mod.read_all_entries()
+    if not audit_rows:
         return 0
 
     today = datetime.now(timezone.utc).date().isoformat()
@@ -275,14 +278,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
     cp_last_seen: dict[str, str] = {}
     recent_qs: list[tuple[str, str, str, str]] = []  # (ts, cp, state, q)
 
-    for line in audit_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            row = _json.loads(line)
-        except Exception:
-            continue
+    for row in audit_rows:
         ts = row.get("ts", "")
         is_today = ts.startswith(today)
         action = row.get("action") or {}
