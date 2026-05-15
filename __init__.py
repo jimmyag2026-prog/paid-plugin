@@ -2683,6 +2683,14 @@ async def _on_paid_telegram_callback(update, context) -> None:
 #     with a colon separator.
 #   - Card update uses ``client.chat_update(channel, ts, blocks=...)``;
 #     on failure (e.g. message too old) falls back to ``chat_postMessage``.
+#
+# Shared module-level state with the Telegram section above:
+#   - ``_CALLBACK_LOCK`` (threading.Lock) — guards both registrations so
+#     a concurrent first-fire on both platforms can't double-register.
+#   - ``_callback_registered: dict[str, bool]`` — per-platform idempotency
+#     flag. Slack uses key "slack"; Telegram uses key "telegram". The two
+#     keys are independent — registering one platform doesn't flip the
+#     other (covered by test_register_slack_does_not_affect_telegram_flag).
 # ---------------------------------------------------------------------------
 
 

@@ -45,6 +45,19 @@ def format_lark(spec: ApprovalCardSpec) -> dict:
     routed to ``_handle_card_action_event`` → synthetic
     ``/card button {json}`` slash command our handler reads.
 
+    Naming convention across platforms (don't conflate these — same intent,
+    different transport):
+      - **Lark**: button identity lives in ``value.paid_action`` (a JSON
+        field inside the button's value dict). Routed to PAID via hermes's
+        synthetic ``/card button {json}`` command → ``_cmd_card``.
+      - **Slack** (see ``format_slack``): button identity lives in
+        ``action_id="paid_approve"`` (a Block Kit top-level field).
+        Routed via ``app.action({"action_id": re.compile(r"^paid_")})``
+        in ``_ensure_slack_callback_registered``.
+      - **Telegram** (see ``format_telegram``): both packed into
+        ``callback_data="paid_approve:<rid>"`` (PTB only gives us one
+        string). Routed via ``CallbackQueryHandler(pattern=r"^paid_")``.
+
     All three buttons (Approve/Edit/Reject) render unconditionally as of
     v1.2.2 — even when has_draft=False. The note block below the actions
     explains what each button means in the no-draft case so the operator
