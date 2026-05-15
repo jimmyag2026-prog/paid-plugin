@@ -288,9 +288,15 @@ def extract_profile_updates(
         content=content[:MAX_CONTENT_CHARS],
     )
     try:
+        # v1.6.9 fix: hermes_io.call_llm takes (prompt, system=...), NOT
+        # messages=[]. Pre-v1.6.9 this raised TypeError every time which
+        # the broad except below swallowed → no proposals ever returned.
+        # Result: every /paid-setup add-doc reply was "🔍 没有找到可更新的
+        # profile 字段" regardless of doc content. Same bug existed in
+        # conv_capture (also fixed).
         raw = hermes_io.call_llm(
+            prompt=prompt,
             system=_EXTRACT_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
         )
     except Exception as e:

@@ -202,3 +202,71 @@ def test_v3_feishu_open_id_still_uses_direct(monkeypatch):
     result = hermes_io.send_dm("feishu", "ou_abc123", "hello")
     assert result["ok"] is True
     assert calls["direct"] == 1
+
+
+# ---------------------------------------------------------------------------
+# V4 — hermes_io.call_llm signature contract (v1.6.1/v1.6.2 latent bug)
+# ---------------------------------------------------------------------------
+
+
+def test_v4_call_llm_signature_uses_prompt_not_messages():
+    """Both conv_capture and doc_ingest call hermes_io.call_llm. Its real
+    signature is (prompt: str, system: str = ""). Pre-v1.6.9 both
+    callers passed messages=[{role, content}] which raised TypeError on
+    every invocation — silently swallowed by the broad except clause.
+    Result: LLM extraction never ran in production since v1.6.1/v1.6.2
+    shipped. This test pins the contract."""
+    import inspect
+    params = inspect.signature(hermes_io.call_llm).parameters
+    assert "prompt" in params, "call_llm must accept a `prompt` parameter"
+    assert "messages" not in params, (
+        "call_llm has no `messages` parameter — callers must NOT pass it"
+    )
+
+
+def test_v4_conv_capture_calls_llm_with_correct_signature(monkeypatch, tmp_path):
+    """End-to-end: extract_from_message must successfully call call_llm
+    with prompt=. Mock to assert the kwarg shape rather than swallow the bug."""
+    from paid import conv_capture as cc, profile, storage, hermes_io as _hio
+    monkeypatch.setattr(storage, "PAID_DIR", tmp_path)
+
+    captured = {}
+    def fake_call_llm(prompt: str = None, system: str = "", **kw) -> str:
+        captured["prompt"] = prompt
+        captured["system"] = system
+        assert "messages" not in kw, (
+            "v1.6.9 regression: conv_capture passed messages= instead of prompt="
+        )
+        assert prompt is not None, "call_llm called without prompt"
+        return '[]'
+
+    monkeypatch.setattr(_hio, "call_llm", fake_call_llm)
+    cc._clear_rate_limit_for_tests()
+    prof = profile.new_profile(owner_id="o1")
+    # Use a phrase that DOES trigger should_scan
+    cc.extract_from_message(
+        "以后客户问 pricing 直接拒绝，我不想看",
+        prof, "feishu", "owner1",
+    )
+    assert captured.get("system"), "call_llm was never invoked"
+
+
+def test_v4_doc_ingest_calls_llm_with_correct_signature(monkeypatch, tmp_path):
+    """Same contract guard for doc_ingest.extract_profile_updates."""
+    from paid import doc_ingest as di, profile, storage, hermes_io as _hio
+    monkeypatch.setattr(storage, "PAID_DIR", tmp_path)
+
+    captured = {}
+    def fake_call_llm(prompt: str = None, system: str = "", **kw) -> str:
+        captured["prompt"] = prompt
+        captured["system"] = system
+        assert "messages" not in kw, (
+            "v1.6.9 regression: doc_ingest passed messages= instead of prompt="
+        )
+        assert prompt is not None, "call_llm called without prompt"
+        return '[]'
+
+    monkeypatch.setattr(_hio, "call_llm", fake_call_llm)
+    prof = profile.new_profile(owner_id="o1")
+    di.extract_profile_updates("Some doc content about voice tone.", prof)
+    assert captured.get("system"), "call_llm was never invoked"
