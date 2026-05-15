@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -85,6 +86,11 @@ def log_action(
         msg = msg[:500]
 
     entry = {
+        # v1.6.6: entry_id is the canonical dedup key. Previously dedup
+        # relied on (ts, session_id) which collided when session_id was
+        # empty (system events) and two entries shared the same isoformat
+        # timestamp at sub-microsecond granularity.
+        "entry_id": secrets.token_hex(8),
         "ts": datetime.now(timezone.utc).isoformat(),
         "session_id": session_id or "",
         "counterparty": cp_id,
@@ -164,11 +170,22 @@ def read_all_entries(
         cutoff = _cutoff_ts(lookback_days)
         rows = [r for r in rows if _row_ts(r) is None or _row_ts(r) >= cutoff]
 
-    # Dedup by (ts, session_id) then sort
-    seen: set[tuple] = set()
+    # v1.6.6: dedup by entry_id when available, falling back to a wider
+    # composite key for pre-v1.6.6 rows that lack entry_id.
+    seen: set = set()
     deduped: list[dict] = []
     for r in rows:
-        key = (r.get("ts", ""), r.get("session_id", ""))
+        eid = r.get("entry_id")
+        if eid:
+            key: Any = ("eid", eid)
+        else:
+            key = (
+                "legacy",
+                r.get("ts", ""),
+                r.get("session_id", ""),
+                r.get("counterparty"),
+                (r.get("junior_msg") or "")[:50],
+            )
         if key not in seen:
             seen.add(key)
             deduped.append(r)

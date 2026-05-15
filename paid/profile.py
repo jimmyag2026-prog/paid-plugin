@@ -36,6 +36,26 @@ logger = logging.getLogger(__name__)
 PROFILE_SCHEMA_VERSION = 1
 
 
+# v1.6.6 — single source of truth for fields that LLM extractors (doc_ingest /
+# conv_capture) are allowed to propose. Drift between extractors caused a
+# silent functional bug where ``observed.preferred_decision_window_hrs``
+# proposals were dropped by ``_parse_proposals``. Both extractors now
+# reference this set so the LLM prompts and the parser whitelist stay aligned.
+ALLOWED_PROFILE_FIELDS: frozenset[str] = frozenset({
+    "name",
+    "voice.tone",
+    "voice.style_notes",
+    "voice.self_description",
+    "voice.do_not_say",
+    "topics.always_escalate",
+    "topics.always_direct",
+    "topics.always_decline",
+    "preferred_language",
+    "preferences.daily_cost_cap_usd",
+    "observed.preferred_decision_window_hrs",
+})
+
+
 # ---------------------------------------------------------------------------
 # Nested dataclasses
 # ---------------------------------------------------------------------------

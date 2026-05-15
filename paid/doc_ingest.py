@@ -12,16 +12,20 @@ Public API:
 
 URL kinds:
   "lark_doc"  — feishu.cn/docx/* or feishu.cn/wiki/*
-  "web"       — anything else
-  "file"      — local file:// (test/import path)
+  "web"       — anything else (with SSRF guard against private IPs)
 
 Fetch strategy:
   - lark_doc: LarkClient.get_doc_raw() via existing lark_client singleton
-  - web: httpx GET, strip HTML tags, truncate at MAX_CONTENT_CHARS
-  - file: plain read (used in tests / /paid-setup import)
+  - web: httpx GET with manual redirect chain (each hop SSRF-checked),
+    strip HTML tags, truncate at MAX_CONTENT_CHARS
+
+v1.6.6: ``file://`` removed — local imports must go through the CLI
+``/paid-setup import <path>`` flow so file contents never enter the LLM
+context or audit log via a chat-triggered code path.
 
 Sensitive material is NEVER in proposals — all extractors are told to
-exclude API keys, passwords, tokens, etc.
+exclude API keys, passwords, tokens, etc., and the parser whitelist
+(``profile.ALLOWED_PROFILE_FIELDS``) is the hard gate.
 """
 
 from __future__ import annotations
@@ -61,19 +65,19 @@ class UpdateProposal:
 def fetch_content(url: str) -> tuple[str, str]:
     """Fetch doc/URL content. Returns (kind, text).
 
-    kind: "lark_doc" | "web" | "file"
+    kind: "lark_doc" | "web"
+
+    v1.6.6: ``file://`` is rejected — local imports must go via the CLI
+    so file contents never reach LLM context via a chat-triggered path.
     Raises ValueError on unsupported scheme or fetch failure.
     """
     url = url.strip()
 
     if url.startswith("file://"):
-        path = url[len("file://"):]
-        try:
-            from pathlib import Path
-            text = Path(path).read_text(encoding="utf-8")
-            return ("file", text[:MAX_CONTENT_CHARS])
-        except OSError as e:
-            raise ValueError(f"Cannot read file {path}: {e}") from e
+        raise ValueError(
+            "file:// URLs are not supported. Use the CLI "
+            "`/paid-setup import <path>` to ingest a local file."
+        )
 
     lark_match = _LARK_DOC_RE.search(url)
     if lark_match:
@@ -104,21 +108,100 @@ def _fetch_lark_doc(url: str, token: str, kind: str) -> tuple[str, str]:
     return ("lark_doc", text[:MAX_CONTENT_CHARS])
 
 
+_MAX_REDIRECTS = 5
+
+
 def _fetch_web(url: str) -> tuple[str, str]:
-    """Fetch via httpx, strip HTML, truncate. Returns ("web", text)."""
+    """Fetch via httpx with manual redirect chain, strip HTML, truncate.
+
+    v1.6.6 SSRF guard: every hop in the redirect chain is resolved and
+    its destination IP checked against private / loopback / link-local
+    ranges before the request goes out. AWS/GCP cloud-metadata IPs are
+    explicitly blocked. Failure → ValueError.
+    """
     try:
         import httpx
-        resp = httpx.get(url, timeout=15.0, follow_redirects=True, headers={
-            "User-Agent": "PAID-profile-ingest/1.0",
-        })
-        resp.raise_for_status()
-        raw = resp.text
-    except Exception as e:
-        raise ValueError(f"Failed to fetch {url}: {e}") from e
+    except ImportError as e:
+        raise ValueError("httpx not installed") from e
+
+    current = url
+    raw = ""
+    with httpx.Client(timeout=15.0, follow_redirects=False, headers={
+        "User-Agent": "PAID-profile-ingest/1.0",
+    }) as client:
+        for _ in range(_MAX_REDIRECTS + 1):
+            _assert_safe_url(current)
+            try:
+                resp = client.get(current)
+            except Exception as e:
+                raise ValueError(f"Failed to fetch {current}: {e}") from e
+            if resp.is_redirect:
+                loc = resp.headers.get("location") or ""
+                if not loc:
+                    raise ValueError(f"Redirect without Location: {current}")
+                # Resolve against current URL for relative redirects
+                current = str(httpx.URL(current).join(loc))
+                continue
+            try:
+                resp.raise_for_status()
+            except Exception as e:
+                raise ValueError(f"Failed to fetch {current}: {e}") from e
+            raw = resp.text
+            break
+        else:
+            raise ValueError(f"Too many redirects ({_MAX_REDIRECTS}) for {url}")
+
     text = _strip_html(raw)
     if not text.strip():
         raise ValueError(f"No readable text content at {url}")
     return ("web", text[:MAX_CONTENT_CHARS])
+
+
+def _assert_safe_url(url: str) -> None:
+    """Reject URLs that resolve to private / loopback / link-local IPs.
+
+    Blocks the classic SSRF targets:
+      - 127.0.0.0/8 (loopback)
+      - 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 (private)
+      - 169.254.0.0/16 (link-local — includes AWS/GCP metadata 169.254.169.254)
+      - ::1, fc00::/7, fe80::/10 (IPv6 equivalents)
+
+    Also rejects non-http(s) schemes that slipped past upstream checks.
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Unsafe URL scheme: {parsed.scheme!r}")
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError(f"URL has no host: {url!r}")
+
+    # Resolve to all IPs (may be multiple A/AAAA records); reject if ANY are private
+    try:
+        addrs = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        raise ValueError(f"DNS resolution failed for {host}: {e}") from e
+
+    for fam, _, _, _, sockaddr in addrs:
+        ip_str = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError(
+                f"Unsafe URL — host {host} resolves to private/internal IP {ip}"
+            )
 
 
 def _strip_html(html: str) -> str:
@@ -255,19 +338,15 @@ def _parse_proposals(raw: str, profile: Any) -> list[UpdateProposal]:
     if not isinstance(items, list):
         return []
 
-    _ALLOWED_FIELDS = {
-        "name", "voice.tone", "voice.style_notes", "voice.self_description",
-        "voice.do_not_say", "topics.always_escalate", "topics.always_direct",
-        "topics.always_decline", "preferred_language",
-        "preferences.daily_cost_cap_usd",
-    }
+    # v1.6.6: shared whitelist with conv_capture — see profile.ALLOWED_PROFILE_FIELDS
+    from . import profile as _profile
 
     results: list[UpdateProposal] = []
     for item in items:
         if not isinstance(item, dict):
             continue
         f = item.get("field", "")
-        if f not in _ALLOWED_FIELDS:
+        if f not in _profile.ALLOWED_PROFILE_FIELDS:
             continue
         proposed = item.get("proposed")
         rationale = str(item.get("rationale", ""))[:300]

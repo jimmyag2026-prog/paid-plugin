@@ -278,49 +278,49 @@ def _check_settings_schema() -> tuple[bool, str, str]:
 
 
 def _check_recent_errors() -> tuple[bool, str, str]:
-    """Scan last 1h of audit_log.jsonl for fatal events.
+    """Scan last 1h of audit for fatal events.
+
+    v1.6.6: reads via ``audit.read_all_entries`` so both per-cp files
+    (v1.6.4 layout) and any remaining legacy ``audit_log.jsonl`` are
+    covered. Before this fix, post-migration installs always reported
+    "fresh install" because the legacy file had been renamed.
 
     Conservative: counts rows where ``extra.fatal=true`` OR
-    ``extra.l4_ok=false`` (output safety failure). Missing file = pass.
+    ``extra.l4_ok=false`` (output safety failure).
     """
-    p = storage.PAID_DIR / "audit_log.jsonl"
-    if not p.exists():
-        return True, "no audit_log.jsonl yet (fresh install)", ""
+    from . import audit as _audit
+    try:
+        rows = _audit.read_all_entries(lookback_days=1)
+    except Exception as exc:
+        return False, f"failed to read audit: {exc}", ""
+
+    if not rows:
+        return True, "no audit entries yet (fresh install)", ""
+
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=_RECENT_ERROR_WINDOW_SECONDS)
     fatal_count = 0
     l4_fail_count = 0
     samples: list[str] = []
-    try:
-        with p.open("r", encoding="utf-8") as f:
-            # Cheap reverse scan: read all, walk last N. PAID audit files are
-            # bounded (sweep + snapshot rotation), so this is OK for v1.
-            lines = f.readlines()
-    except Exception as exc:
-        return False, f"failed to read audit_log: {exc}", ""
-    for line in reversed(lines):
-        try:
-            row = json.loads(line)
-        except Exception:
-            continue
+    for row in rows:
         ts = row.get("ts", "")
         try:
-            row_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            row_dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
         except Exception:
             continue
         if row_dt < cutoff:
-            break
+            continue
         extra = row.get("extra") or {}
         if extra.get("fatal") is True:
             fatal_count += 1
             if len(samples) < 3:
-                samples.append(f"fatal@{ts}: {row.get('reason', '')[:80]}")
+                samples.append(f"fatal@{ts}: {str(row.get('reason', ''))[:80]}")
         elif extra.get("l4_ok") is False:
             l4_fail_count += 1
     if fatal_count or l4_fail_count:
         detail = f"fatal={fatal_count} l4_fail={l4_fail_count} in past 1h"
         if samples:
             detail += f" — e.g. {samples[0]}"
-        return False, detail, "see ~/.hermes/paid/audit_log.jsonl"
+        return False, detail, "see counterparties/*/audit.jsonl"
     return True, "no fatal events in past 1h", ""
 
 

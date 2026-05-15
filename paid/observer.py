@@ -171,7 +171,12 @@ def _compute_avg_reply_len(entries: list[dict]) -> float | None:
 
 
 def _compute_decision_window_p75(entries: list[dict]) -> float | None:
-    """75th percentile time between message receipt and owner decision (hrs)."""
+    """75th percentile time between message receipt and owner decision (hrs).
+
+    v1.6.6: switched from nearest-rank (``int(n*0.75)-1``) to linear
+    interpolation. Nearest-rank was too pessimistic on small samples —
+    e.g. [1,2,3] returned 2 when the correct P75 is 2.5.
+    """
     windows: list[float] = []
     for e in entries:
         received = e.get("received_at") or e.get("timestamp")
@@ -186,9 +191,28 @@ def _compute_decision_window_p75(entries: list[dict]) -> float | None:
                 pass
     if not windows:
         return None
-    windows.sort()
-    idx = max(0, int(len(windows) * 0.75) - 1)
-    return round(windows[idx], 2)
+    return round(_percentile_linear(windows, 0.75), 2)
+
+
+def _percentile_linear(values: list[float], q: float) -> float:
+    """Linear-interpolation percentile (matches numpy.percentile default).
+
+    For sorted values v[0..n-1] and target quantile q ∈ [0,1]:
+      pos = q * (n - 1)
+      lo, hi = floor(pos), ceil(pos)
+      return v[lo] + (v[hi] - v[lo]) * (pos - lo)
+    """
+    if not values:
+        raise ValueError("percentile of empty sequence")
+    s = sorted(values)
+    n = len(s)
+    if n == 1:
+        return s[0]
+    pos = q * (n - 1)
+    lo = int(pos)
+    hi = min(lo + 1, n - 1)
+    frac = pos - lo
+    return s[lo] + (s[hi] - s[lo]) * frac
 
 
 # ---------------------------------------------------------------------------
