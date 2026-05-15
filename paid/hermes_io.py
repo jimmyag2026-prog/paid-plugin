@@ -1444,6 +1444,36 @@ def send_dm(
                 result["queued"] = str(qp)
             return result
 
+        # v1.6.9: chat_id-type Lark send WITH a live adapter used to fall
+        # through to the generic async-adapter branch below
+        # (``fut.result(timeout=30)``). On live VPS the adapter's
+        # ``send()`` co-routine consistently waits the full 30 s before
+        # resolving even though the message lands in Lark within a
+        # second. Net effect: every ``/paid-setup`` reply, every wizard
+        # response, every dashboard DM stalled the gateway thread for
+        # 30 s before logging the skip. Route through the same direct
+        # client used for open_id sends — it's a single synchronous Lark
+        # IM API call with no event-loop scheduling.
+        try:
+            result = _send_lark_direct(adapter, user_id, message)
+        except Exception as exc:
+            try:
+                result = _send_lark_standalone(user_id, message)
+            except Exception as exc2:
+                if fallback_to_queue:
+                    qp = _enqueue_outbound_fallback(platform, user_id, message)
+                    return {"ok": False, "queued": str(qp),
+                            "error": f"lark direct send raised: {exc}; "
+                                     f"standalone fallback raised: {exc2}"}
+                raise SendDmError(
+                    f"lark direct (chat_id) send raised: {exc}; "
+                    f"standalone fallback raised: {exc2}"
+                ) from exc2
+        if not result.get("ok") and fallback_to_queue:
+            qp = _enqueue_outbound_fallback(platform, user_id, message)
+            result["queued"] = str(qp)
+        return result
+
     # Non-Lark platforms below this point — adapter must exist.
     if adapter is None:
         # Should be unreachable because we returned/raised above.

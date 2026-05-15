@@ -51,6 +51,15 @@ _TRIGGER_PATTERNS: list[re.Pattern] = [re.compile(p, re.IGNORECASE) for p in [
     r"以后.{0,10}不要",
     r"以后.{0,10}请",
     r"以后.{0,10}记得",
+    # v1.6.9: "以后 X 直接/一律 拒/拒绝/不回/不答" — the natural Chinese
+    # SOP-update phrasing that v1.6.2 missed entirely. The user's actual
+    # live test "以后客户问 pricing 直接拒绝，我不想看" failed to fire any
+    # pre-v1.6.9 pattern because no preset literal sat within 10 chars
+    # of "以后" and the topic-routing regex required "我" within 10 chars
+    # of an action verb (which it isn't in this phrasing).
+    r"以后.{0,30}(?:直接|一律|马上|立刻).{0,15}(?:拒|拒绝|不回|不答|不理|不要回)",
+    r"以后.{0,30}(?:都|全部|一律|统统).{0,15}(?:拒|拒绝|不回|不答|不理)",
+    r"以后.{0,40}(?:不想|不愿|懒得|没空).{0,10}(?:看|理|回|应)",
     # "记住 X"
     r"记住.{0,20}",
     # English equivalents
@@ -60,6 +69,9 @@ _TRIGGER_PATTERNS: list[re.Pattern] = [re.compile(p, re.IGNORECASE) for p in [
     r"\bdon'?t\b.{0,15}",
     r"\bplease\b.{0,10}\b(always|never|don'?t)\b",
     r"\bfrom now on\b",
+    # v1.6.9: "from now on X just reject" / "always decline"
+    r"\b(?:from now on|going forward)\b.{0,40}\b(?:reject|decline|refuse|ignore|skip)\b",
+    r"\b(?:always|never|just|please)\b.{0,15}\b(?:decline|reject|refuse|skip|ignore)\b",
     # Time windows
     r"\d+\s*(?:小时|hr|hour|分钟|min|minute).{0,10}(?:内|以内|以后|within|reply|回)",
     # Tone hints
@@ -118,9 +130,16 @@ Allowed fields to extract:
   voice.style_notes      — freeform style notes (string)
   topics.always_escalate — topics that always need owner approval (list)
   topics.always_direct   — topics bot can handle without approval (list)
+  topics.always_decline  — topics bot should reject outright without escalating (list)
   preferred_language     — "zh" | "en" | "ko" | "auto"
   preferences.daily_cost_cap_usd — number
   observed.preferred_decision_window_hrs — number
+
+Distinguishing escalate vs decline:
+- always_escalate = "bother the owner, let them decide each time"
+  (e.g. "客户问 X 一定要告诉我")
+- always_decline  = "reject outright, do NOT bother me about this again"
+  (e.g. "客户问 X 直接拒绝，我不想看" / "ignore these going forward")
 
 RULES:
 - Extract ONLY if the owner's message explicitly states or very strongly implies a change.
