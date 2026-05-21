@@ -1,0 +1,201 @@
+name: Deploy to VPS
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Ref to deploy (tag, branch, or sha). Defaults to current.'
+        required: false
+        default: ''
+      include_paid_jelabs:
+        description: 'Also deploy to paid-jelabs after paid succeeds (default true)'
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  deploy-paid:
+    name: Deploy to paid user (jimmy self)
+    runs-on: ubuntu-latest
+    environment: vps-paid
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Show what we're deploying
+        run: |
+          echo "Deploying ref: ${{ github.event.inputs.ref || github.ref }}"
+          echo "Commit: $(git rev-parse HEAD)"
+          echo "_version.py: $(grep __version__ paid/_version.py)"
+
+      - name: Build payload tarball
+        run: |
+          mkdir -p /tmp/payload
+          # Exclude dev/test artefacts; include only what hermes loads at runtime.
+          tar -czf /tmp/paid-plugin.tar.gz \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.pytest_cache' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='tests' \
+            --exclude='docs/v*_design.md' \
+            -C . .
+          ls -lh /tmp/paid-plugin.tar.gz
+
+      - name: Install SSH key for paid
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.VPS_DEPLOY_KEY_PAID }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Upload tarball to paid user
+        run: |
+          scp -i ~/.ssh/deploy_key -o BatchMode=yes \
+            /tmp/paid-plugin.tar.gz \
+            paid@${{ secrets.VPS_HOST }}:/tmp/paid-plugin-deploy.tar.gz
+
+      - name: Extract + restart hermes-gateway (paid)
+        run: |
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes paid@${{ secrets.VPS_HOST }} \
+            'bash -se' <<'REMOTE'
+          set -euo pipefail
+          TARBALL=/tmp/paid-plugin-deploy.tar.gz
+          DEST=$HOME/.hermes/plugins/paid-v1
+          BACKUP=$HOME/.hermes/plugins/paid-v1.bak
+          STAGE=$HOME/.hermes/plugins/paid-v1.new
+
+          # Stage: extract into fresh dir first
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          tar -xzf "$TARBALL" -C "$STAGE"
+
+          # Atomic-ish swap
+          rm -rf "$BACKUP"
+          if [ -d "$DEST" ]; then mv "$DEST" "$BACKUP"; fi
+          mv "$STAGE" "$DEST"
+
+          # Restart hermes-gateway
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          systemctl --user restart hermes-gateway.service
+
+          # Smoke: wait up to 30s for active state + log signal
+          for i in $(seq 1 15); do
+            if systemctl --user is-active --quiet hermes-gateway.service; then
+              break
+            fi
+            sleep 2
+          done
+          systemctl --user is-active hermes-gateway.service
+
+          # Final smoke: gateway must log "Gateway running with N platform(s)"
+          sleep 8
+          if ! tail -n 100 $HOME/.hermes/logs/gateway.log 2>/dev/null \
+               | grep -q "Gateway running with"; then
+            echo "ERROR: gateway did not report 'Gateway running' in last 100 log lines"
+            echo "--- gateway.log tail ---"
+            tail -n 30 $HOME/.hermes/logs/gateway.log 2>/dev/null || true
+            exit 1
+          fi
+          echo "paid deploy OK: $(grep __version__ $DEST/paid/_version.py)"
+
+          rm -f "$TARBALL"
+          REMOTE
+
+      - name: Cleanup
+        if: always()
+        run: rm -f ~/.ssh/deploy_key /tmp/paid-plugin.tar.gz
+
+  deploy-paid-jelabs:
+    name: Deploy to paid-jelabs user (JELabs pilot)
+    needs: deploy-paid
+    if: ${{ github.event_name == 'push' || github.event.inputs.include_paid_jelabs == 'true' }}
+    runs-on: ubuntu-latest
+    environment: vps-paid-jelabs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Build payload tarball
+        run: |
+          tar -czf /tmp/paid-plugin.tar.gz \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.pytest_cache' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='tests' \
+            --exclude='docs/v*_design.md' \
+            -C . .
+
+      - name: Install SSH key for paid-jelabs
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.VPS_DEPLOY_KEY_PAID_JELABS }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Upload tarball to paid-jelabs user
+        run: |
+          scp -i ~/.ssh/deploy_key -o BatchMode=yes \
+            /tmp/paid-plugin.tar.gz \
+            paid-jelabs@${{ secrets.VPS_HOST }}:/tmp/paid-plugin-deploy.tar.gz
+
+      - name: Extract + restart hermes-gateway (paid-jelabs)
+        run: |
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes paid-jelabs@${{ secrets.VPS_HOST }} \
+            'bash -se' <<'REMOTE'
+          set -euo pipefail
+          TARBALL=/tmp/paid-plugin-deploy.tar.gz
+          DEST=$HOME/.hermes/plugins/paid-v1
+          BACKUP=$HOME/.hermes/plugins/paid-v1.bak
+          STAGE=$HOME/.hermes/plugins/paid-v1.new
+
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          tar -xzf "$TARBALL" -C "$STAGE"
+
+          rm -rf "$BACKUP"
+          if [ -d "$DEST" ]; then mv "$DEST" "$BACKUP"; fi
+          mv "$STAGE" "$DEST"
+
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          systemctl --user restart hermes-gateway.service
+
+          for i in $(seq 1 15); do
+            if systemctl --user is-active --quiet hermes-gateway.service; then
+              break
+            fi
+            sleep 2
+          done
+          systemctl --user is-active hermes-gateway.service
+
+          sleep 8
+          if ! tail -n 100 $HOME/.hermes/logs/gateway.log 2>/dev/null \
+               | grep -q "Gateway running with"; then
+            echo "ERROR: gateway did not report 'Gateway running' in last 100 log lines"
+            tail -n 30 $HOME/.hermes/logs/gateway.log 2>/dev/null || true
+            exit 1
+          fi
+          echo "paid-jelabs deploy OK: $(grep __version__ $DEST/paid/_version.py)"
+
+          rm -f "$TARBALL"
+          REMOTE
+
+      - name: Cleanup
+        if: always()
+        run: rm -f ~/.ssh/deploy_key /tmp/paid-plugin.tar.gz
