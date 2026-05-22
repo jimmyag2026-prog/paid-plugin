@@ -46,7 +46,8 @@ MARKER = f"# PAID_RICH_TEXT_PATCH_VERSION = {PATCH_VERSION!r}"
 
 DEFAULT_TARGET = Path.home() / ".hermes/hermes-agent/gateway/platforms/feishu.py"
 
-OLD_BUILD = '''    def _build_outbound_payload(self, content: str) -> tuple[str, str]:
+# hermes-agent v0.13.0 shape — bails to plain text on markdown table.
+OLD_BUILD_V013 = '''    def _build_outbound_payload(self, content: str) -> tuple[str, str]:
         # Feishu post-type 'md' elements do not render markdown tables; sending
         # table content as post causes the message to appear blank on the client.
         # Force plain text for anything that looks like a markdown table.
@@ -58,29 +59,42 @@ OLD_BUILD = '''    def _build_outbound_payload(self, content: str) -> tuple[str,
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)'''
 
+# hermes-agent v0.12.0 shape — no table bail, but raw `|...|` rendered as
+# post 'md' produces a blank message per the v0.13 comment. Same fix
+# applies: wrap tables in fences so they render as monospace.
+OLD_BUILD_V012 = '''    def _build_outbound_payload(self, content: str) -> tuple[str, str]:
+        if _MARKDOWN_HINT_RE.search(content):
+            return "post", _build_markdown_post_payload(content)
+        text_payload = {"text": content}
+        return "text", json.dumps(text_payload, ensure_ascii=False)'''
+
 NEW_BUILD = f'''    def _build_outbound_payload(self, content: str) -> tuple[str, str]:
         {MARKER}
         # PAID v1.6.19 fix: wrap markdown table blocks in ``` fences so the
         # Lark post renderer treats them as monospace code (aligned columns)
-        # instead of refusing to render and forcing the whole message to
-        # plain text (which killed bold/headings/lists alongside the table).
-        if _MARKDOWN_TABLE_RE.search(content):
+        # instead of refusing to render or producing a blank message. Bold,
+        # headings, lists outside the table keep their post formatting.
+        if _MARKDOWN_TABLE_BLOCK_RE.search(content):
             content = _wrap_tables_in_code_fences(content)
         if _MARKDOWN_HINT_RE.search(content):
             return "post", _build_markdown_post_payload(content)
         text_payload = {{"text": content}}
         return "text", json.dumps(text_payload, ensure_ascii=False)'''
 
-HELPER_ANCHOR = (
+# Anchors for the helper insertion — one per known hermes shape.
+HELPER_ANCHOR_V013 = (
     '_MARKDOWN_TABLE_RE = re.compile(r"^\\|.*\\|\\n\\|[-|: ]+\\|", re.MULTILINE)'
+)
+HELPER_ANCHOR_V012 = (
+    '_MARKDOWN_LINK_RE = re.compile(r"\\[([^\\]]+)\\]\\(([^)]+)\\)")'
 )
 
 HELPER_BLOCK = '''
 # PAID v1.6.19: capture a full markdown table block (header + separator +
-# zero-or-more body rows) for wrapping in fenced code blocks. The standalone
-# _MARKDOWN_TABLE_RE above only matches header + separator and is reused
-# as a fast presence-check; this regex extracts the full block for the
-# transformation in _build_outbound_payload.
+# zero-or-more body rows) and wrap it in fenced code blocks for Lark post
+# rendering. The block regex is used both as a presence check and for the
+# substitution itself — _wrap_tables_in_code_fences is a no-op when no
+# table is present, so the call site is safe regardless of content.
 _MARKDOWN_TABLE_BLOCK_RE = re.compile(
     r"(^\\|.*\\|\\n\\|[-|: ]+\\|(?:\\n\\|.*\\|)*)",
     re.MULTILINE,
@@ -94,6 +108,16 @@ def _wrap_tables_in_code_fences(content: str) -> str:
         content,
     )
 '''
+
+
+def _detect_shape(src: str) -> tuple[str | None, str | None]:
+    """Return (matched_build_block, matched_anchor) for the first shape
+    that fits, or (None, None) if neither matches."""
+    if OLD_BUILD_V013 in src and HELPER_ANCHOR_V013 in src:
+        return OLD_BUILD_V013, HELPER_ANCHOR_V013
+    if OLD_BUILD_V012 in src and HELPER_ANCHOR_V012 in src:
+        return OLD_BUILD_V012, HELPER_ANCHOR_V012
+    return None, None
 
 
 def main() -> int:
@@ -122,26 +146,21 @@ def main() -> int:
         print(f"[skip] {target} already patched ({PATCH_VERSION})")
         return 0
 
-    if OLD_BUILD not in src:
+    old_build, helper_anchor = _detect_shape(src)
+    if old_build is None or helper_anchor is None:
         print(
-            f"ERROR: expected _build_outbound_payload block not found in {target}.\n"
-            f"       hermes-agent may have changed shape; re-derive OLD_BUILD.",
+            f"ERROR: no known hermes-agent shape detected in {target}.\n"
+            f"       Tried v0.13.0 build block + _MARKDOWN_TABLE_RE anchor,\n"
+            f"       then v0.12.0 build block + _MARKDOWN_LINK_RE anchor.\n"
+            f"       hermes-agent may have changed again — re-derive OLD_BUILD_*.",
             file=sys.stderr,
         )
         return 3
 
-    if HELPER_ANCHOR not in src:
-        print(
-            f"ERROR: anchor for helper insertion not found in {target}.\n"
-            f"       Looked for: {HELPER_ANCHOR!r}",
-            file=sys.stderr,
-        )
-        return 4
-
-    new_src = src.replace(OLD_BUILD, NEW_BUILD, 1)
+    new_src = src.replace(old_build, NEW_BUILD, 1)
     new_src = new_src.replace(
-        HELPER_ANCHOR,
-        HELPER_ANCHOR + HELPER_BLOCK,
+        helper_anchor,
+        helper_anchor + HELPER_BLOCK,
         1,
     )
 

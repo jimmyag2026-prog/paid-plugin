@@ -15,9 +15,8 @@ from pathlib import Path
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "patch_hermes_feishu_rich_text.py"
 
 
-# Minimal fixture matching the OLD_BUILD + HELPER_ANCHOR strings in the
-# script. Anything outside these blocks is filler so import works.
-FIXTURE = textwrap.dedent('''
+# v0.13.0 fixture — has the table → text bail block.
+FIXTURE_V013 = textwrap.dedent('''
     import json
     import re
 
@@ -42,6 +41,33 @@ FIXTURE = textwrap.dedent('''
             text_payload = {"text": content}
             return "text", json.dumps(text_payload, ensure_ascii=False)
 ''').lstrip()
+
+
+# v0.12.0 fixture — no table bail; _MARKDOWN_TABLE_RE doesn't exist at
+# module level. Helper anchor for this shape is _MARKDOWN_LINK_RE.
+FIXTURE_V012 = textwrap.dedent('''
+    import json
+    import re
+
+    _MARKDOWN_HINT_RE = re.compile(r"\\*\\*", re.MULTILINE)
+    _MARKDOWN_LINK_RE = re.compile(r"\\[([^\\]]+)\\]\\(([^)]+)\\)")
+
+
+    def _build_markdown_post_payload(content):
+        return json.dumps({"zh_cn": {"content": [[{"tag": "md", "text": content}]]}}, ensure_ascii=False)
+
+
+    class FakeAdapter:
+        def _build_outbound_payload(self, content: str) -> tuple[str, str]:
+            if _MARKDOWN_HINT_RE.search(content):
+                return "post", _build_markdown_post_payload(content)
+            text_payload = {"text": content}
+            return "text", json.dumps(text_payload, ensure_ascii=False)
+''').lstrip()
+
+
+# Backward-compat alias for tests that used FIXTURE before the v0.12 split.
+FIXTURE = FIXTURE_V013
 
 
 def _run_patch(target: Path, *extra: str) -> subprocess.CompletedProcess:
@@ -98,7 +124,49 @@ def test_patch_fails_loudly_when_shape_changed(tmp_path):
     target.write_text("# unrelated content with no anchor\n", encoding="utf-8")
     res = _run_patch(target)
     assert res.returncode != 0
-    assert "expected _build_outbound_payload block not found" in res.stderr
+    assert "no known hermes-agent shape detected" in res.stderr
+
+
+def test_patch_handles_v012_shape(tmp_path):
+    """v0.12.0 hermes had no table → text bail and no _MARKDOWN_TABLE_RE
+    module-level regex. The patcher must detect this shape and use the
+    _MARKDOWN_LINK_RE anchor instead."""
+    target = tmp_path / "feishu.py"
+    target.write_text(FIXTURE_V012, encoding="utf-8")
+    res = _run_patch(target)
+    assert res.returncode == 0, res.stderr
+    assert "[ok] patched" in res.stdout
+
+    patched = target.read_text(encoding="utf-8")
+    assert "_MARKDOWN_TABLE_BLOCK_RE" in patched
+    assert "_wrap_tables_in_code_fences" in patched
+    assert "PAID_RICH_TEXT_PATCH_VERSION" in patched
+    # Helper was inserted after _MARKDOWN_LINK_RE (the v0.12 anchor), not
+    # _MARKDOWN_TABLE_RE which doesn't exist in v0.12.
+    assert "_MARKDOWN_TABLE_RE" not in patched.split("def _build_markdown_post_payload")[0]
+
+
+def test_v012_patched_build_uses_post_for_table_plus_bold(tmp_path):
+    """v0.12 + patch: table+bold content routes to post and table is fenced."""
+    target = tmp_path / "feishu.py"
+    target.write_text(FIXTURE_V012, encoding="utf-8")
+    assert _run_patch(target).returncode == 0
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("patched_feishu_v012", target)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+    adapter = mod.FakeAdapter()
+    content = (
+        "**SG/LA schedule**\n\n"
+        "| SG | LA |\n"
+        "|----|----|\n"
+        "| 10:00 | 19:00 |\n"
+    )
+    msg_type, payload = adapter._build_outbound_payload(content)
+    assert msg_type == "post"
+    assert "```" in payload
 
 
 def test_patched_helper_logic_wraps_tables(tmp_path):
