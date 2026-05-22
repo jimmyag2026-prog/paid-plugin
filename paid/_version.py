@@ -7,4 +7,4 @@ Bump with `bin/bump-version.sh <new-version>` — never edit version strings
 by hand in multiple places.
 """
 
-__version__ = "1.6.11"
+__version__ = "1.6.19"

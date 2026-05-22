@@ -4,6 +4,45 @@ All notable changes to PAID are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/);
 versioning follows SemVer (see `~/.openclaw/workspace/GIT_VERSION_SCHEME.md`).
 
+## [1.6.19] - 2026-05-21
+
+JE Labs pilot feedback (owner Evie): Lark group `@bot` and DM replies
+arrived as plain unformatted text — **bold** rendered literally,
+markdown tables had proportional-font misaligned columns. Two root
+causes traced + fixed.
+
+### Fixed
+
+- `paid/hermes_io.py`: removed pre-emptive `_strip_markdown_for_lark`
+  call inside `send_dm` for `feishu`/`lark` platforms. The v1.4.3 strip
+  was a workaround for an older hermes that only sent `text` msg_type;
+  current hermes-agent's `_build_outbound_payload` auto-routes markdown
+  to Lark's `post` msg_type which renders bold/headings/lists/links
+  natively. Stripping first cancelled the rich rendering. The
+  `_strip_markdown_for_lark` helper itself is kept available for
+  callers that explicitly want plain text (audit summaries, console
+  diagnostics).
+- `scripts/patch_hermes_feishu_rich_text.py`: new **idempotent**
+  deploy-time patch for hermes-agent's `gateway/platforms/feishu.py`.
+  Pre-patch the adapter forced plain `text` whenever a markdown table
+  was present, killing bold/headings AND leaving the table itself
+  misaligned. Post-patch the adapter wraps the table block in
+  ``` fences (Lark post `md` renders fenced content as monospace →
+  aligned columns) while keeping the rest of the message in post mode
+  so other formatting survives. Marker comment lets re-run skip; backup
+  + AST validation on apply; rollback on syntax failure. Apply with
+  `python3 scripts/patch_hermes_feishu_rich_text.py` after each hermes
+  upgrade until the change is upstreamed.
+
+### Notes
+
+- Owner pass-through path (XiaEvie's own messages in group/DM) only
+  benefits from the hermes-side patch — PAID's `send_dm` isn't on that
+  path. Other-counterparty replies go through both paths and benefit
+  from both fixes.
+- No version SSOT drift: `bin/bump-version.sh` updates `_version.py` +
+  `plugin.yaml` in lockstep; `test_version_sync.py` 4/4.
+
 ## [1.6.11] - 2026-05-15
 
 Catch-up release: bundles all merged work since `v1.6.10` (the

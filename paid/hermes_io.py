@@ -1323,11 +1323,14 @@ def send_dm(
     """
     import asyncio
 
-    # v1.4.3: Lark/Feishu doesn't render markdown in `text` msg_type — strip
-    # bold/italic/bullet/links to avoid literal `**X**` in the recipient's
-    # chat. Only feishu/lark; Telegram and Slack render markdown natively.
-    if platform in ("feishu", "lark"):
-        message = _strip_markdown_for_lark(message)
+    # v1.6.19: hermes-agent feishu adapter now auto-routes markdown content
+    # to Lark post msg_type via _build_outbound_payload, which renders
+    # **bold**, headings, lists, and links natively. The v1.4.3 pre-emptive
+    # strip was a workaround for an older hermes that only sent text — it
+    # now causes the OPPOSITE problem (XiaEvie/JELabs reported plain-text
+    # group/DM replies with no formatting). Drop the strip; let hermes
+    # decide msg_type. `_strip_markdown_for_lark` is kept for any caller
+    # that explicitly wants plain text (e.g., logs, audit summaries).
 
     # Platform-specific options_block dispatch BEFORE plain-text path.
     # Failure here is non-fatal — we fall through to the plain-text path so

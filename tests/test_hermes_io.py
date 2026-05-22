@@ -688,28 +688,54 @@ def test_strip_markdown_empty_passes_through():
     assert hermes_io._strip_markdown_for_lark(None) is None
 
 
-def test_send_dm_strips_markdown_only_for_lark(monkeypatch):
-    """feishu/lark messages get stripped; telegram/slack pass through."""
-    captured: dict[str, str] = {}
+def test_send_dm_does_not_strip_markdown_for_lark(monkeypatch):
+    """v1.6.19: send_dm must NOT call `_strip_markdown_for_lark` before
+    handing the message to the platform layer — hermes-agent's feishu
+    adapter auto-routes markdown content to Lark's post msg_type, which
+    renders **bold** / headings / lists / links natively. Stripping
+    pre-emptively (v1.4.3 behavior) caused the OPPOSITE bug: bold and
+    headings vanished from group/DM replies. We assert by spying on the
+    strip helper: it must NOT be called from inside send_dm for any
+    Lark/Feishu send. (Other callers may still invoke it deliberately
+    for plain-text contexts like audit summaries.)
+    """
+    strip_calls: list[str] = []
+    original_strip = hermes_io._strip_markdown_for_lark
 
-    def fake_adapter(_):
-        class _Adapter:
-            async def send(self, **kw):
-                captured["text"] = kw.get("content", kw.get("text", ""))
-                return {"message_id": "msg-1"}
-        return _Adapter()
+    def _spy_strip(text):
+        strip_calls.append(text)
+        return original_strip(text)
 
-    monkeypatch.setattr(hermes_io, "_get_gateway_adapter", fake_adapter)
-    monkeypatch.setattr(hermes_io, "_detect_lark_receive_id_type", lambda u: "chat_id")
-    # Provide a fake async-runner result
-    import asyncio
+    monkeypatch.setattr(hermes_io, "_strip_markdown_for_lark", _spy_strip)
+    # Force the lark fallback to queue path so send_dm exits cleanly
+    # without needing a live adapter — we only care about whether the
+    # strip helper got invoked along the way.
+    monkeypatch.setattr(
+        hermes_io,
+        "_get_gateway_adapter",
+        lambda _: (_ for _ in ()).throw(hermes_io.SendDmError("no adapter")),
+    )
+    monkeypatch.setattr(
+        hermes_io, "_send_lark_standalone",
+        lambda rid, msg: {"ok": True, "msg_id": "om_TEST", "platform": "feishu",
+                          "receive_id_type": "user_id"},
+    )
 
-    md_in = "Hi **friend**, see [our site](https://jelabs.top)"
-    # Direct call into the markdown helper to verify strip happens regardless
-    # of platform plumbing — full send_dm integration covered by existing tests.
-    stripped = hermes_io._strip_markdown_for_lark(md_in)
-    assert "**" not in stripped
-    assert "https://jelabs.top" in stripped
+    md_in = "Hi **friend**, see [our site](https://jelabs.top)\n\n- one\n- two"
+    hermes_io.send_dm("feishu", "a5361ea1", md_in)
+
+    # The key contract: send_dm did NOT strip markdown on the way out.
+    assert strip_calls == [], (
+        "send_dm must not strip markdown for Lark/Feishu in v1.6.19+; "
+        f"saw strip called with: {strip_calls!r}"
+    )
+
+
+def test_strip_markdown_helper_still_works():
+    """v1.6.19 keeps `_strip_markdown_for_lark` available for callers that
+    explicitly want plain text (e.g., audit log summaries, console
+    diagnostics). Only the auto-call inside send_dm was removed."""
+    assert hermes_io._strip_markdown_for_lark("**hi**") == "hi"
 
 
 # ---------------------------------------------------------------------------
