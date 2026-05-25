@@ -4,6 +4,17 @@ All notable changes to PAID are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/);
 versioning follows SemVer (see `~/.openclaw/workspace/GIT_VERSION_SCHEME.md`).
 
+## [Unreleased]
+
+### Fixed
+- Upstream hermes-agent treats `"@_all" in raw_content` as a bot
+  mention, so any Lark group `@所有人` broadcast passed
+  `require_mention` and woke PAID. New idempotent patch script
+  `scripts/patches/feishu_atall_not_bot_mention.py` removes that
+  early-return — real `@bot` and `@bot + @all` still admit through
+  the mentions[] open_id check; `@all` alone is now silently dropped
+  upstream of PAID.
+
 ## [1.6.19] - 2026-05-21
 
 JE Labs pilot feedback (owner Evie): Lark group `@bot` and DM replies
