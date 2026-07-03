@@ -772,9 +772,11 @@ def on_pre_llm_call(**kwargs) -> dict | None:
             return None
 
         # Defense in depth: pre_gateway_dispatch may not have fired (older
-        # hermes / unusual route). Try again from here on TG events.
+        # hermes / unusual route). Try again from here on TG / Slack events.
         if platform == "telegram":
             _ensure_telegram_callback_registered()
+        elif platform == "slack":
+            _ensure_slack_callback_registered()
 
         if identity.is_owner(platform, sender_id):
             _safe_log(f"[pre_llm] owner pass-through platform={platform} sender={sender_id}")
@@ -1199,11 +1201,13 @@ def on_pre_gateway_dispatch(**kwargs) -> dict | None:
             platform = getattr(plat_val, "value", str(plat_val)) if plat_val else ""
             sender_id = str(getattr(source, "user_id", "") or "")
 
-        # First TG inbound after gateway boot: attach our paid_* button
-        # callback handler to the live PTB Application. Idempotent — only
-        # the first call does real work.
+        # First TG / Slack inbound after gateway boot: attach our paid_*
+        # button callback handler to the live adapter. Idempotent — only
+        # the first call per platform does real work.
         if platform == "telegram":
             _ensure_telegram_callback_registered()
+        elif platform == "slack":
+            _ensure_slack_callback_registered()
 
         # v1.5.4: attachment-binding for two-event Lark delivery.
         # Lark splits "/review <text>" + image attachment into two
@@ -2375,7 +2379,7 @@ def _send_setup_wizard_reply(
 # ---------------------------------------------------------------------------
 
 _CALLBACK_LOCK = threading.Lock()
-_callback_registered: dict[str, bool] = {"telegram": False}
+_callback_registered: dict[str, bool] = {"telegram": False, "slack": False}
 
 
 def _ensure_telegram_callback_registered() -> None:
@@ -2594,6 +2598,280 @@ async def _on_paid_telegram_callback(update, context) -> None:
             await context.bot.send_message(chat_id=chat_id, text=result_text)
         except Exception as exc2:
             _safe_log(f"[tg-callback] fallback send_message also failed: {exc2}")
+
+
+# ---------------------------------------------------------------------------
+# Slack Block-Kit button callback routing (M3.5.C-slack, v1.7.0)
+#
+# Goal: owner clicks ✅ Approve / ✏️ Reply / ❌ Reject on the Slack approval
+# card and PAID actually acts on it — instead of falling back to
+# ``/paid-approve <id>`` slash command, which was the v1.2 UX gap.
+#
+# Approach: same shape as the Telegram callback (above) — lazy-grab the
+# live ``adapter._app`` (slack_bolt AsyncApp) on first hook fire for
+# platform=slack and register a single regex-matched action handler for
+# ``^paid_``. Bolt has no group/priority concept like PTB, but namespace
+# isolation is sufficient: hermes registers only ``hermes_*`` action_ids
+# (see ``gateway/platforms/slack.py:631-646``), so our ``paid_*`` handlers
+# can't collide.
+#
+# Notes vs TG:
+#   - Slack requires ``await ack()`` within 3s or the client UI hangs;
+#     we ack first thing, before owner verification or dispatch.
+#   - The action body's button metadata is split across two fields:
+#     ``action_id`` (paid_approve/paid_reply/paid_reject) carries the verb,
+#     ``value`` carries the request_id. TG packed both into callback_data
+#     with a colon separator.
+#   - Card update uses ``client.chat_update(channel, ts, blocks=...)``;
+#     on failure (e.g. message too old) falls back to ``chat_postMessage``.
+# ---------------------------------------------------------------------------
+
+
+def _ensure_slack_callback_registered() -> None:
+    """Best-effort, idempotent. Attach PAID's action handler to the live
+    Slack adapter so paid_* button clicks route back to PAID.
+
+    Called on every Slack-platform pre_llm_call / pre_gateway_dispatch —
+    the first successful call wins; subsequent calls are O(1) flag check.
+
+    Failures (no adapter, no _app, slack_bolt missing, app.action raises)
+    set the flag anyway and emit a fatal_alert so the operator sees that
+    buttons WON'T work this run, and PAID falls back to slash commands.
+    """
+    if _callback_registered.get("slack"):
+        return
+    with _CALLBACK_LOCK:
+        if _callback_registered.get("slack"):
+            return
+
+        try:
+            adapter = hermes_io._get_gateway_adapter("slack")
+        except hermes_io.SendDmError:
+            return
+        except Exception as exc:
+            _safe_log(f"[slack-callback] adapter lookup EXC: {exc}")
+            return
+
+        app = getattr(adapter, "_app", None)
+        if app is None:
+            return
+
+        try:
+            import re as _re
+        except Exception as exc:  # pragma: no cover — re is stdlib
+            _callback_registered["slack"] = True
+            _safe_log(f"[slack-callback] re import failed: {exc}")
+            return
+
+        try:
+            # Bolt's app.action accepts a dict constraint: any action_id
+            # matching the regex routes to our handler. We catch the full
+            # paid_* prefix so v1.7.2's paid_opt_<key> options-block path
+            # can route through the same handler without re-registration.
+            app.action({"action_id": _re.compile(r"^paid_")})(
+                _on_paid_slack_action
+            )
+            _callback_registered["slack"] = True
+            _safe_log(
+                "[slack-callback] registered paid_* action handler on "
+                "adapter._app (slack_bolt AsyncApp)"
+            )
+        except Exception as exc:
+            _callback_registered["slack"] = True
+            detail = (
+                f"app.action registration raised: {exc}. Slack button clicks "
+                f"will NOT route to PAID this run; use /paid-approve / "
+                f"/paid-reject slash commands instead."
+            )
+            _safe_log(f"[slack-callback] ⚠️  {detail}")
+            try:
+                _alert_owner(reason="paid_slack_callback_register", detail=detail)
+            except Exception:
+                pass
+
+
+def _parse_paid_slack_action(action_id: str, value: str) -> tuple[str, str] | None:
+    """Parse Slack (action_id, value) → (verb, rid_or_key).
+
+    Whitelisted verbs only:
+      - paid_approve / paid_reject / paid_reply → value is request_id
+      - paid_opt_<key>                          → "opt", key
+
+    Anything else returns None. Defensive against a future prefix collision
+    accidentally firing approval logic.
+    """
+    if not action_id or not action_id.startswith("paid_"):
+        return None
+    suffix = action_id[len("paid_"):]
+    rid = (value or "").strip()
+    if suffix in ("approve", "reject", "reply"):
+        if not rid:
+            return None
+        return suffix, rid
+    if suffix.startswith("opt_"):
+        key = suffix[len("opt_"):].strip()
+        if not key:
+            return None
+        return "opt", key
+    return None
+
+
+async def _on_paid_slack_action(ack, body, client, logger=None) -> None:
+    """slack_bolt action handler for paid_* Block-Kit buttons.
+
+    Owner-gates by ``body["user"]["id"]`` against owner.json identities —
+    independent of the env-var gating used for slash commands.
+
+    Calls ``await ack()`` immediately so Slack's 3s ack deadline never
+    fires, then runs the actual approve/reject dispatch off the event
+    loop via ``run_in_executor`` to avoid deadlocking on
+    ``hermes_io.send_dm`` (which uses ``run_coroutine_threadsafe + .result()``
+    on the same gateway loop).
+
+    On completion, edits the original card to show the resolution and
+    removes the action buttons. Falls back to a fresh message if the
+    card is too old to edit.
+    """
+    try:
+        await ack()
+    except Exception as exc:
+        _safe_log(f"[slack-callback] ack failed: {exc}")
+
+    try:
+        actions = body.get("actions") or []
+        if not actions:
+            _safe_log(f"[slack-callback] body has no actions: {repr(body)[:200]}")
+            return
+        action = actions[0]
+        action_id = str(action.get("action_id", ""))
+        value = str(action.get("value", ""))
+
+        user = body.get("user") or {}
+        user_id = str(user.get("id", ""))
+
+        container = body.get("container") or {}
+        channel_id = str(container.get("channel_id", "") or "")
+        message_ts = str(container.get("message_ts", "") or "")
+    except Exception as exc:
+        _safe_log(f"[slack-callback] body parse EXC: {exc}")
+        return
+
+    # Owner check — independent from slash command env-var path.
+    if not identity.is_owner("slack", user_id):
+        _safe_log(
+            f"[slack-callback] unauthorized click "
+            f"action_id={action_id!r} slack_user={user_id}"
+        )
+        try:
+            await client.chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text="⛔ Not authorized.",
+            )
+        except Exception as exc:
+            _safe_log(f"[slack-callback] postEphemeral failed: {exc}")
+        return
+
+    parsed = _parse_paid_slack_action(action_id, value)
+    if parsed is None:
+        _safe_log(
+            f"[slack-callback] malformed action_id={action_id!r} value={value!r}"
+        )
+        return
+    verb, rid = parsed
+
+    # v1.7.2 will route opt → review skill; v1.7.0 ignores opt clicks
+    # (junior still has plain-text fallback via key reply).
+    if verb == "opt":
+        _safe_log(
+            f"[slack-callback] opt click action_id={action_id!r} — "
+            f"routing deferred to v1.7.2; no-op"
+        )
+        return
+
+    loop = asyncio.get_event_loop()
+    result_text = ""
+    try:
+        if verb == "approve":
+            req_obj = approval.get(rid)
+            override = ""
+            if req_obj is not None and not (req_obj.draft_answer or "").strip():
+                override = _default_approve_text(req_obj)
+            result_text = await loop.run_in_executor(
+                None, lambda: _do_approve(rid, override_text=override)
+            )
+        elif verb == "reject":
+            result_text = await loop.run_in_executor(
+                None, lambda: _do_reject(rid)
+            )
+        elif verb == "reply":
+            _record_awaiting_input(rid, expected_chat_id=channel_id or None)
+            junior_label = "the requester"
+            req_obj = approval.get(rid)
+            if req_obj is not None:
+                junior_label = (
+                    req_obj.counterparty_display
+                    or req_obj.counterparty_user_id
+                    or junior_label
+                )
+            result_text = (
+                f"✏️ #{rid} 等你输入答复给 {junior_label}（30 分钟内有效）。\n"
+                f"接下来你在本聊天发的下一条普通文字会作为答复转给 ta。\n"
+                f"发 /paid-cancel-input 取消，或 /paid-reject {rid} 拒绝。"
+            )
+        else:
+            # _parse_paid_slack_action whitelist guarantees no other verb.
+            _safe_log(f"[slack-callback] unhandled verb={verb!r}")
+            return
+    except Exception as exc:
+        _safe_log(
+            f"[slack-callback] dispatch EXC verb={verb} rid={rid}: {exc}"
+        )
+        result_text = (
+            f"PAID: #{rid} — internal error while handling {verb}: {exc}"
+        )
+
+    _safe_log(
+        f"[slack-callback] handled verb={verb} rid={rid} → {result_text[:120]!r}"
+    )
+
+    # Update the card to reflect resolution + remove buttons. Fall back
+    # to a fresh message if edit fails (message > 90d in retention,
+    # original deleted, etc).
+    if not channel_id or not message_ts:
+        # No container info → can only postMessage. (Rare; container is
+        # always present in block_actions payloads in practice.)
+        try:
+            await client.chat_postMessage(
+                channel=channel_id or user_id, text=result_text
+            )
+        except Exception as exc:
+            _safe_log(f"[slack-callback] postMessage fallback EXC: {exc}")
+        return
+
+    updated_blocks = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": result_text},
+        }
+    ]
+    try:
+        await client.chat_update(
+            channel=channel_id,
+            ts=message_ts,
+            blocks=updated_blocks,
+            text=result_text,
+        )
+    except Exception as exc:
+        _safe_log(
+            f"[slack-callback] chat_update failed: {exc}; sending fallback"
+        )
+        try:
+            await client.chat_postMessage(channel=channel_id, text=result_text)
+        except Exception as exc2:
+            _safe_log(
+                f"[slack-callback] fallback chat_postMessage also failed: {exc2}"
+            )
 
 
 def _cmd_card(raw_args: str) -> str:

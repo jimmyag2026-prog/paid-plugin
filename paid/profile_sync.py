@@ -93,14 +93,25 @@ def derive_from_profile(profile: OwnerProfile) -> dict[str, Any]:
 def _write_owner_json(profile: OwnerProfile, audit: dict) -> None:
     """owner.json schema is owned by ``paid.identity`` (v2 schema). Render
     from profile while preserving v2 field shape so existing readers don't
-    notice anything changed."""
+    notice anything changed.
+
+    Preferred-platform resolution order (v1.7.0):
+      1. profile.preferred_platform if it names an enabled identity
+      2. first enabled identity (legacy v1.6 behavior — zero-regression)
+    """
     path = storage.PAID_DIR / "owner.json"
-    preferred = ""
-    for ident in profile.identities:
-        if isinstance(ident, dict) and ident.get("enabled", True):
-            preferred = ident.get("platform", "")
-            if preferred:
-                break
+    enabled_platforms = [
+        str(ident.get("platform", "") or "")
+        for ident in profile.identities
+        if isinstance(ident, dict) and ident.get("enabled", True)
+        and ident.get("platform")
+    ]
+    explicit = (profile.preferred_platform or "").strip()
+    if explicit and explicit in enabled_platforms:
+        preferred = explicit
+    else:
+        # Legacy fallback: first enabled identity wins.
+        preferred = enabled_platforms[0] if enabled_platforms else ""
 
     payload = {
         "schema_version": 2,
